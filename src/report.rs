@@ -259,58 +259,65 @@ mod tests {
         assert!(matches!(escape("a\rb"), std::borrow::Cow::Owned(_)));
     }
 
-    #[test]
-    fn every_action_has_a_distinct_symbol() {
-        let all = [
+    /// Every action, in declaration order, with what each part of the
+    /// vocabulary says about it: its symbol, its word, whether it is pending
+    /// work, whether it needs a decision, and the exit status it implies alone
+    /// and beside a converged target.
+    ///
+    /// An undeclared file and a target waiting for `bx sync` exit zero: bx
+    /// will never act on either here, so `apply` twice must still converge. A
+    /// conflict and a blocked target are not pending work, but the machine is
+    /// not converged and someone has to look, which is what a non-zero exit
+    /// is for.
+    const ACTIONS: [(Action, char, &str, bool, bool, Exit); 7] = [
+        (
             Action::Unchanged,
+            '=',
+            "unchanged",
+            false,
+            false,
+            Exit::Converged,
+        ),
+        (
             Action::Undeclared,
-            Action::Create,
-            Action::Modify,
-            Action::Sync,
+            '*',
+            "undeclared",
+            false,
+            false,
+            Exit::Converged,
+        ),
+        (Action::Create, '+', "create", true, false, Exit::Pending),
+        (Action::Modify, '~', "modify", true, false, Exit::Pending),
+        (Action::Sync, '<', "sync", false, false, Exit::Converged),
+        (
             Action::Conflict,
-            Action::Blocked,
-        ];
-        let mut symbols: Vec<char> = all.iter().map(|a| a.symbol()).collect();
+            '!',
+            "conflict",
+            false,
+            true,
+            Exit::Pending,
+        ),
+        (Action::Blocked, '?', "blocked", false, true, Exit::Pending),
+    ];
+
+    #[test]
+    fn every_action_has_its_documented_symbol_word_and_status() {
+        for (action, symbol, word, pending, attention, exit) in ACTIONS {
+            assert_eq!(action.symbol(), symbol, "{action:?}");
+            assert_eq!(action.to_string(), word, "{action:?}");
+            assert_eq!(action.is_pending(), pending, "{action:?}");
+            assert_eq!(action.needs_attention(), attention, "{action:?}");
+            assert_eq!(Exit::from_actions(&[action]), exit, "{action:?}");
+            assert_eq!(
+                Exit::from_actions(&[Action::Unchanged, action]),
+                exit,
+                "{action:?}"
+            );
+        }
+        let mut symbols: Vec<char> = ACTIONS.iter().map(|row| row.1).collect();
         symbols.sort_unstable();
         symbols.dedup();
-        assert_eq!(symbols.len(), all.len());
-    }
-
-    #[test]
-    fn symbols_are_the_documented_ones() {
-        assert_eq!(Action::Create.symbol(), '+');
-        assert_eq!(Action::Modify.symbol(), '~');
-        assert_eq!(Action::Conflict.symbol(), '!');
-        assert_eq!(Action::Blocked.symbol(), '?');
-        assert_eq!(Action::Unchanged.symbol(), '=');
-        assert_eq!(Action::Undeclared.symbol(), '*');
-        assert_eq!(Action::Sync.symbol(), '<');
-    }
-
-    #[test]
-    fn only_create_and_modify_are_pending_work() {
-        assert!(Action::Create.is_pending());
-        assert!(Action::Modify.is_pending());
-        assert!(!Action::Conflict.is_pending());
-        assert!(!Action::Blocked.is_pending());
-        assert!(!Action::Unchanged.is_pending());
-        assert!(!Action::Undeclared.is_pending());
-        assert!(!Action::Sync.is_pending());
-    }
-
-    #[test]
-    fn conflicts_and_blocked_targets_need_a_decision() {
-        assert!(Action::Conflict.needs_attention());
-        assert!(Action::Blocked.needs_attention());
-        for a in [
-            Action::Create,
-            Action::Modify,
-            Action::Sync,
-            Action::Unchanged,
-            Action::Undeclared,
-        ] {
-            assert!(!a.needs_attention(), "{a} should not need attention");
-        }
+        assert_eq!(symbols.len(), ACTIONS.len(), "symbols are distinct");
     }
 
     #[test]
@@ -327,29 +334,7 @@ mod tests {
             Action::Modify,
         ];
         actions.sort_unstable();
-        assert_eq!(
-            actions,
-            [
-                Action::Unchanged,
-                Action::Undeclared,
-                Action::Create,
-                Action::Modify,
-                Action::Sync,
-                Action::Conflict,
-                Action::Blocked,
-            ]
-        );
-    }
-
-    #[test]
-    fn actions_render_as_words() {
-        assert_eq!(Action::Conflict.to_string(), "conflict");
-        assert_eq!(Action::Blocked.to_string(), "blocked");
-        assert_eq!(Action::Unchanged.to_string(), "unchanged");
-        assert_eq!(Action::Create.to_string(), "create");
-        assert_eq!(Action::Modify.to_string(), "modify");
-        assert_eq!(Action::Undeclared.to_string(), "undeclared");
-        assert_eq!(Action::Sync.to_string(), "sync");
+        assert_eq!(actions, ACTIONS.map(|row| row.0));
     }
 
     #[test]
@@ -366,43 +351,6 @@ mod tests {
         assert_eq!(
             Exit::from_actions(&[Action::Unchanged, Action::Unchanged]),
             Exit::Converged
-        );
-    }
-
-    #[test]
-    fn an_undeclared_file_alone_exits_zero() {
-        // bx will never act on it and nothing is wrong with it: `apply` twice
-        // must still converge while the user decides whether to `bx rm` it.
-        assert_eq!(
-            Exit::from_actions(&[Action::Unchanged, Action::Undeclared]),
-            Exit::Converged
-        );
-    }
-
-    #[test]
-    fn pending_work_exits_two() {
-        assert_eq!(
-            Exit::from_actions(&[Action::Unchanged, Action::Create]),
-            Exit::Pending
-        );
-        assert_eq!(Exit::from_actions(&[Action::Modify]), Exit::Pending);
-    }
-
-    #[test]
-    fn a_conflict_alone_exits_two() {
-        // apply will skip it, but the machine is not converged and someone has
-        // to look — which is what a non-zero exit is for.
-        assert_eq!(Exit::from_actions(&[Action::Conflict]), Exit::Pending);
-    }
-
-    #[test]
-    fn a_blocked_target_alone_exits_two() {
-        // Same reasoning as a conflict: apply skips it, but the machine is not
-        // converged until someone installs the tool.
-        assert_eq!(Exit::from_actions(&[Action::Blocked]), Exit::Pending);
-        assert_eq!(
-            Exit::from_actions(&[Action::Unchanged, Action::Blocked]),
-            Exit::Pending
         );
     }
 
@@ -438,8 +386,6 @@ mod tests {
             summary(&[Action::Sync, Action::Unchanged]),
             "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 1 to sync."
         );
-        // Not pending, and not a conflict: apply has nothing to do about it.
-        assert_eq!(Exit::from_actions(&[Action::Sync]), Exit::Converged);
     }
 
     #[test]

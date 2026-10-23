@@ -287,141 +287,132 @@ mod tests {
         std::env::join_paths(dirs.iter().map(|d| d.path())).unwrap()
     }
 
-    #[test]
-    fn an_absolute_path_to_an_executable_is_found() {
-        let dir = TempDir::new().unwrap();
-        let exe = bin(&dir, "sccache", 0o755);
-        assert_eq!(locate(&exe, ""), Presence::Present { path: exe });
+    /// What one of a case's two directories holds under the name `sccache`.
+    #[derive(Debug, Clone, Copy)]
+    enum Entry {
+        Empty,
+        /// A regular file with this mode.
+        File(u32),
+        /// A directory. It carries `x` for "traversable", so it would slip past
+        /// the executability check on its own.
+        Dir,
+        /// A symlink to an executable in the other directory. The link's own
+        /// path is the one reported: that is where the tool is reachable from,
+        /// which is what a caller writing a config value needs.
+        Link,
+        /// A symlink to nothing.
+        Dangling,
     }
+    use Entry::{Dangling, Dir, Empty, File, Link};
+
+    /// What a case asks for: `sccache` as a bare name, `sccache` in one of
+    /// its directories by absolute path, or a string as given.
+    #[derive(Debug)]
+    enum Query {
+        Bare,
+        In(usize),
+        Name(&'static str),
+    }
+    use Query::{Bare, In, Name};
+
+    /// The answer a case expects: `sccache` in one of its directories, or
+    /// nothing.
+    #[derive(Debug)]
+    enum Expect {
+        Present(usize),
+        NotExec(usize),
+        Missing,
+    }
+    use Expect::{Missing, NotExec, Present};
+
+    /// `locate` over every layout whose answer is the same for every caller,
+    /// as (what the two directories hold, the query, the search path, the
+    /// answer). A search path of `None` is the two directories in order.
+    ///
+    /// - An absolute path is never backed by a path search: an implementation
+    ///   that fell back to searching after the direct miss would find the
+    ///   `sccache` in the second directory.
+    /// - A relative path, and an empty `PATH` entry, are not the working
+    ///   directory. cargo runs tests with the package root as the working
+    ///   directory, so `Cargo.toml` is there, and resolving it would answer
+    ///   `NotExecutable`. Its *mode* is deliberately irrelevant: a runner that
+    ///   copies the tree without preserving modes — cargo-mutants does — must
+    ///   still get the same answer.
+    /// - Of two inexecutable matches the first is reported, matching the
+    ///   search order.
+    /// - A file with no execute bit is inexecutable for every caller, root
+    ///   included: `X_OK` fails when no execute bit is set at all.
+    /// - An empty tool name names `<dir>/`, a directory, which is rejected like
+    ///   any other non-regular candidate.
+    const LOCATE: &[([Entry; 2], Query, Option<&str>, Expect)] = &[
+        // An absolute path is resolved directly.
+        ([File(0o755), Empty], In(0), Some(""), Present(0)),
+        ([File(0o644), Empty], In(0), Some(""), NotExec(0)),
+        ([Empty, Empty], In(0), Some(""), Missing),
+        ([Empty, File(0o755)], In(0), None, Missing),
+        // A relative path is not resolved at all.
+        ([Empty, Empty], Name("./Cargo.toml"), Some(""), Missing),
+        // A bare name is searched for, in order.
+        ([File(0o755), Empty], Bare, None, Present(0)),
+        ([Empty, File(0o755)], Bare, None, Present(1)),
+        ([File(0o755), File(0o755)], Bare, None, Present(0)),
+        ([File(0o700), Empty], Bare, None, Present(0)),
+        ([Link, Empty], Bare, None, Present(0)),
+        // An inexecutable match masks nothing, and is reported when nothing
+        // better is found.
+        ([File(0o644), File(0o755)], Bare, None, Present(1)),
+        ([File(0o644), File(0o600)], Bare, None, NotExec(0)),
+        ([File(0o600), Empty], Bare, None, NotExec(0)),
+        // Nothing that is not a regular file matches.
+        ([Dir, Empty], Bare, None, Missing),
+        ([Dangling, Empty], Bare, None, Missing),
+        ([Empty, Empty], Name(""), None, Missing),
+        // Neither an empty entry nor an empty path is the working directory.
+        ([Empty, Empty], Name("Cargo.toml"), Some(":"), Missing),
+        ([Empty, Empty], Bare, Some(""), Missing),
+    ];
 
     #[test]
-    fn an_absolute_path_to_a_non_executable_file_is_reported_as_such() {
-        let dir = TempDir::new().unwrap();
-        let file = bin(&dir, "sccache", 0o644);
-        assert_eq!(locate(&file, ""), Presence::NotExecutable { path: file });
-    }
-
-    #[test]
-    fn an_absolute_path_that_does_not_exist_is_missing() {
-        let dir = TempDir::new().unwrap();
-        assert_eq!(locate(dir.path().join("sccache"), ""), Presence::Missing);
-    }
-
-    #[test]
-    fn an_absolute_path_is_never_backed_by_a_path_search() {
-        let on_path = TempDir::new().unwrap();
-        let elsewhere = TempDir::new().unwrap();
-        // `sccache` *is* on the search path, so an implementation that fell
-        // back to searching after the direct miss would answer `Present`.
-        bin(&on_path, "sccache", 0o755);
-        assert_eq!(
-            locate(elsewhere.path().join("sccache"), path_of(&[&on_path])),
-            Presence::Missing
-        );
-    }
-
-    #[test]
-    fn a_relative_path_is_not_resolved_against_the_working_directory() {
-        // cargo runs tests with the package root as the working directory, so
-        // Cargo.toml is there. Its *mode* is deliberately irrelevant here: a
-        // runner that copies the tree without preserving modes — cargo-mutants
-        // does — must still get the same answer.
+    fn locate_answers_every_layout_as_documented() {
         assert!(
             Path::new("Cargo.toml").is_file(),
             "fixture: the working directory should be the package root"
         );
-        // Resolving it would answer `NotExecutable`; the answer must not depend
-        // on where the caller was standing.
-        assert_eq!(locate("./Cargo.toml", ""), Presence::Missing);
-    }
-
-    #[test]
-    fn a_bare_name_is_found_on_the_path() {
-        let dir = TempDir::new().unwrap();
-        let exe = bin(&dir, "sccache", 0o755);
-        assert_eq!(
-            locate("sccache", path_of(&[&dir])),
-            Presence::Present { path: exe }
-        );
-    }
-
-    #[test]
-    fn later_directories_are_searched_when_earlier_ones_miss() {
-        let first = TempDir::new().unwrap();
-        let second = TempDir::new().unwrap();
-        let exe = bin(&second, "sccache", 0o755);
-        assert_eq!(
-            locate("sccache", path_of(&[&first, &second])),
-            Presence::Present { path: exe }
-        );
-    }
-
-    #[test]
-    fn the_first_directory_on_the_path_wins() {
-        let first = TempDir::new().unwrap();
-        let second = TempDir::new().unwrap();
-        let shadowing = bin(&first, "sccache", 0o755);
-        bin(&second, "sccache", 0o755);
-        assert_eq!(
-            locate("sccache", path_of(&[&first, &second])),
-            Presence::Present { path: shadowing }
-        );
-    }
-
-    #[test]
-    fn a_directory_with_the_tools_name_is_not_a_match() {
-        let dir = TempDir::new().unwrap();
-        // A directory carries `x` for "traversable", so this is also the case
-        // that would slip past the executability check on its own.
-        fs::create_dir(dir.path().join("sccache")).unwrap();
-        assert_eq!(locate("sccache", path_of(&[&dir])), Presence::Missing);
-    }
-
-    #[test]
-    fn a_non_executable_earlier_on_the_path_does_not_mask_a_working_one() {
-        let first = TempDir::new().unwrap();
-        let second = TempDir::new().unwrap();
-        bin(&first, "sccache", 0o644);
-        let working = bin(&second, "sccache", 0o755);
-        assert_eq!(
-            locate("sccache", path_of(&[&first, &second])),
-            Presence::Present { path: working }
-        );
-    }
-
-    #[test]
-    fn a_non_executable_match_is_reported_when_nothing_better_is_found() {
-        let first = TempDir::new().unwrap();
-        let second = TempDir::new().unwrap();
-        let broken = bin(&first, "sccache", 0o644);
-        bin(&second, "sccache", 0o600);
-        // The first one found is the one reported, matching the search order.
-        assert_eq!(
-            locate("sccache", path_of(&[&first, &second])),
-            Presence::NotExecutable { path: broken }
-        );
-    }
-
-    #[test]
-    fn an_owner_executable_file_is_present() {
-        let dir = TempDir::new().unwrap();
-        let exe = bin(&dir, "sccache", 0o700);
-        assert_eq!(
-            locate("sccache", path_of(&[&dir])),
-            Presence::Present { path: exe }
-        );
-    }
-
-    #[test]
-    fn a_file_with_no_execute_bit_anywhere_is_not_executable() {
-        let dir = TempDir::new().unwrap();
-        let file = bin(&dir, "sccache", 0o600);
-        // Holds for every caller, root included: `X_OK` fails when no execute
-        // bit is set at all.
-        assert_eq!(
-            locate("sccache", path_of(&[&dir])),
-            Presence::NotExecutable { path: file }
-        );
+        for case @ (entries, query, search, expect) in LOCATE {
+            let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+            let sccache = |index: usize| dirs[index].path().join("sccache");
+            for (index, entry) in entries.iter().enumerate() {
+                match *entry {
+                    Empty => {}
+                    File(mode) => drop(bin(&dirs[index], "sccache", mode)),
+                    Dir => fs::create_dir(sccache(index)).unwrap(),
+                    Link => {
+                        let real = bin(&dirs[1 - index], "sccache-real", 0o755);
+                        std::os::unix::fs::symlink(real, sccache(index)).unwrap();
+                    }
+                    Dangling => {
+                        let gone = dirs[index].path().join("gone");
+                        std::os::unix::fs::symlink(gone, sccache(index)).unwrap();
+                    }
+                }
+            }
+            let tool: OsString = match query {
+                Bare => "sccache".into(),
+                In(index) => sccache(*index).into(),
+                Name(name) => name.into(),
+            };
+            let search = search.map_or_else(|| path_of(&[&dirs[0], &dirs[1]]), OsString::from);
+            let expected = match expect {
+                Present(index) => Presence::Present {
+                    path: sccache(*index),
+                },
+                NotExec(index) => Presence::NotExecutable {
+                    path: sccache(*index),
+                },
+                Missing => Presence::Missing,
+            };
+            assert_eq!(locate(tool, search), expected, "{case:?}");
+        }
     }
 
     #[test]
@@ -443,30 +434,6 @@ mod tests {
         assert_eq!(locate("sccache", path_of(&[&dir])), expected);
     }
 
-    #[test]
-    fn an_empty_path_entry_is_not_the_working_directory() {
-        assert!(
-            Path::new("Cargo.toml").is_file(),
-            "fixture: the working directory should be the package root"
-        );
-        // An implementation honouring the POSIX "an empty entry means `.`" rule
-        // would find Cargo.toml and report it inexecutable.
-        assert_eq!(locate("Cargo.toml", ":"), Presence::Missing);
-    }
-
-    #[test]
-    fn an_empty_path_finds_nothing() {
-        assert_eq!(locate("sccache", ""), Presence::Missing);
-    }
-
-    #[test]
-    fn an_empty_tool_name_finds_nothing() {
-        let dir = TempDir::new().unwrap();
-        // `<dir>/` is a directory, not a file, so it is rejected like any other
-        // non-regular candidate.
-        assert_eq!(locate("", path_of(&[&dir])), Presence::Missing);
-    }
-
     // APFS refuses a file name that is not UTF-8.
     #[cfg(target_os = "linux")]
     #[test]
@@ -479,29 +446,6 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         // A `&str` parameter could not express this call at all.
         assert_eq!(locate(name, path_of(&[&dir])), Presence::Present { path });
-    }
-
-    #[test]
-    fn a_symlink_to_an_executable_is_followed() {
-        let target_dir = TempDir::new().unwrap();
-        let dir = TempDir::new().unwrap();
-        let real = bin(&target_dir, "sccache-real", 0o755);
-        let link = dir.path().join("sccache");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        // The link's own path is reported, not the target's: that is where the
-        // tool is reachable from, which is what a caller writing a config value
-        // needs.
-        assert_eq!(
-            locate("sccache", path_of(&[&dir])),
-            Presence::Present { path: link }
-        );
-    }
-
-    #[test]
-    fn a_dangling_symlink_is_not_a_match() {
-        let dir = TempDir::new().unwrap();
-        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("sccache")).unwrap();
-        assert_eq!(locate("sccache", path_of(&[&dir])), Presence::Missing);
     }
 
     #[test]

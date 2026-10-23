@@ -1277,13 +1277,71 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_file_loads_as_fresh_and_empty() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let loaded: Loaded<Value> = locked_load(&dir.path().join("nope.mpk")).expect("load");
-        assert_eq!(loaded.health, Health::Fresh);
-        assert!(loaded.value.is_empty());
-        assert!(!loaded.health.is_reset());
-        assert_eq!(loaded.health.damage(), None);
+    fn what_a_file_holds_decides_its_health_and_damage_degrades_to_empty() {
+        // Each damage's text is pinned whole by
+        // `every_damage_says_what_is_wrong_with_the_file`.
+        let whole = encoded(KIND, VERSION, &sample());
+        let mut trailing = whole.clone();
+        trailing.extend_from_slice(b"\x00\x00leftovers");
+        let future = Damage::FutureVersion {
+            found: VERSION + 5,
+            supported: VERSION,
+        };
+        let wrong_kind = Damage::WrongKind {
+            found: OTHER.to_string(),
+        };
+        for (what, seed, health) in [
+            ("missing", None, Health::Fresh),
+            (
+                "older",
+                Some(encoded(KIND, VERSION - 1, &sample())),
+                Health::Loaded,
+            ),
+            (
+                "truncated",
+                Some(whole[..whole.len() / 2].to_vec()),
+                Health::Reset(Damage::Malformed),
+            ),
+            (
+                "garbage",
+                Some(b"this is certainly not MessagePack".to_vec()),
+                Health::Reset(Damage::Malformed),
+            ),
+            (
+                "trailing",
+                Some(trailing),
+                Health::Reset(Damage::TrailingBytes),
+            ),
+            (
+                "future",
+                Some(encoded(KIND, VERSION + 5, &sample())),
+                Health::Reset(future),
+            ),
+            (
+                "wrong kind",
+                Some(encoded(OTHER, VERSION, &sample())),
+                Health::Reset(wrong_kind),
+            ),
+        ] {
+            let (_dir, path) = state_file();
+            if let Some(seed) = &seed {
+                std::fs::write(&path, seed).expect("seed");
+            }
+            let loaded: Loaded<Value> = locked_load(&path).expect("load");
+            let damage = match &health {
+                Health::Reset(damage) => Some(damage.clone()),
+                _ => None,
+            };
+            let value = if health == Health::Loaded {
+                sample()
+            } else {
+                Value::new()
+            };
+            assert_eq!(loaded.health, health, "{what}");
+            assert_eq!(loaded.value, value, "{what}");
+            assert_eq!(loaded.health.is_reset(), damage.is_some(), "{what}");
+            assert_eq!(loaded.health.damage(), damage.as_ref(), "{what}");
+        }
     }
 
     #[test]
@@ -1424,63 +1482,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_older_version_still_loads() {
-        let (_dir, path) = state_file();
-        std::fs::write(&path, encoded(KIND, VERSION - 1, &sample())).expect("seed");
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(loaded.health, Health::Loaded);
-        assert_eq!(loaded.value, sample());
-    }
-
-    #[test]
-    fn a_truncated_file_degrades_to_empty() {
-        let (_dir, path) = state_file();
-        let bytes = encoded(KIND, VERSION, &sample());
-        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("seed");
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
-        assert!(loaded.value.is_empty());
-    }
-
-    #[test]
-    fn garbage_bytes_degrade_to_empty() {
-        let (_dir, path) = state_file();
-        std::fs::write(&path, b"this is certainly not MessagePack").expect("seed");
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
-        assert!(loaded.value.is_empty());
-    }
-
-    #[test]
-    fn trailing_bytes_are_damage_not_a_silent_half_read() {
-        let (_dir, path) = state_file();
-        let mut bytes = encoded(KIND, VERSION, &sample());
-        bytes.extend_from_slice(b"\x00\x00leftovers");
-        std::fs::write(&path, &bytes).expect("seed");
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(loaded.health, Health::Reset(Damage::TrailingBytes));
-        assert!(loaded.value.is_empty());
-    }
-
-    #[test]
-    fn a_future_version_degrades_and_names_the_version() {
-        let (_dir, path) = state_file();
-        std::fs::write(&path, encoded(KIND, VERSION + 5, &sample())).expect("seed");
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(
-            loaded.health,
-            Health::Reset(Damage::FutureVersion {
-                found: VERSION + 5,
-                supported: VERSION,
-            }),
-        );
-        assert!(loaded.value.is_empty());
-        let message = loaded.health.damage().expect("damage").to_string();
-        assert!(message.contains("version 8"), "got {message}");
-        assert!(message.contains("up to 3"), "got {message}");
-    }
-
     /// An envelope of `version` whose payload is a shape [`Value`] is not, as
     /// a newer format that changed the payload would write.
     fn reshaped(version: u16) -> Vec<u8> {
@@ -1615,18 +1616,41 @@ mod tests {
     }
 
     #[test]
-    fn a_file_of_the_wrong_kind_is_not_accepted() {
-        let (_dir, path) = state_file();
-        std::fs::write(&path, encoded(OTHER, VERSION, &sample())).expect("seed");
-        let loaded: Loaded<Value> = locked_load(&path).expect("load");
-        assert_eq!(
-            loaded.health,
-            Health::Reset(Damage::WrongKind {
-                found: OTHER.to_string(),
-            }),
-        );
-        let message = loaded.health.damage().expect("damage").to_string();
-        assert!(message.contains(OTHER), "got {message}");
+    fn a_recomputable_link_that_cannot_be_followed_degrades_and_only_the_link_moves() {
+        // A link to nothing, one that loops (`ELOOP`), and one whose path runs
+        // through a file (`ENOTDIR`) are each a `DanglingLink`: fatal for the
+        // ledger, and for a file whose loss costs a recomputation, damage. A
+        // lockless reader leaves the link where it is; the lock holder moves
+        // the link itself aside, never creating its far end.
+        for far in ["unmounted/v.mpk", "v.mpk", "a-file/v.mpk"] {
+            let (dir, path) = state_file();
+            std::fs::write(dir.path().join("a-file"), b"not a directory").expect("a file");
+            let far = dir.path().join(far);
+            std::os::unix::fs::symlink(&far, &path).expect("symlink");
+            let shown = far.display();
+
+            let read = load::<Value>(&path, KIND, VERSION, Loss::Recomputable, None)
+                .unwrap_or_else(|e| panic!("{shown}: {e}"));
+            assert_eq!(
+                read.health,
+                Health::Damaged(Damage::DanglingLink),
+                "{shown}"
+            );
+            assert!(read.value.is_empty(), "{shown}");
+            assert_eq!(std::fs::read_link(&path).expect("left in place"), far);
+
+            let opened: Loaded<Value> =
+                locked_load(&path).unwrap_or_else(|e| panic!("{shown}: {e}"));
+            assert_eq!(
+                opened.health,
+                Health::Reset(Damage::DanglingLink),
+                "{shown}"
+            );
+            let aside = StateDir::quarantine(&path);
+            assert_eq!(std::fs::read_link(&aside).expect("the link, moved"), far);
+            assert!(std::fs::symlink_metadata(&path).is_err(), "{shown}");
+            assert!(!dir.path().join("unmounted").exists(), "{shown}");
+        }
     }
 
     #[test]

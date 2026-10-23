@@ -853,46 +853,22 @@ mod tests {
     }
 
     #[test]
-    fn the_default_location_is_under_local_state() {
-        let dir = StateDir::resolve(Path::new("/home/someone"));
-        assert_eq!(dir.root(), Path::new("/home/someone/.local/state/bx"));
-    }
-
-    #[test]
-    fn an_absolute_xdg_state_home_is_honoured() {
-        let dir = StateDir::resolve_in(Path::new("/home/someone"), Some(OsStr::new("/srv/state")));
-        assert_eq!(dir.root(), Path::new("/srv/state/bx"));
-    }
-
-    #[test]
-    fn a_relative_or_empty_xdg_state_home_is_ignored() {
-        for bogus in ["", "relative/state"] {
-            let dir = StateDir::resolve_in(Path::new("/home/someone"), Some(OsStr::new(bogus)));
-            assert_eq!(dir.root(), Path::new("/home/someone/.local/state/bx"));
-        }
-    }
-
-    #[test]
     fn the_layer_loader_and_the_state_directory_agree() {
         // The local layer and the ledger must be in the same directory, and
         // `local.toml` must be one file with one name. Both are delegated
-        // rather than repeated; this is the test that says so.
+        // rather than repeated; this is the test that says so. What the
+        // resolution answers is `paths::state_dir`'s to test.
         let home = Path::new("/home/someone");
-        for xdg in [None, Some(OsStr::new("/srv/state"))] {
+        for xdg in [None, Some(OsStr::new("/srv/state")), Some(OsStr::new(""))] {
             let dir = StateDir::resolve_in(home, xdg);
             let resolved = crate::paths::state_dir(home, xdg);
             assert_eq!(dir.root(), resolved);
             assert_eq!(dir.local_toml(), crate::paths::local_layer_path(&resolved));
         }
-    }
-
-    #[test]
-    fn two_homes_resolve_to_two_state_directories() {
-        let a = StateDir::resolve(Path::new("/tmp/a"));
-        let b = StateDir::resolve(Path::new("/tmp/b"));
-        assert_ne!(a.root(), b.root());
-        assert!(a.root().starts_with("/tmp/a"));
-        assert!(b.root().starts_with("/tmp/b"));
+        assert_eq!(
+            StateDir::resolve(home).root(),
+            crate::paths::state_dir(home, None)
+        );
     }
 
     #[test]
@@ -924,49 +900,40 @@ mod tests {
     }
 
     #[test]
-    fn ensure_creates_the_state_directory_at_0700() {
-        let (_home, dir) = guarded_state();
-        dir.ensure().expect("ensure");
-        assert!(dir.root().is_dir());
-        assert_eq!(mode_of(dir.root()), Mode::PRIVATE_DIR);
-    }
-
-    #[test]
-    fn ensure_creates_restore_and_shell_at_0700() {
-        let (_home, dir) = guarded_state();
-        dir.ensure().expect("ensure");
-        assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR);
-        assert_eq!(mode_of(&dir.shell()), Mode::PRIVATE_DIR);
-    }
-
-    #[test]
-    fn ensure_is_idempotent() {
+    fn ensure_creates_every_directory_at_0700_and_sets_any_other_mode_back() {
+        // The repair fired on `is_shared` — `mode & 0o077` — once, which is
+        // structurally unable to see a mode wrong in the OWNER bits, so a
+        // `0500` state directory was deliberately left, and every later write
+        // into it failed `EACCES` with no repair and no diagnostic. The lock
+        // file is repaired on inequality for exactly this reason; one rule
+        // now governs both.
         let (_home, dir) = guarded_state();
         dir.ensure().expect("first");
-        let before: Vec<_> = std::fs::read_dir(dir.root())
-            .expect("read_dir")
-            .map(|e| e.expect("entry").file_name())
-            .collect();
-        dir.ensure().expect("second");
-        let after: Vec<_> = std::fs::read_dir(dir.root())
-            .expect("read_dir")
-            .map(|e| e.expect("entry").file_name())
-            .collect();
-        assert_eq!(before, after);
-        assert_eq!(mode_of(dir.root()), Mode::PRIVATE_DIR);
-    }
-
-    #[test]
-    fn ensure_tightens_a_group_readable_state_directory() {
-        let (_home, dir) = guarded_state();
-        dir.ensure().expect("first");
-        std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o755))
-            .expect("widen");
-        std::fs::set_permissions(dir.restore(), std::fs::Permissions::from_mode(0o750))
-            .expect("widen");
-        dir.ensure().expect("second");
-        assert_eq!(mode_of(dir.root()), Mode::PRIVATE_DIR);
-        assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR);
+        let names = || {
+            let mut names: Vec<_> = std::fs::read_dir(dir.root())
+                .expect("read_dir")
+                .map(|e| e.expect("entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let created = names();
+        let all = [dir.root().to_path_buf(), dir.restore(), dir.shell()];
+        for path in &all {
+            assert_eq!(mode_of(path), Mode::PRIVATE_DIR, "{}", path.display());
+        }
+        for path in &all {
+            for wrong in [0o500, 0o600, 0o750, 0o755, 0o770] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(wrong))
+                    .expect("set");
+                dir.ensure().expect("again");
+                for path in &all {
+                    let shown = path.display();
+                    assert_eq!(mode_of(path), Mode::PRIVATE_DIR, "{shown} from {wrong:04o}");
+                }
+            }
+        }
+        assert_eq!(names(), created, "ensure is idempotent");
     }
 
     #[test]
@@ -1001,24 +968,6 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("reachable beyond its owner"), "{said}");
-    }
-
-    #[test]
-    fn ensure_sets_a_directory_that_is_not_0700_back_to_it() {
-        // r4 round 2 (CL3): the repair fired on `is_shared` — `mode & 0o077` —
-        // which is structurally unable to see a mode wrong in the OWNER bits,
-        // so a `0500` state directory was deliberately left, and every later
-        // write into it failed `EACCES` with no repair and no diagnostic. The
-        // lock file is repaired on inequality for exactly this reason; one
-        // rule now governs both.
-        let (_home, dir) = guarded_state();
-        dir.ensure().expect("first");
-        for wrong in [0o500, 0o600, 0o755, 0o770] {
-            std::fs::set_permissions(dir.shell(), std::fs::Permissions::from_mode(wrong))
-                .expect("set");
-            dir.ensure().expect("second");
-            assert_eq!(mode_of(&dir.shell()), Mode::PRIVATE_DIR, "from {wrong:04o}",);
-        }
     }
 
     #[test]

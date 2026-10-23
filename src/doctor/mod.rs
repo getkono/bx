@@ -616,7 +616,7 @@ login-shell = \"zsh\"
     }
 
     #[test]
-    fn what_the_last_update_check_found_reaches_the_report_as_a_note() {
+    fn what_the_last_update_check_found_is_a_note_and_a_stopped_update_a_finding() {
         let home = guarded_home();
         home.write(
             ".config/bx/bx.lock",
@@ -639,6 +639,13 @@ login-shell = \"zsh\"
             )
         );
         assert_eq!(code, Exit::Converged);
+
+        // `run` carries `externals::check`'s findings into the report too.
+        let stopped = format!("{}the remote was unreachable", crate::update::STOPPED);
+        std::fs::write(&last, format!("{stopped}\n")).unwrap();
+        let (out, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unreachable());
+        assert!(out.starts_with("  ! bx update "), "{out}");
+        assert_eq!(code, Exit::Pending);
     }
 
     #[test]

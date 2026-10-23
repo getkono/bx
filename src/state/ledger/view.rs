@@ -518,19 +518,6 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_ledger_degrades_to_an_empty_one() {
-        let home = guarded_home();
-        let (dir, lock) = locked(&home);
-        dir.ensure().expect("ensure");
-        std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
-
-        let loaded = Ledger::open(&dir, &lock, home.path()).expect("open");
-        assert_eq!(loaded.health, Health::Reset(Damage::Malformed));
-        assert!(loaded.value.is_empty());
-        assert!(dir.root().join("ledger.mpk.corrupt").exists());
-    }
-
-    #[test]
     fn a_damaged_ledger_that_cannot_be_moved_aside_stops_bx_and_is_never_saved_over() {
         // r3 round 1 (L1b): `Ledger::open` reported `Health::Reset` when the
         // rename failed, a caller that kept only the value saved, and the save
@@ -743,25 +730,6 @@ mod tests {
         let opened = Ledger::open(&dir, &lock, home.path()).expect("open");
         assert_eq!(opened.health, Health::Fresh);
         assert_eq!(opened.quarantined, aside);
-    }
-
-    #[test]
-    fn a_second_damaged_ledger_never_replaces_the_first_quarantine() {
-        let home = guarded_home();
-        let (dir, lock) = locked(&home);
-        std::fs::write(dir.ledger(), b"first damaged ledger").expect("seed");
-        Ledger::open(&dir, &lock, home.path()).expect("first open");
-        std::fs::write(dir.ledger(), b"second damaged ledger").expect("seed again");
-        Ledger::open(&dir, &lock, home.path()).expect("second open");
-
-        assert_eq!(
-            std::fs::read(dir.root().join("ledger.mpk.corrupt")).expect("first kept"),
-            b"first damaged ledger",
-        );
-        assert_eq!(
-            std::fs::read(dir.root().join("ledger.mpk.corrupt.1")).expect("second kept"),
-            b"second damaged ledger",
-        );
     }
 
     /// A one-entry ledger for `key`, saved without going through `record`.

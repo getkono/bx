@@ -1008,29 +1008,23 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_is_final_before_any_content_exists() {
-        let home = guarded_home();
-        let staged = stage_now(&home.child("secret"), Mode::PRIVATE_FILE).expect("stage");
-
+    fn the_mode_is_final_before_any_content_exists_and_never_wider() {
         // Observable on the temporary file, while it is still empty: this is
-        // the property a decrypted secret depends on.
-        let meta = std::fs::symlink_metadata(staged.temp_path()).expect("stat");
-        assert_eq!(mode_of(&meta), Mode::PRIVATE_FILE);
-        assert_eq!(meta.len(), 0, "the mode is set before any content");
-        assert_eq!(staged.mode(), Mode::PRIVATE_FILE);
-    }
-
-    #[test]
-    fn the_temporary_file_is_never_wider_than_its_final_mode() {
-        let home = guarded_home();
-        // tempfile creates at 0600 and the declared mode only narrows it, so
-        // there is no instant at which the file is wider than 0600.
-        let staged = stage_now(&home.child("secret"), Mode::from_bits(0o400)).expect("stage");
-        assert_eq!(mode_of_path(staged.temp_path()), Mode::from_bits(0o400));
-        let filled = staged.fill(b"plaintext").expect("fill");
-        assert_eq!(mode_of_path(filled.temp_path()), Mode::from_bits(0o400));
-        filled.publish().expect("publish");
-        assert_eq!(mode_of_path(&home.child("secret")), Mode::from_bits(0o400));
+        // the property a decrypted secret depends on. tempfile creates at 0600
+        // and the declared mode only narrows it, so there is no instant at
+        // which the file is wider than 0600.
+        for mode in [Mode::PRIVATE_FILE, Mode::from_bits(0o400)] {
+            let home = guarded_home();
+            let staged = stage_now(&home.child("secret"), mode).expect("stage");
+            let meta = std::fs::symlink_metadata(staged.temp_path()).expect("stat");
+            assert_eq!(mode_of(&meta), mode);
+            assert_eq!(meta.len(), 0, "the mode is set before any content");
+            assert_eq!(staged.mode(), mode);
+            let filled = staged.fill(b"plaintext").expect("fill");
+            assert_eq!(mode_of_path(filled.temp_path()), mode);
+            filled.publish().expect("publish");
+            assert_eq!(mode_of_path(&home.child("secret")), mode);
+        }
     }
 
     #[test]
@@ -1062,41 +1056,30 @@ mod tests {
     }
 
     #[test]
-    fn an_abandoned_stage_leaves_the_original_intact() {
-        let home = guarded_home();
-        let dest = home.child("f");
-        seed(&dest, b"v1", Mode::DEFAULT_FILE);
+    fn a_write_abandoned_at_either_phase_leaves_the_original_intact() {
+        // Filled is the crash phase that matters: the content is on disk and
+        // fsynced, and the rename has not happened.
+        for fill in [false, true] {
+            let home = guarded_home();
+            let dest = home.child("f");
+            seed(&dest, b"v1", Mode::DEFAULT_FILE);
 
-        let staged = stage_now(&dest, Mode::PRIVATE_FILE).expect("stage");
-        let temp = staged.temp_path().to_path_buf();
-        staged.abandon();
+            let staged = stage_now(&dest, Mode::PRIVATE_FILE).expect("stage");
+            let temp = staged.temp_path().to_path_buf();
+            if fill {
+                let filled = staged.fill(b"v2").expect("fill");
+                assert_eq!(std::fs::read(&temp).expect("read temp"), b"v2");
+                assert_eq!(std::fs::read(&dest).expect("read"), b"v1");
+                filled.abandon();
+            } else {
+                staged.abandon();
+            }
 
-        assert_eq!(std::fs::read(&dest).expect("read"), b"v1");
-        assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
-        assert!(!temp.exists(), "no .bx- orphan survives an abandoned write");
-        assert_eq!(names_in(home.path()), vec![OsString::from("f")]);
-    }
-
-    #[test]
-    fn an_abandoned_filled_write_leaves_the_original_intact() {
-        let home = guarded_home();
-        let dest = home.child("f");
-        seed(&dest, b"v1", Mode::DEFAULT_FILE);
-
-        // The crash phase that matters: the content is on disk and fsynced, and
-        // the rename has not happened.
-        let filled = stage_now(&dest, Mode::PRIVATE_FILE)
-            .expect("stage")
-            .fill(b"v2")
-            .expect("fill");
-        let temp = filled.temp_path().to_path_buf();
-        assert_eq!(std::fs::read(&temp).expect("read temp"), b"v2");
-        assert_eq!(std::fs::read(&dest).expect("read"), b"v1");
-        filled.abandon();
-
-        assert_eq!(std::fs::read(&dest).expect("read"), b"v1");
-        assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE);
-        assert!(!temp.exists());
+            assert_eq!(std::fs::read(&dest).expect("read"), b"v1", "{fill}");
+            assert_eq!(mode_of_path(&dest), Mode::DEFAULT_FILE, "{fill}");
+            assert!(!temp.exists(), "no .bx- orphan survives an abandoned write");
+            assert_eq!(names_in(home.path()), vec![OsString::from("f")]);
+        }
     }
 
     #[test]
@@ -1146,22 +1129,17 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_replaces_content_and_mode_together() {
-        let home = guarded_home();
-        let dest = home.child("f");
-        seed(&dest, b"v1", Mode::DEFAULT_FILE);
-        write_atomically(&dest, b"v2", Mode::PRIVATE_FILE).expect("write");
-        assert_eq!(std::fs::read(&dest).expect("read"), b"v2");
-        assert_eq!(mode_of_path(&dest), Mode::PRIVATE_FILE);
-    }
-
-    #[test]
-    fn a_write_creates_the_file_at_the_requested_mode() {
-        let home = guarded_home();
-        let dest = home.child("f");
-        write_atomically(&dest, b"hello", Mode::PRIVATE_FILE).expect("write");
-        assert_eq!(std::fs::read(&dest).expect("read"), b"hello");
-        assert_eq!(mode_of_path(&dest), Mode::PRIVATE_FILE);
+    fn a_write_creates_or_replaces_content_and_mode_together() {
+        for replaces in [false, true] {
+            let home = guarded_home();
+            let dest = home.child("f");
+            if replaces {
+                seed(&dest, b"v1", Mode::DEFAULT_FILE);
+            }
+            write_atomically(&dest, b"v2", Mode::PRIVATE_FILE).expect("write");
+            assert_eq!(std::fs::read(&dest).expect("read"), b"v2", "{replaces}");
+            assert_eq!(mode_of_path(&dest), Mode::PRIVATE_FILE, "{replaces}");
+        }
     }
 
     #[test]
@@ -1206,13 +1184,6 @@ mod tests {
             names_in(home.path()),
             vec![OsString::from("f"), OsString::from("sibling")],
         );
-    }
-
-    #[test]
-    fn a_write_leaves_no_temporary_file_behind() {
-        let home = guarded_home();
-        write_atomically(&home.child("f"), b"x", Mode::DEFAULT_FILE).expect("write");
-        assert_eq!(names_in(home.path()), vec![OsString::from("f")]);
     }
 
     #[test]

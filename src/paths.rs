@@ -737,119 +737,75 @@ mod tests {
     }
 
     #[test]
-    fn a_path_under_home_becomes_tilde_relative() {
-        assert_eq!(
-            to_portable(Path::new("/var/home/example/.gitconfig"), home()),
-            "~/.gitconfig"
-        );
-    }
-
-    #[test]
-    fn a_nested_path_keeps_its_tail() {
-        assert_eq!(
-            to_portable(
-                Path::new("/var/home/example/.ssh/config.d/10-hosts.conf"),
-                home()
+    fn a_path_under_home_becomes_tilde_relative_and_renders_back() {
+        // `/var/home/example-backup` is not inside `/var/home/example`: a
+        // prefix that is not a path component does not match.
+        for (path, portable) in [
+            ("/var/home/example/.gitconfig", "~/.gitconfig"),
+            (
+                "/var/home/example/.ssh/config.d/10-hosts.conf",
+                "~/.ssh/config.d/10-hosts.conf",
             ),
-            "~/.ssh/config.d/10-hosts.conf"
-        );
+            (
+                "/var/home/example/.config/starship.toml",
+                "~/.config/starship.toml",
+            ),
+            ("/var/home/example", "~"),
+            ("/usr/bin/sccache", "/usr/bin/sccache"),
+            ("/var/home/example-backup/x", "/var/home/example-backup/x"),
+        ] {
+            assert_eq!(to_portable(Path::new(path), home()), portable, "{path}");
+            assert_eq!(render(portable, home()), Path::new(path), "{portable}");
+        }
     }
 
     #[test]
-    fn home_itself_is_a_bare_tilde() {
-        assert_eq!(to_portable(home(), home()), "~");
+    fn rendering_expands_only_this_accounts_tilde() {
+        // The whole point: one repo, two machines. Another user's home is
+        // never expanded.
+        for (portable, home, rendered) in [
+            ("~/.gitconfig", "/home/other", "/home/other/.gitconfig"),
+            (
+                "~/.gitconfig",
+                "/var/home/example",
+                "/var/home/example/.gitconfig",
+            ),
+            ("~", "/var/home/example", "/var/home/example"),
+            ("/usr/bin/sccache", "/var/home/example", "/usr/bin/sccache"),
+            (
+                "~other/.linuxbrew",
+                "/var/home/example",
+                "~other/.linuxbrew",
+            ),
+        ] {
+            assert_eq!(
+                render(portable, Path::new(home)),
+                Path::new(rendered),
+                "{portable} under {home}"
+            );
+        }
     }
 
     #[test]
-    fn a_path_outside_home_is_left_absolute() {
-        assert_eq!(
-            to_portable(Path::new("/usr/bin/sccache"), home()),
-            "/usr/bin/sccache"
-        );
-    }
-
-    #[test]
-    fn a_prefix_that_is_not_a_path_component_does_not_match() {
-        // /var/home/example-backup is not inside /var/home/example.
-        assert_eq!(
-            to_portable(Path::new("/var/home/example-backup/x"), home()),
-            "/var/home/example-backup/x"
-        );
-    }
-
-    #[test]
-    fn rendering_reverses_portability() {
-        let original = Path::new("/var/home/example/.config/starship.toml");
-        assert_eq!(render(&to_portable(original, home()), home()), original);
-    }
-
-    #[test]
-    fn the_same_repo_renders_against_a_different_home() {
-        // The whole point: one repo, two machines.
-        assert_eq!(
-            render("~/.gitconfig", Path::new("/home/other")),
-            Path::new("/home/other/.gitconfig")
-        );
-        assert_eq!(
-            render("~/.gitconfig", home()),
-            Path::new("/var/home/example/.gitconfig")
-        );
-    }
-
-    #[test]
-    fn a_bare_tilde_renders_to_home() {
-        assert_eq!(render("~", home()), home());
-    }
-
-    #[test]
-    fn an_absolute_path_renders_unchanged() {
-        assert_eq!(
-            render("/usr/bin/sccache", home()),
-            Path::new("/usr/bin/sccache")
-        );
-    }
-
-    #[test]
-    fn another_users_home_is_never_expanded() {
-        assert_eq!(
-            render("~other/.linuxbrew", home()),
-            Path::new("~other/.linuxbrew")
-        );
-    }
-
-    #[test]
-    fn content_expands_a_leading_tilde_per_line() {
-        let rendered = render_content("~/.cargo/bin\n~/.local/bin\n", home());
-        assert_eq!(
-            rendered,
-            "/var/home/example/.cargo/bin\n/var/home/example/.local/bin\n"
-        );
-    }
-
-    #[test]
-    fn content_preserves_indentation() {
-        let rendered = render_content("  ~/.ssh/config.d/*.conf\n", home());
-        assert_eq!(rendered, "  /var/home/example/.ssh/config.d/*.conf\n");
-    }
-
-    #[test]
-    fn a_tilde_that_is_not_leading_is_content() {
-        // Rendering must never corrupt a file body: these are all real config.
-        let body = "path = a~b\nignore = *~\nbackup=~/x is not leading\n";
-        assert_eq!(render_content(body, home()), body);
-    }
-
-    #[test]
-    fn content_without_a_trailing_newline_is_preserved() {
-        assert_eq!(
-            render_content("~/.gitconfig", home()),
-            "/var/home/example/.gitconfig"
-        );
-    }
-
-    #[test]
-    fn empty_content_stays_empty() {
-        assert_eq!(render_content("", home()), "");
+    fn content_expands_a_leading_tilde_per_line_and_nothing_else() {
+        // Rendering must never corrupt a file body: the tildes that are not
+        // leading are all real config.
+        let untouched = "path = a~b\nignore = *~\nbackup=~/x is not leading\n";
+        for (body, rendered) in [
+            (
+                "~/.cargo/bin\n~/.local/bin\n",
+                "/var/home/example/.cargo/bin\n/var/home/example/.local/bin\n",
+            ),
+            (
+                "  ~/.ssh/config.d/*.conf\n",
+                "  /var/home/example/.ssh/config.d/*.conf\n",
+            ),
+            (untouched, untouched),
+            ("~/.gitconfig", "/var/home/example/.gitconfig"),
+            ("", ""),
+        ] {
+            assert_eq!(render_content(body, home()), rendered, "{body:?}");
+        }
     }
 
     // --- the XDG rule -----------------------------------------------------
@@ -1558,56 +1514,52 @@ mod tests {
     // --- lexical normalisation --------------------------------------------
 
     #[test]
-    fn normalize_removes_dot_and_dotdot() {
-        assert_eq!(
-            normalize(Path::new("/var/mnt/scratch/./one/../example/cache")),
-            Path::new("/var/mnt/scratch/example/cache")
-        );
-        assert_eq!(normalize(Path::new("./a/b")), Path::new("a/b"));
+    fn normalize_resolves_dots_and_slashes_lexically() {
+        for (path, normal) in [
+            // `.` and `..` are removed.
+            (
+                "/var/mnt/scratch/./one/../example/cache",
+                "/var/mnt/scratch/example/cache",
+            ),
+            ("./a/b", "a/b"),
+            // Repeated and trailing slashes collapse.
+            ("/var//mnt///scratch/", "/var/mnt/scratch"),
+            // The root's parent is the root, so a `..` chain cannot escape it
+            // and cannot be used to smuggle a path out of a declared root.
+            ("/../../..", "/"),
+            ("/a/../../b", "/b"),
+            // Nothing precedes a leading `..` in a relative path, so dropping
+            // it would name a different directory.
+            ("../../a", "../../a"),
+            ("a/../../b", "../b"),
+            // An empty result is `.`.
+            ("", "."),
+            (".", "."),
+            ("a/..", "."),
+            // A path that does not exist is normalised and left alone, which
+            // `canonicalize` could not do.
+            (
+                "/var/mnt/scratch/example/does/not/exist",
+                "/var/mnt/scratch/example/does/not/exist",
+            ),
+        ] {
+            assert_eq!(normalize(Path::new(path)), Path::new(normal), "{path}");
+        }
     }
 
-    #[test]
-    fn normalize_collapses_repeated_and_trailing_slashes() {
-        assert_eq!(
-            normalize(Path::new("/var//mnt///scratch/")),
-            Path::new("/var/mnt/scratch")
-        );
-    }
-
-    #[test]
-    fn normalize_does_not_walk_above_the_root() {
-        // The root's parent is the root, so a `..` chain cannot escape it and
-        // cannot be used to smuggle a path out of a declared root.
-        assert_eq!(normalize(Path::new("/../../..")), Path::new("/"));
-        assert_eq!(normalize(Path::new("/a/../../b")), Path::new("/b"));
-    }
-
-    #[test]
-    fn normalize_keeps_a_leading_dotdot_in_a_relative_path() {
-        // Nothing precedes it, so dropping it would name a different directory.
-        assert_eq!(normalize(Path::new("../../a")), Path::new("../../a"));
-        assert_eq!(normalize(Path::new("a/../../b")), Path::new("../b"));
-    }
-
-    #[test]
-    fn normalize_reduces_an_empty_result_to_dot() {
-        assert_eq!(normalize(Path::new("")), Path::new("."));
-        assert_eq!(normalize(Path::new(".")), Path::new("."));
-        assert_eq!(normalize(Path::new("a/..")), Path::new("."));
-    }
-
-    #[test]
-    fn normalize_never_touches_the_filesystem() {
-        // Normalising a path that does not exist succeeds and leaves it alone,
-        // which `canonicalize` could not do.
-        let absent = Path::new("/var/mnt/scratch/example/does/not/exist");
-        assert_eq!(normalize(absent), absent);
-    }
-
-    #[test]
-    fn normalize_is_idempotent() {
-        let once = normalize(Path::new("/a/./b/../c//d/"));
-        assert_eq!(normalize(&once), once);
+    proptest::proptest! {
+        #[test]
+        fn normalize_is_idempotent(
+            absolute in proptest::bool::ANY,
+            parts in proptest::collection::vec(
+                proptest::sample::select(vec!["", ".", "..", "a", "b"]),
+                0..8,
+            ),
+        ) {
+            let path = format!("{}{}", if absolute { "/" } else { "" }, parts.join("/"));
+            let once = normalize(Path::new(&path));
+            proptest::prop_assert_eq!(normalize(&once), once, "{}", path);
+        }
     }
 
     /// The recorded limit: a home reached through a symlinked alias is not seen.

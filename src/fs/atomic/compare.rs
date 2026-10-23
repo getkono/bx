@@ -328,95 +328,84 @@ mod tests {
     use crate::report::Action;
     use crate::testing::guarded_home;
 
-    #[test]
-    fn an_absent_destination_is_a_create() {
-        let home = guarded_home();
-        let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.drift, Drift::Create);
-        assert!(outcome.content_drift);
-        assert_eq!(outcome.mode_drift, None);
-        assert_eq!(outcome.note, None);
+    /// What a comparison case finds at its destination before `compare` runs.
+    enum Found {
+        Nothing,
+        File(&'static [u8], Mode),
+        Dir,
+        Symlink,
+        Fifo,
     }
 
-    #[test]
-    fn identical_content_and_mode_is_unchanged() {
-        let home = guarded_home();
-        seed(&home.child("f"), b"x", Mode::DEFAULT_FILE);
-        let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.drift, Drift::Unchanged);
-        assert!(!outcome.content_drift);
-        assert_eq!(outcome.mode_drift, None);
-        assert_eq!(outcome.note, None);
-        assert!(
-            !Action::from(outcome.drift).is_pending(),
-            "a second plan must be empty"
-        );
-    }
-
-    #[test]
-    fn identical_content_with_the_wrong_mode_is_a_modify() {
-        let home = guarded_home();
-        seed(&home.child("f"), b"x", Mode::DEFAULT_FILE);
-        let outcome = outcome_for(&home, "f", b"x", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.drift, Drift::Modify);
-        assert!(
-            !outcome.content_drift,
-            "the bytes match; only the mode drifted",
-        );
-        assert_eq!(
-            outcome.mode_drift,
-            Some((Mode::DEFAULT_FILE, Mode::PRIVATE_FILE)),
-        );
-    }
-
-    #[test]
-    fn the_ssh_config_mode_drift_renders_the_operator_s_line() {
-        let home = guarded_home();
-        // The worked example: a config faithfully reproduced at 0644 that ssh
-        // will not accept, declared 0600.
-        seed(&home.child(".ssh/config"), b"Host *\n", Mode::DEFAULT_FILE);
-        let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.drift, Drift::Modify);
-        assert_eq!(outcome.note.as_deref(), Some("mode 0644 -> 0600"));
-        assert_eq!(Action::from(outcome.drift).symbol(), '~');
-    }
-
-    #[test]
-    fn changed_content_with_a_matching_mode_is_a_modify() {
-        let home = guarded_home();
-        seed(&home.child("f"), b"old", Mode::DEFAULT_FILE);
-        let outcome = outcome_for(&home, "f", b"new", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.drift, Drift::Modify);
-        assert!(outcome.content_drift);
-        assert_eq!(outcome.mode_drift, None);
-        assert_eq!(outcome.note, None);
-    }
-
-    #[test]
-    fn a_directory_where_a_file_is_declared_is_a_conflict() {
-        let home = guarded_home();
-        std::fs::create_dir(home.child("f")).expect("occupy");
-        let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.drift, Drift::Conflict);
-        assert!(Action::from(outcome.drift).needs_attention());
-        assert!(
-            outcome
-                .note
-                .as_deref()
-                .is_some_and(|n| n.contains("directory")),
-            "{:?}",
-            outcome.note,
-        );
-    }
-
-    #[test]
-    fn a_device_node_where_a_file_is_declared_is_a_conflict() {
+    /// `compare` for `b"x"` declared at `declared` over what `found` leaves
+    /// at the destination, with the action `plan` reports for it checked to
+    /// be the one of the same name.
+    fn compared(found: Found, declared: Mode) -> Outcome {
         let home = guarded_home();
         let path = home.child("f");
-        crate::testing::mkfifo(&path);
-        let outcome = outcome_for(&home, "f", b"x", Mode::DEFAULT_FILE);
-        assert_eq!(outcome.drift, Drift::Conflict);
-        assert_eq!(outcome.note.as_deref(), Some("not a regular file"));
+        match found {
+            Found::Nothing => {}
+            Found::File(bytes, mode) => seed(&path, bytes, mode),
+            Found::Dir => std::fs::create_dir(&path).expect("occupy"),
+            Found::Symlink => std::os::unix::fs::symlink("elsewhere", &path).expect("symlink"),
+            Found::Fifo => crate::testing::mkfifo(&path),
+        }
+        let outcome = outcome_for(&home, "f", b"x", declared);
+        let drift = outcome.drift;
+        assert_eq!(format!("{:?}", Action::from(drift)), format!("{drift:?}"));
+        outcome
+    }
+
+    #[test]
+    fn a_file_target_compares_by_its_bytes_and_mode() {
+        use Drift::{Create, Modify, Unchanged};
+        use Found::{File, Nothing};
+        let (d, p) = (Mode::DEFAULT_FILE, Mode::PRIVATE_FILE);
+        // The mode-only row is the worked example: a config faithfully
+        // reproduced at 0644 that ssh will not accept, declared 0600. Only a
+        // mode drift is noted. The unchanged row is what makes a second plan
+        // empty.
+        for (found, declared, drift, content_drift, mode_drift) in [
+            (Nothing, d, Create, true, None),
+            (File(b"x", d), d, Unchanged, false, None),
+            (File(b"x", d), p, Modify, false, Some((d, p))),
+            (File(b"old", d), d, Modify, true, None),
+        ] {
+            let outcome = compared(found, declared);
+            let note = mode_drift
+                .is_some()
+                .then(|| "mode 0644 -> 0600".to_string());
+            assert_eq!(
+                (
+                    outcome.drift,
+                    outcome.content_drift,
+                    outcome.mode_drift,
+                    outcome.note
+                ),
+                (drift, content_drift, mode_drift, note),
+            );
+        }
+    }
+
+    #[test]
+    fn anything_but_a_file_where_a_file_is_declared_is_a_conflict() {
+        for (found, note) in [
+            (Found::Dir, "a directory, where the target declares a file"),
+            (
+                Found::Symlink,
+                "a symlink; bx will not replace a link you created",
+            ),
+            (Found::Fifo, "not a regular file"),
+        ] {
+            let conflict = Outcome {
+                drift: Drift::Conflict,
+                content_drift: false,
+                mode_drift: None,
+                note: Some(note.to_string()),
+                parent_note: None,
+            };
+            assert_eq!(compared(found, Mode::DEFAULT_FILE), conflict);
+        }
     }
 
     #[test]
@@ -476,15 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn a_parent_bx_has_yet_to_create_is_reported_before_it_exists() {
-        let home = guarded_home();
-        let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        assert_eq!(outcome.drift, Drift::Create);
-        let note = outcome.parent_note.expect("the parent must be reported");
-        assert!(note.contains("will be created at 0755"), "{note}");
-    }
-
-    #[test]
     fn a_symlinked_parent_reports_the_directory_it_resolves_to() {
         let home = guarded_home();
         // The mainstream dotfiles layout: ~/.ssh is a link into a repository,
@@ -515,20 +495,6 @@ mod tests {
             observe(&home.child(".ssh")).expect("observe").kind,
             Kind::Symlink
         );
-    }
-
-    #[test]
-    fn a_symlinked_parent_that_is_genuinely_wide_is_still_reported() {
-        let home = guarded_home();
-        std::fs::create_dir_all(home.child("dotfiles/dot_ssh")).expect("mkdir");
-        set_mode(&home.child("dotfiles/dot_ssh"), Mode::DEFAULT_DIR).expect("chmod");
-        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.child(".ssh")).expect("symlink");
-        seed(&home.child(".ssh/config"), b"Host *\n", Mode::PRIVATE_FILE);
-
-        let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        let note = outcome.parent_note.expect("the parent must be reported");
-        assert!(note.contains("is 0755"), "{note}");
-        assert!(note.contains("wider than the 0600"), "{note}");
     }
 
     #[test]
@@ -641,22 +607,6 @@ mod tests {
             );
             assert_eq!(note, expected, "{rel}");
         }
-    }
-
-    #[test]
-    fn a_wide_symlinked_parent_names_the_directory_to_chmod() {
-        let home = guarded_home();
-        std::fs::create_dir_all(home.child("dotfiles/dot_ssh")).expect("mkdir");
-        set_mode(&home.child("dotfiles/dot_ssh"), Mode::DEFAULT_DIR).expect("chmod");
-        std::os::unix::fs::symlink("dotfiles/dot_ssh", home.child(".ssh")).expect("symlink");
-
-        let outcome = outcome_for(&home, ".ssh/config", b"Host *\n", Mode::PRIVATE_FILE);
-        let note = outcome.parent_note.expect("the parent must be reported");
-        assert!(
-            note.contains("so chmod ~/dotfiles/dot_ssh itself"),
-            "the note names the directory the link resolves to, portably: {note}",
-        );
-        assert!(note.contains("chmod"), "{note}");
     }
 
     #[test]

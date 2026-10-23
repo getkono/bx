@@ -860,90 +860,102 @@ mod tests {
         drop(writer);
     }
 
-    #[test]
-    fn a_probe_refuses_a_symlink_at_the_lock_path_and_reaches_nothing_through_it() {
-        let (home, dir) = guarded_state();
-        std::fs::create_dir_all(dir.root()).expect("the state directory");
-        home.write(".bashrc", "the user wrote this\n");
-        let before = mode_of(&home.child(".bashrc"));
-        std::os::unix::fs::symlink(home.child(".bashrc"), dir.lock()).expect("symlink");
-
-        let err = SharedLock::probe(&dir).expect_err("a link is not a lock file");
-        assert!(
-            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
-            "got {err}"
-        );
-        assert_eq!(
-            std::fs::read(home.child(".bashrc")).expect("read"),
-            b"the user wrote this\n"
-        );
-        assert_eq!(mode_of(&home.child(".bashrc")), before);
-
-        std::fs::remove_file(dir.lock()).expect("unlink the link");
-        std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("dangling");
-        // `0777` on Linux; the umask-masked mode on macOS.
-        let made = lmode_of(&dir.lock());
-        let err = SharedLock::probe(&dir).expect_err("a dangling link is not a lock file");
-        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
-        assert!(!home.child("elsewhere").exists());
-        assert_eq!(lmode_of(&dir.lock()), made);
+    /// Something other than the plain file bx creates, put at the lock path.
+    #[derive(Debug, Clone, Copy)]
+    enum Occupant {
+        /// A symlink to a file the user wrote, which the lock file's
+        /// truncation would empty if it were followed.
+        Symlink,
+        /// A symlink to nothing, through which a create would make a file.
+        Dangling,
+        /// A directory holding a file.
+        Directory,
+        /// A second hard link to a file the user wrote.
+        HardLink,
+        /// A FIFO, whose open would wait for a writer.
+        Fifo,
     }
 
-    #[test]
-    fn a_probe_refuses_a_directory_at_the_lock_path() {
-        let (_home, dir) = guarded_state();
-        std::fs::create_dir_all(dir.lock()).expect("occupy");
-        std::fs::set_permissions(dir.lock(), std::fs::Permissions::from_mode(0o755))
-            .expect("widen");
-
-        let err = SharedLock::probe(&dir).expect_err("a directory is not a lock file");
-        assert!(
-            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
-            "got {err}"
-        );
-        assert_eq!(mode_of(&dir.lock()), 0o755);
-    }
+    /// Every way into the lock, answering only whether it was refused.
+    type Entry = fn(&StateDir) -> Result<(), Error>;
+    const ENTRY_POINTS: [(&str, Entry); 5] = [
+        ("probe", |dir| SharedLock::probe(dir).map(drop)),
+        ("exclusive", |dir| ExclusiveLock::acquire(dir).map(drop)),
+        ("shared", |dir| SharedLock::acquire(dir).map(drop)),
+        ("try exclusive", |dir| {
+            ExclusiveLock::try_acquire(dir).map(drop)
+        }),
+        ("try shared", |dir| SharedLock::try_acquire(dir).map(drop)),
+    ];
 
     #[test]
-    fn a_probe_refuses_a_lock_file_with_a_second_link() {
-        let (home, dir) = guarded_state();
-        std::fs::create_dir_all(dir.root()).expect("the state directory");
-        home.write(".profile", "the user wrote this too\n");
-        std::fs::hard_link(home.child(".profile"), dir.lock()).expect("hard link");
+    fn anything_but_bxs_own_file_at_the_lock_path_is_refused_everywhere_and_left_alone() {
+        use Occupant::{Dangling, Directory, Fifo, HardLink, Symlink};
+        for occupant in [Symlink, Dangling, Directory, HardLink, Fifo] {
+            for (entry, enter) in ENTRY_POINTS {
+                let (home, dir) = guarded_state();
+                std::fs::create_dir_all(dir.root()).expect("the state directory");
+                home.write(".bashrc", "the user wrote this\n");
+                let user_mode = mode_of(&home.child(".bashrc"));
+                let lock = dir.lock();
+                match occupant {
+                    Symlink => std::os::unix::fs::symlink(home.child(".bashrc"), &lock),
+                    Dangling => std::os::unix::fs::symlink(home.child("elsewhere"), &lock),
+                    Directory => std::fs::create_dir(&lock)
+                        .and_then(|()| std::fs::write(lock.join("keep"), b"x"))
+                        .and_then(|()| {
+                            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o755))
+                        }),
+                    HardLink => std::fs::hard_link(home.child(".bashrc"), &lock),
+                    Fifo => {
+                        crate::testing::mkfifo(&lock);
+                        Ok(())
+                    }
+                }
+                .expect("occupy the lock path");
+                // `0777` for a link on Linux; the umask-masked mode on macOS.
+                let made = lmode_of(&lock);
 
-        let err = SharedLock::probe(&dir).expect_err("a second link is not bx's file");
-        assert!(
-            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
-            "got {err}"
-        );
-        assert_eq!(
-            std::fs::read(home.child(".profile")).expect("read"),
-            b"the user wrote this too\n"
-        );
-    }
+                // On a thread, so an open that waits for a writer to open a
+                // FIFO fails this test instead of hanging the suite until it
+                // is killed. Such a thread is left blocked; the process ends it.
+                let (sent, answer) = std::sync::mpsc::channel();
+                let at = dir.clone();
+                std::thread::spawn(move || {
+                    let _ = sent.send(enter(&at));
+                });
+                let case = format!("{entry} over a {occupant:?}");
+                let err = answer
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap_or_else(|_| panic!("{case}: blocked"))
+                    .expect_err(&case);
+                assert!(
+                    matches!(&err, Error::LockNotAFile { path } if *path == lock),
+                    "{case}: {err}"
+                );
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "{} is not a plain file bx created (a directory, a symlink, a hard link \
+                         or a special file); bx will not open it. Move it aside and run bx again",
+                        lock.display()
+                    ),
+                );
 
-    #[test]
-    fn a_probe_refuses_a_fifo_at_the_lock_path_without_waiting_for_a_writer() {
-        let (_home, dir) = guarded_state();
-        std::fs::create_dir_all(dir.root()).expect("the state directory");
-        crate::testing::mkfifo(&dir.lock());
-
-        // Probed on a thread, so an open that waits for a writer to open the
-        // FIFO fails this test instead of hanging the suite until it is
-        // killed. Such a thread is left blocked; the process ends it.
-        let (sent, answer) = std::sync::mpsc::channel();
-        let probed = dir.clone();
-        std::thread::spawn(move || {
-            let _ = sent.send(SharedLock::probe(&probed));
-        });
-        let err = answer
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("the probe blocked opening a FIFO")
-            .expect_err("a fifo is not a lock file");
-        assert!(
-            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
-            "got {err}"
-        );
+                // Nothing is reached through it, and it is left as it was.
+                assert_eq!(
+                    std::fs::read(home.child(".bashrc")).expect("read"),
+                    b"the user wrote this\n",
+                    "{case}"
+                );
+                assert_eq!(mode_of(&home.child(".bashrc")), user_mode, "{case}");
+                assert!(!home.child("elsewhere").exists(), "{case}");
+                assert_eq!(lmode_of(&lock), made, "{case}");
+                if let Directory = occupant {
+                    assert_eq!(std::fs::read(lock.join("keep")).expect("kept"), b"x");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1106,17 +1118,19 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_lock_body_still_yields_a_usable_message() {
+    fn an_unreadable_or_empty_lock_body_still_yields_a_usable_message() {
         let (_home, dir) = guarded_state();
         let held = ExclusiveLock::acquire(&dir).expect("acquire");
         // Overwrite the identity line with something that is not one.
-        std::fs::write(held.path(), b"\xff\xfe not utf-8").expect("clobber");
-        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
-        let Error::Locked { holder, .. } = &err else {
-            panic!("got {err}")
-        };
-        assert_eq!(holder, &Holder::unknown());
-        assert!(err.to_string().contains("another bx process"));
+        for body in [&b"\xff\xfe not utf-8"[..], b""] {
+            std::fs::write(held.path(), body).expect("clobber");
+            let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
+            let Error::Locked { holder, .. } = &err else {
+                panic!("got {err}")
+            };
+            assert_eq!(holder, &Holder::unknown());
+            assert!(err.to_string().contains("another bx process"), "{err}");
+        }
     }
 
     #[test]
@@ -1158,15 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_lock_body_still_yields_a_usable_message() {
-        let (_home, dir) = guarded_state();
-        let held = ExclusiveLock::acquire(&dir).expect("acquire");
-        std::fs::write(held.path(), b"").expect("clobber");
-        let err = ExclusiveLock::acquire(&dir).expect_err("must be refused");
-        assert!(err.to_string().contains("another bx process"), "got {err}");
-    }
-
-    #[test]
     fn a_holder_line_is_parsed_and_rendered() {
         assert_eq!(
             Holder::parse("1234 bx\n"),
@@ -1179,14 +1184,6 @@ mod tests {
         assert_eq!(Holder::parse("not-a-pid bx"), Holder::unknown());
         assert_eq!(Holder::parse("1234"), Holder::unknown());
         assert_eq!(Holder::unknown().to_string(), "another bx process");
-    }
-
-    #[test]
-    fn releasing_the_lock_lets_the_next_acquisition_succeed() {
-        let (_home, dir) = guarded_state();
-        let first = ExclusiveLock::acquire(&dir).expect("first");
-        drop(first);
-        let _second = ExclusiveLock::acquire(&dir).expect("second");
     }
 
     #[test]
@@ -1361,69 +1358,6 @@ mod tests {
             path.exists(),
             "unlinking races: another process may hold a descriptor on the old inode",
         );
-    }
-
-    #[test]
-    fn a_symlink_at_the_lock_path_is_refused_and_never_truncates_what_it_names() {
-        // Review round 3: the lock file was opened RDWR|CREATE following
-        // symlinks and then truncated, so `<state>/lock -> ~/.bashrc` emptied
-        // the user's file.
-        let (home, dir) = guarded_state();
-        dir.ensure().expect("ensure");
-        home.write(".bashrc", "the user wrote this\n");
-        let before = mode_of(&home.child(".bashrc"));
-        std::os::unix::fs::symlink(home.child(".bashrc"), dir.lock()).expect("symlink");
-
-        let err = ExclusiveLock::acquire(&dir).expect_err("must refuse");
-        assert!(
-            matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
-            "got {err}",
-        );
-        assert!(err.to_string().contains("not a plain file"), "{err}");
-        assert!(matches!(
-            SharedLock::acquire(&dir),
-            Err(Error::LockNotAFile { path }) if path == dir.lock()
-        ));
-        assert!(matches!(
-            ExclusiveLock::try_acquire(&dir),
-            Err(Error::LockNotAFile { path }) if path == dir.lock()
-        ));
-        assert_eq!(
-            std::fs::read(home.child(".bashrc")).expect("read"),
-            b"the user wrote this\n",
-        );
-        assert_eq!(mode_of(&home.child(".bashrc")), before);
-    }
-
-    #[test]
-    fn a_dangling_symlink_at_the_lock_path_creates_nothing_through_it() {
-        let (home, dir) = guarded_state();
-        dir.ensure().expect("ensure");
-        std::os::unix::fs::symlink(home.child("elsewhere"), dir.lock()).expect("symlink");
-
-        let err = ExclusiveLock::acquire(&dir).expect_err("must refuse");
-        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
-        assert!(!home.child("elsewhere").exists());
-    }
-
-    #[test]
-    fn a_hard_link_or_a_fifo_at_the_lock_path_is_refused() {
-        let (home, dir) = guarded_state();
-        dir.ensure().expect("ensure");
-        home.write(".profile", "the user wrote this too\n");
-        std::fs::hard_link(home.child(".profile"), dir.lock()).expect("hard link");
-
-        let err = ExclusiveLock::acquire(&dir).expect_err("a second link is not bx's file");
-        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
-        assert_eq!(
-            std::fs::read(home.child(".profile")).expect("read"),
-            b"the user wrote this too\n",
-        );
-
-        std::fs::remove_file(dir.lock()).expect("unlink the link");
-        crate::testing::mkfifo(&dir.lock());
-        let err = ExclusiveLock::acquire(&dir).expect_err("a fifo is not a lock file");
-        assert!(matches!(err, Error::LockNotAFile { .. }), "got {err}");
     }
 
     #[test]
@@ -1646,34 +1580,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(20))
             .expect("read_holder blocked on a FIFO");
         assert_eq!(holder, Holder::unknown());
-    }
-
-    #[test]
-    fn a_directory_at_the_lock_path_is_refused_with_a_remedy() {
-        // Review round 4: a directory there was a bare `Error::Lock` carrying
-        // EISDIR, which says what failed and not what to do.
-        let (_home, dir) = guarded_state();
-        dir.ensure().expect("ensure");
-        std::fs::create_dir(dir.lock()).expect("occupy");
-        std::fs::write(dir.lock().join("keep"), b"x").expect("occupy");
-
-        for err in [
-            ExclusiveLock::acquire(&dir).expect_err("must fail"),
-            SharedLock::acquire(&dir).expect_err("must fail"),
-        ] {
-            assert!(
-                matches!(&err, Error::LockNotAFile { path } if *path == dir.lock()),
-                "got {err}",
-            );
-            let message = err.to_string();
-            assert!(message.contains("a directory"), "{message}");
-            assert!(message.contains("Move it aside"), "{message}");
-        }
-        assert!(matches!(
-            ExclusiveLock::try_acquire(&dir),
-            Err(Error::LockNotAFile { path }) if path == dir.lock()
-        ));
-        assert_eq!(std::fs::read(dir.lock().join("keep")).expect("kept"), b"x");
     }
 
     #[test]

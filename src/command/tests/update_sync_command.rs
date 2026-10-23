@@ -284,3 +284,53 @@ fn a_declined_update_over_only_a_carry_writes_and_pushes_nothing() {
     assert_eq!(rev(home.path(), &repo, "HEAD"), head);
     assert!(!text(&out).contains("Pushed"), "{}", text(&out));
 }
+
+#[test]
+fn copies_an_interrupted_sync_left_are_committed_and_said_by_an_update() {
+    let home = guarded_home();
+    let repo = tracking(&home);
+    home.write(".lock", "b\n");
+    // A sync that wrote the copy and stopped before its commit.
+    let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+    assert!(
+        plan::run(&inputs, Mode::Sync, &mut |_| Ok(true))
+            .expect("the carrying run")
+            .executed
+    );
+
+    let mut out = Vec::new();
+    let exit = update(&home, &mut out).expect("the recovering update");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).starts_with(
+            "Committed 1 tracked file(s) an interrupted bx sync carried into the repo.\n"
+        ),
+        "{}",
+        text(&out)
+    );
+    assert!(clean(&home, &repo));
+
+    let mut again = Vec::new();
+    update(&home, &mut again).expect("a second update");
+    assert!(!text(&again).contains("interrupted"), "{}", text(&again));
+}
+
+#[test]
+fn a_carry_subject_on_a_commit_that_touches_the_lock_is_not_replayed() {
+    let home = guarded_home();
+    let repo = tracking(&home);
+    // A person's commit under bx's carry subject, changing bx.lock too.
+    let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+    std::fs::write(repo.join("bx.lock"), format!("{edited}# mine\n")).expect("an edit");
+    std::fs::write(repo.join("files/lock"), "mine\n").expect("a copy");
+    commit_all(home.path(), &repo, crate::sync::CARRIED_SUBJECT);
+    pushed_elsewhere(&home, "notes", "theirs\n");
+    let head = rev(home.path(), &repo, "HEAD");
+
+    let error = update(&home, &mut Vec::new()).expect_err("diverged");
+    assert!(
+        matches!(error, update::Error::Sync(sync::Error::Diverged { .. })),
+        "{error:?}"
+    );
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing moved");
+}

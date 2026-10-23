@@ -275,7 +275,7 @@ pub fn missing<'a>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::shells::{Phase, Shells};
     use crate::config::source::{DEFAULT_PHASE, PHASES, parse_phase};
@@ -511,72 +511,86 @@ mod tests {
         assert!(answered.iter().all(|s| matches!(s, Resolution::Ready(_))));
     }
 
-    #[test]
-    fn a_switched_off_or_unusable_value_holds_the_source_back_too() {
-        let off = resolved(
-            "[[value]]\nname = \"h\"\nkind = \"string\"\ndefault = \"x\"\nenabled = false\n\
-             [[source]]\nname = \"s\"\npath = \"~/{{h}}\"\n",
-        )
-        .expect("resolves");
-        let [Resolution::Blocked(entry)] = off.as_slice() else {
-            panic!("{off:?}");
-        };
-        assert!(matches!(entry.reason, BlockReason::DisabledValue { .. }));
+    /// One kind of shell entry whose text takes `{{value}}` placeholders, as
+    /// [`assert_value_gating`] drives it. Sources and functions each classify
+    /// what a value does to their entry, so each is held to the same cases.
+    pub(crate) struct Gated<T> {
+        /// Parse a layer, resolve its values, and resolve this kind against
+        /// them.
+        pub(crate) resolved: fn(&str) -> Result<Vec<Resolution<T>>, String>,
+        /// The entry `s` of this kind whose placeholder-taking text names the
+        /// value `{{NAME}}`, NAME being the argument.
+        pub(crate) entry: fn(&str) -> String,
+        /// How a message names the entry `s`, e.g. ``source `s` ``.
+        pub(crate) named: &'static str,
+        /// TOML string content that, substituted for the value, leaves text
+        /// this kind cannot hold, and what a message about it then says.
+        pub(crate) unusable: (&'static str, &'static [&'static str]),
+    }
 
-        let unusable = resolved(
-            "[[value]]\nname = \"root\"\nkind = \"path\"\n\
-             [values]\nroot = \"relative\"\n\
-             [[source]]\nname = \"s\"\npath = \"{{root}}/a\"\n",
-        )
-        .expect("resolves");
-        let [Resolution::Blocked(entry)] = unusable.as_slice() else {
-            panic!("{unusable:?}");
+    /// Assert that `kind` holds its entry back, never failing the load, on a
+    /// value switched off, on a path value answered with something that is not
+    /// one, and on an answer that leaves the text unusable, naming the
+    /// answer's line; that it fails the load on an undeclared value, and on a
+    /// committed default no answer can clear; and that a disabled entry is not
+    /// read at all.
+    pub(crate) fn assert_value_gating<T: std::fmt::Debug>(kind: &Gated<T>) {
+        let blocked = |layer: String| -> BlockedEntry {
+            let resolved = (kind.resolved)(&layer).expect("a held entry is not a load error");
+            match <[_; 1]>::try_from(resolved) {
+                Ok([Resolution::Blocked(entry)]) => entry,
+                other => panic!("{layer}: {other:?}"),
+            }
         };
-        assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
+        let (bytes, why) = kind.unusable;
 
-        // An answer that brings a blank into the path blocks it, naming the
-        // answer's line.
-        let blank = resolved(
-            "[[value]]\nname = \"h\"\nkind = \"string\"\n\
-             [values]\nh = \"my box\"\n\
-             [[source]]\nname = \"s\"\npath = \"~/.keychain/{{h}}-sh\"\n",
-        )
-        .expect("resolves");
-        let [Resolution::Blocked(entry)] = blank.as_slice() else {
-            panic!("{blank:?}");
-        };
-        assert!(matches!(entry.reason, BlockReason::InvalidValue { .. }));
-        assert!(entry.hint.contains("found ' '"), "{}", entry.hint);
-        assert!(
-            entry.hint.contains("`path = \"~/.keychain/my box-sh\"`"),
-            "{}",
-            entry.hint
-        );
-        assert!(
-            entry.hint.contains("the answer to `h` at /repo/bx.toml:5"),
-            "{}",
-            entry.hint
-        );
+        let off = blocked(format!(
+            "[[value]]\nname = \"v\"\nkind = \"string\"\ndefault = \"x\"\nenabled = false\n{}",
+            (kind.entry)("v")
+        ));
+        assert!(matches!(off.reason, BlockReason::DisabledValue { .. }));
+        assert!(off.hint.contains("re-enable v"), "{}", off.hint);
+
+        let unusable = blocked(format!(
+            "[[value]]\nname = \"root\"\nkind = \"path\"\n[values]\nroot = \"relative\"\n{}",
+            (kind.entry)("root")
+        ));
+        assert!(matches!(unusable.reason, BlockReason::InvalidValue { .. }));
+
+        let answered = blocked(format!(
+            "[[value]]\nname = \"v\"\nkind = \"string\"\n[values]\nv = \"{bytes}\"\n{}",
+            (kind.entry)("v")
+        ));
+        assert!(matches!(answered.reason, BlockReason::InvalidValue { .. }));
+        for needle in why.iter().chain(&["the answer to `v` at /repo/bx.toml:5"]) {
+            assert!(answered.hint.contains(needle), "{}", answered.hint);
+        }
+
+        let err = (kind.resolved)(&(kind.entry)("nobody")).expect_err("an undeclared value");
+        assert!(err.contains(kind.named), "{err}");
+        assert!(err.contains("`nobody`"), "{err}");
+        let err = (kind.resolved)(&format!(
+            "[[value]]\nname = \"v\"\nkind = \"string\"\ndefault = \"{bytes}\"\n{}",
+            (kind.entry)("v")
+        ))
+        .expect_err("no answer can clear it");
+        for needle in why {
+            assert!(err.contains(needle), "{err}");
+        }
+
+        let disabled = format!("{}enabled = false\n", (kind.entry)("nobody"));
+        let none = (kind.resolved)(&disabled).expect("a disabled entry is not read");
+        assert!(none.is_empty(), "{none:?}");
     }
 
     #[test]
-    fn a_repo_defect_in_a_path_fails_the_load() {
-        let err = resolved("[[source]]\nname = \"s\"\npath = \"~/{{nobody}}\"\n")
-            .expect_err("an undeclared value");
-        assert!(err.contains("source `s`"), "{err}");
-        assert!(err.contains("`nobody`"), "{err}");
-        // A committed default alone makes the path unwritable.
-        let err = resolved(
-            "[[value]]\nname = \"h\"\nkind = \"string\"\ndefault = \"a;b\"\n\
-             [[source]]\nname = \"s\"\npath = \"~/{{h}}\"\n",
-        )
-        .expect_err("no answer can clear it");
-        assert!(err.contains("found ';'"), "{err}");
-        assert!(err.contains("`path = \"~/a;b\"`"), "{err}");
-        // A disabled source is not read at all.
-        let none = resolved("[[source]]\nname = \"s\"\npath = \"~/{{nobody}}\"\nenabled = false\n")
-            .expect("a disabled path is not read");
-        assert!(none.is_empty());
+    fn a_value_holds_the_source_back_or_fails_the_load_as_its_cause_decides() {
+        assert_value_gating(&Gated {
+            resolved,
+            entry: |name| format!("[[source]]\nname = \"s\"\npath = \"~/{{{{{name}}}}}\"\n"),
+            named: "source `s`",
+            unusable: ("a;b", &["found ';'", "`path = \"~/a;b\"`"]),
+        });
     }
 
     #[test]

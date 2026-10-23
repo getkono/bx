@@ -2493,7 +2493,11 @@ mod tests {
             ),
             "{removals:?}"
         );
-        // What `rm` leaves on disk is `restore`'s, and its tests pin it.
+        assert!(
+            !home.child(".made/new.conf").exists(),
+            "removed, not emptied"
+        );
+        assert!(!home.child(".made").exists(), "and the directory bx made");
         assert_eq!(
             layer(&home),
             format!(
@@ -2505,10 +2509,9 @@ mod tests {
     }
 
     #[test]
-    fn rm_of_a_file_bx_replaced_says_it_was_put_back_and_undeclares_it() {
-        // The bytes and mode it puts back are `restore`'s to pin.
+    fn rm_puts_back_the_bytes_and_mode_of_a_file_bx_replaced() {
         let home = repo("");
-        plant(&home, ".replaced", b"the user's\n", 0o600);
+        let file = plant(&home, ".replaced", b"the user's\n", 0o600);
         crate::plan::tests::own(home.path(), ".replaced", b"bx's\n", Mechanism::Own);
         seed(home.path(), &inline("~/.replaced", "bx's\\n"));
         assert_eq!(plan_exit(&home).0, Exit::Converged);
@@ -2522,6 +2525,8 @@ mod tests {
             text.contains("  - ~/.replaced  put back the file bx replaced; no longer declared in ~/.config/bx/bx.toml"),
             "{text}"
         );
+        assert_eq!(std::fs::read(&file).expect("read"), b"the user's\n");
+        assert_eq!(mode_of(&file), 0o600);
         assert_eq!(layer(&home), "");
     }
 
@@ -2539,6 +2544,10 @@ mod tests {
         let text = String::from_utf8(out).expect("UTF-8");
         assert!(text.starts_with("  ! ~/.edited  "), "{text}");
         assert!(text.ends_with("; still managed\n"), "{text}");
+        assert_eq!(
+            std::fs::read(home.child(".edited")).expect("read"),
+            b"hand edit\n"
+        );
         assert_eq!(layer(&home), layer_text, "still declared");
         assert!(ledger(&home).get(&target(&home, ".edited")).is_some());
     }

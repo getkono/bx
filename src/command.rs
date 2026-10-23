@@ -1292,25 +1292,53 @@ mod tests {
         panic!("nothing should have been asked")
     }
 
-    /// Set on the child that actually calls [`confirm`].
-    const CONFIRM_CHILD: &str = "BX_TEST_CONFIRM_CHILD";
+    /// Set on the child that actually puts every terminal prompt.
+    const PROMPTS_CHILD: &str = "BX_TEST_PROMPTS_CHILD";
 
     #[test]
     #[ignore = "spawned by the test below; it must run with a stdin that is not a terminal"]
-    fn confirm_child() {
+    fn prompts_child() {
+        use crate::init::Ask as _;
+        use inquire::InquireError::NotTTY;
+
         // Without the variable this is someone running `--ignored` by hand,
         // possibly from a terminal, where `prompt` would block on a question
         // nobody is there to answer. Do nothing rather than hang.
-        if std::env::var_os(CONFIRM_CHILD).is_none() {
+        if std::env::var_os(PROMPTS_CHILD).is_none() {
             return;
         }
         let answer = confirm();
         // `Ok(_)` is what both surviving mutants return, so this is the
         // assertion that kills them: with no terminal there is no answer, and
         // a wrapper that invents one would approve a write nobody confirmed.
+        assert!(matches!(answer, Err(Error::Prompt(NotTTY))), "{answer:?}");
         assert!(
-            matches!(answer, Err(Error::Prompt(inquire::InquireError::NotTTY))),
-            "{answer:?}"
+            ask_passphrase("~/.ssh/id_ed25519").is_none(),
+            "a prompt with no terminal is no passphrase"
+        );
+        // `init`'s questions: a value, asked afresh or again after a
+        // problem, and the files to adopt.
+        let decl = crate::config::parse_str(
+            "[[value]]\nname = \"a\"\nkind = \"string\"\n",
+            Path::new("bx.toml"),
+            Path::new("/"),
+        )
+        .expect("a declaration")
+        .values
+        .remove(0);
+        for problem in [None, Some("no")] {
+            let answer = crate::init::Terminal.value(&decl, problem);
+            assert!(
+                matches!(answer, Err(crate::init::Error::Prompt(NotTTY))),
+                "{problem:?}: {answer:?}"
+            );
+        }
+        let offered =
+            [crate::paths::Portable::parse_in("~/.a", Path::new("/h")).expect("portable")];
+        let picked = crate::init::Terminal.adopt(&offered);
+        assert!(
+            matches!(picked, Err(crate::init::Error::Prompt(NotTTY))),
+            "{picked:?}"
         );
     }
 
@@ -1331,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer() {
+    fn every_prompt_without_a_terminal_is_a_prompt_error_and_never_an_answer() {
         // P42R1 "Untested line: the `inquire` confirmation call". `cargo
         // mutants` reported `confirm -> Ok(true)` and `-> Ok(false)` as missed.
         // The earlier round recorded it as needing a pseudo-terminal and a
@@ -1346,8 +1374,8 @@ mod tests {
         // child's stdin is `/dev/null` either way, which is the same seam
         // `plan::tests`'s crash harness uses to fix a child's environment.
         run_ignored_child(
-            ignored_child("command::tests::confirm_child")
-                .env(CONFIRM_CHILD, "1")
+            ignored_child("command::tests::prompts_child")
+                .env(PROMPTS_CHILD, "1")
                 .stdin(std::process::Stdio::null()),
         );
     }
@@ -2323,33 +2351,6 @@ mod tests {
             not_built("bx shell-init", &mut Refusing),
             Err(Error::Output(_))
         ));
-    }
-
-    /// Set on the child that actually calls [`ask_passphrase`].
-    const PASSPHRASE_CHILD: &str = "BX_TEST_PASSPHRASE_CHILD";
-
-    #[test]
-    #[ignore = "spawned by the test below; it must run with a stdin that is not a terminal"]
-    fn passphrase_child() {
-        if std::env::var_os(PASSPHRASE_CHILD).is_none() {
-            return;
-        }
-        assert!(
-            ask_passphrase("~/.ssh/id_ed25519").is_none(),
-            "a prompt with no terminal is no passphrase"
-        );
-    }
-
-    #[test]
-    fn a_passphrase_prompt_without_a_terminal_is_no_passphrase() {
-        // As `confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer`:
-        // in a child whose stdin is certainly not a terminal, so this never
-        // hangs on a developer's machine.
-        run_ignored_child(
-            ignored_child("command::tests::passphrase_child")
-                .env(PASSPHRASE_CHILD, "1")
-                .stdin(std::process::Stdio::null()),
-        );
     }
 
     /// A writer that refuses every byte.

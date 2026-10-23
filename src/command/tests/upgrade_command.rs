@@ -4,7 +4,7 @@
 use super::update_command::{AT, layer, publish, upstream};
 use super::*;
 use crate::sync::tests::{cloned, commit_all, git, rev, run};
-use crate::testing::GuardedHome;
+use crate::testing::{GuardedHome, mode_of};
 
 /// Where the pinned external is checked out, relative to the home.
 const PINNED: &str = ".local/share/pinned";
@@ -482,6 +482,8 @@ fn a_pin_commit_git_refuses_puts_the_layer_back_and_moves_no_checkout() {
     .expect("a hook");
     crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
     let layer = std::fs::read_to_string(repo.join("bx.toml")).expect("bx.toml");
+    let shared = crate::fs::Mode::from_bits(0o664);
+    crate::fs::set_mode(&repo.join("bx.toml"), shared).expect("a group-writable layer");
 
     let error = upgrade(
         &home,
@@ -494,6 +496,11 @@ fn a_pin_commit_git_refuses_puts_the_layer_back_and_moves_no_checkout() {
     assert_eq!(
         std::fs::read_to_string(repo.join("bx.toml")).expect("bx.toml"),
         layer
+    );
+    assert_eq!(
+        mode_of(&repo.join("bx.toml")),
+        shared.bits(),
+        "put back as it was"
     );
     assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
     assert_eq!(
@@ -508,6 +515,11 @@ fn a_pin_commit_git_refuses_puts_the_layer_back_and_moves_no_checkout() {
     let exit = upgrade(&home, &[], Upgrading::Upgrade { yes: true }, &mut out).expect("upgrade");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
     assert!(text(&out).contains("Pushed 2 commit(s)"), "{}", text(&out));
+    assert_eq!(
+        mode_of(&repo.join("bx.toml")),
+        shared.bits(),
+        "rewritten as it was"
+    );
 }
 
 #[test]
@@ -603,6 +615,7 @@ fn a_pin_local_toml_declares_is_rewritten_there_and_never_committed() {
     let local = crate::state::StateDir::resolve(home.path()).local_toml();
     std::fs::create_dir_all(local.parent().expect("the state dir")).expect("the state dir");
     std::fs::write(&local, pinned(&first)).expect("local.toml");
+    crate::fs::set_mode(&local, crate::fs::Mode::PRIVATE_FILE).expect("as `bx init` writes it");
     let second = publish(&home, &["skills/b/SKILL.md"]);
     tag(&home, "2.0.0", false);
 
@@ -640,12 +653,7 @@ fn a_pin_local_toml_declares_is_rewritten_there_and_never_committed() {
         std::fs::read_to_string(&local).expect("local.toml"),
         pinned(&second)
     );
-    assert_eq!(
-        std::os::unix::fs::PermissionsExt::mode(
-            &std::fs::metadata(&local).expect("local.toml").permissions()
-        ) & 0o777,
-        crate::fs::Mode::PRIVATE_FILE.bits()
-    );
+    assert_eq!(mode_of(&local), crate::fs::Mode::PRIVATE_FILE.bits());
     assert_eq!(
         subjects(&home, &repo, 1),
         [update::SUBJECT],

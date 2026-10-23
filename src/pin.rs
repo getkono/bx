@@ -105,8 +105,11 @@ pub enum Verdict {
         /// How many new commits there are, when a checkout could count them.
         count: Option<u64>,
     },
-    /// A newer commit that nothing shows is newer: with no release tag at the
-    /// commit pinned and no checkout of bx's to order the two. Not offered.
+    /// A newer commit, the newest release or the default branch's tip, that
+    /// nothing shows descends from the commit pinned: bx has no checkout of
+    /// its own to order the two, whether or not a release tag is at the
+    /// commit pinned. Not offered; the run that clones the checkout leaves
+    /// the next one to decide.
     Unproven {
         /// The commit.
         tip: String,
@@ -603,14 +606,25 @@ pub fn write_and_commit(
     edits: &[Edit],
     message: &str,
 ) -> Result<bool, crate::update::Error> {
-    // `local.toml` keeps the private mode `bx init` writes it with.
-    let write = |edit: &Edit, bytes: &str| {
-        let mode = if edit.committed {
-            Mode::DEFAULT_FILE
-        } else {
-            Mode::PRIVATE_FILE
-        };
-        crate::fs::write_atomically(&edit.file, bytes.as_bytes(), mode)
+    use std::os::unix::fs::PermissionsExt as _;
+    // Each layer, and its rollback, keeps the mode it was found with, as
+    // `bx adopt`'s edits keep it; one that cannot be stat'ed takes the mode
+    // bx writes its kind with, `local.toml` the private one `bx init` gives it.
+    let modes: Vec<Mode> = edits
+        .iter()
+        .map(|edit| {
+            std::fs::metadata(&edit.file).map_or(
+                if edit.committed {
+                    Mode::DEFAULT_FILE
+                } else {
+                    Mode::PRIVATE_FILE
+                },
+                |meta| Mode::from_bits(meta.permissions().mode() & 0o7777),
+            )
+        })
+        .collect();
+    let write = |at: usize, bytes: &str| {
+        crate::fs::write_atomically(&edits[at].file, bytes.as_bytes(), modes[at])
             .map_err(crate::update::Error::Write)
     };
     // What was shown is what is replaced: a layer edited since — while the
@@ -621,9 +635,9 @@ pub fn write_and_commit(
         }
     }
     for (at, edit) in edits.iter().enumerate() {
-        if let Err(error) = write(edit, &edit.after) {
-            for written in &edits[..at] {
-                let _ = write(written, &written.before);
+        if let Err(error) = write(at, &edit.after) {
+            for (back, written) in edits[..at].iter().enumerate() {
+                let _ = write(back, &written.before);
             }
             return Err(error);
         }
@@ -649,8 +663,8 @@ pub fn write_and_commit(
     committed.map_err(|error: git::Error| {
         let _ = git.query(repo, &with(&["reset", "--quiet"], &files));
         // Put back as far as it goes; git's refusal is what is said.
-        for edit in edits {
-            let _ = write(edit, &edit.before);
+        for (at, edit) in edits.iter().enumerate() {
+            let _ = write(at, &edit.before);
         }
         error.into()
     })

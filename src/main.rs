@@ -48,8 +48,9 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Move externals that follow a branch to its new commits: pull, look,
-    /// lock and commit, apply, push
+    /// Everything sync does, and move externals that follow a branch to its
+    /// new commits: pull, look, lock and commit, apply and carry tracked
+    /// files, push
     Update {
         /// Only these externals, by path; every followed one when none
         paths: Vec<String>,
@@ -58,7 +59,8 @@ enum Command {
         yes: bool,
         /// Only look and report: exit 0 when nothing is new, 2 when
         /// something is, 1 when nothing is but an external could not be checked;
-        /// locks, commits and applies nothing
+        /// fetches the config repo's upstream without pulling it, and locks,
+        /// commits and applies nothing
         #[arg(long, conflicts_with = "snooze")]
         check: bool,
         /// Ask again only after the next interval; reaches no network

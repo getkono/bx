@@ -222,3 +222,128 @@ pub(crate) fn sync_dir(handle: &durable::Dir, dir: &Path) -> Result<(), Error> {
         source,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::fs::Mode;
+
+    #[test]
+    fn a_directory_that_is_not_empty_stops_the_pruning() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let deep = dir.path().join("a/b/c");
+        std::fs::create_dir_all(&deep).expect("mkdir");
+        std::fs::write(dir.path().join("a/b/kept"), "the user's").expect("write");
+
+        prune_dirs(&[deep.clone(), dir.path().join("a/b"), dir.path().join("a")]).expect("prune");
+
+        assert!(!deep.exists(), "the empty leaf went");
+        assert!(dir.path().join("a/b").is_dir(), "the non-empty one stayed");
+        assert!(dir.path().join("a").is_dir(), "and the walk stopped there");
+    }
+
+    #[test]
+    fn pruning_beneath_follows_only_the_chain_above_what_was_removed() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let root = dir.path();
+        let chain = [root.join("a/b"), root.join("a")];
+        std::fs::create_dir_all(&chain[0]).expect("mkdir");
+
+        // Removed from `a/b`: both go.
+        prune_beneath(&chain[0].join(".bx-0"), &chain).expect("prune");
+        assert!(!root.join("a").exists(), "the whole chain went");
+
+        // An absent directory breaks the chain: `a` stands empty and is not
+        // shown made by anything beneath it.
+        std::fs::create_dir(root.join("a")).expect("the user's");
+        prune_beneath(&chain[0].join(".bx-0"), &chain).expect("prune");
+        assert!(root.join("a").is_dir(), "never made, so never pruned");
+
+        // So does a directory that is not the parent of what was removed.
+        std::fs::create_dir(&chain[0]).expect("mkdir");
+        prune_beneath(&root.join("elsewhere/.bx-0"), &chain).expect("prune");
+        assert!(chain[0].is_dir(), "not beneath it");
+
+        // And one that is not empty.
+        std::fs::write(chain[0].join("kept"), "the user's").expect("write");
+        prune_beneath(&chain[0].join(".bx-0"), &chain).expect("prune");
+        assert!(chain[0].is_dir() && root.join("a").is_dir());
+    }
+
+    #[test]
+    fn a_made_directory_is_removed_only_when_it_is_there_and_empty() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let made = dir.path().join("made");
+        assert!(
+            !remove_made_dir(&made).expect("absent"),
+            "nothing to remove"
+        );
+        std::fs::write(&made, "a file").expect("write");
+        assert!(!remove_made_dir(&made).expect("a file"), "not a directory");
+        std::fs::remove_file(&made).expect("rm");
+        std::fs::create_dir(&made).expect("mkdir");
+        assert!(remove_made_dir(&made).expect("empty"));
+        assert!(!made.exists());
+    }
+
+    #[test]
+    fn pruning_a_directory_that_is_already_gone_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("a tempdir");
+        prune_dirs(&[dir.path().join("never-existed")]).expect("prune");
+        unlink(&dir.path().join("never-there")).expect("unlink");
+        // Opening the directory first must not turn a missing one into an error.
+        unlink(&dir.path().join("gone/never-there")).expect("unlink in a missing directory");
+    }
+
+    #[test]
+    fn a_removal_opens_its_directory_before_the_unlink_and_syncs_it_after() {
+        // The order `fs::write_atomically` keeps for a rename, observed: the
+        // directory handle exists before the file goes, and the sync follows.
+        use crate::fs::durable::{Event, recording};
+
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let file = dir.path().join("f");
+        std::fs::write(&file, "x\n").expect("write");
+
+        let (removed, events) = recording(|| unlink(&file));
+        removed.expect("unlink");
+
+        assert_eq!(
+            events,
+            [
+                Event::OpenDir(dir.path().to_path_buf()),
+                Event::Unlink(file.clone()),
+                Event::SyncDir(dir.path().to_path_buf()),
+            ],
+        );
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_opened_fails_a_removal_before_the_file_goes() {
+        if rustix::process::geteuid().is_root() {
+            // Root ignores the permission bits, so there is nothing to assert.
+            crate::testing::skip_unconstructible("root ignores the permission bits");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("a tempdir");
+        let file = dir.path().join("f");
+        std::fs::write(&file, "the user's\n").expect("write");
+        // Write and search, no read: the file can be unlinked, and the directory
+        // cannot be opened to fsync the unlink.
+        crate::fs::set_mode(dir.path(), Mode::from_bits(0o300)).expect("chmod");
+
+        let result = unlink(&file);
+        crate::fs::set_mode(dir.path(), Mode::PRIVATE_DIR).expect("unlock for cleanup");
+
+        let Error { path, source } = result.expect_err("the directory cannot be opened");
+        assert_eq!(path, dir.path());
+        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read(&file).expect("the file is still there"),
+            b"the user's\n",
+            "an Err means the removal did not happen",
+        );
+    }
+}

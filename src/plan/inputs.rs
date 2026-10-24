@@ -1,10 +1,11 @@
 //! What a run decides against: the configuration, the places it was loaded
 //! from, and the machine it runs on, loaded once by [`Inputs::load`].
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::Error;
-use crate::config::external::External;
+use crate::config::external::{External, Pin};
 use crate::config::layers;
 use crate::config::lock::Lock;
 use crate::config::merge;
@@ -15,7 +16,7 @@ use crate::config::{Layer, LayerKind};
 use crate::env::Env;
 use crate::env_guard::RootSet;
 use crate::git::Git;
-use crate::paths;
+use crate::paths::{self, Portable};
 use crate::shell::activation::{self, Host as _};
 use crate::state::StateDir;
 
@@ -151,6 +152,19 @@ impl Inputs {
     #[must_use]
     pub fn with_lock(mut self, lock: Lock) -> Self {
         self.lock = lock;
+        self
+    }
+
+    /// The same inputs, keeping each pinned external `pins` names at the
+    /// commit it gives rather than the `rev` its layer holds: what
+    /// `bx upgrade` plans against before it rewrites those layers.
+    #[must_use]
+    pub fn with_pins(mut self, pins: &BTreeMap<Portable, String>) -> Self {
+        for external in &mut self.resolved.externals {
+            if let (Pin::Rev(rev), Some(pin)) = (&mut external.pin, pins.get(&external.path)) {
+                rev.clone_from(pin);
+            }
+        }
         self
     }
 

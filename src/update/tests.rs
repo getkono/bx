@@ -53,6 +53,21 @@ fn moves(tip: &str) -> Verdict {
 }
 
 #[test]
+fn a_layer_is_bx_toml_or_a_toml_directly_in_modules() {
+    for (path, layer) in [
+        ("bx.toml", true),
+        ("modules/a.toml", true),
+        ("modules/a/b.toml", false),
+        ("modules/a.txt", false),
+        ("modulesa.toml", false),
+        ("other/bx.toml", false),
+        ("bx.lock", false),
+    ] {
+        assert_eq!(is_layer(path), layer, "{path}");
+    }
+}
+
+#[test]
 fn select_takes_every_followed_external_or_the_ones_named() {
     let externals = [
         followed("~/a", Check::Ask),

@@ -58,7 +58,7 @@ Answers you typed in a run that stopped at a later value question are not kept.
 
 ## Commands
 
-There are twelve. You should not need a manual.
+There are thirteen. You should not need a manual.
 
 | | |
 |---|---|
@@ -70,13 +70,14 @@ There are twelve. You should not need a manual.
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, carry this machine's copies of tracked files into the repo and commit them, push — no git knowledge required |
 | `bx update` | everything `bx sync` does, and move [externals](#externals) that follow a branch to its new commits: pull, look, lock and commit, apply and carry tracked files, push |
+| `bx upgrade` | everything `bx update` does, and move [pinned externals](#externals) to their newest release, rewriting `rev` where it is declared; then say whether `bx self-upgrade` has a newer bx |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
 | `bx shell-init` | the one line for your shell rc — not built yet |
 | `bx self-upgrade` | install the latest release over this one; `--check` only looks, `--force` reinstalls even when this one is not older |
 
-`init`, `apply`, `sync` and `update` take `--yes`, and `init` takes
-`--set NAME=VALUE` for each value it would ask for, so all four run without a
+`init`, `apply`, `sync`, `update` and `upgrade` take `--yes`, and `init` takes
+`--set NAME=VALUE` for each value it would ask for, so all five run without a
 terminal. `bx update --check` only looks, exiting `2` when something is new,
 and `1` when nothing is but a followed external could not be checked
 (its remote unreachable, or without the branch it follows); it fetches the
@@ -84,7 +85,10 @@ config repo's upstream without pulling it, so a commit another machine
 already locked is reported as one `bx sync` brings in rather than as new; an
 upstream it cannot fetch is said, and judged against this machine's
 `bx.lock`, without changing the exit status.
-`bx update --snooze` puts the next question off.
+`bx update --snooze` puts the next question off. `bx upgrade --check` is
+`bx update --check`, then the same look at each pinned external, then
+`bx self-upgrade --check`: it exits `2` when any of them finds something
+newer, and otherwise `1` when any could not look.
 
 `add` and `rm` need the file or directory to act on; without one they refuse
 and point you at `bx init`, which offers the config already on the machine.
@@ -311,7 +315,8 @@ require = "SKILL.md"
 ```
 
 **Pinned or followed.** An external says exactly one of `rev` and `branch`.
-A pinned one moves only when you edit `rev`: the form for code you review
+A pinned one moves only when its `rev` changes — by your hand, or by
+`bx upgrade`, which shows you the edit first: the form for code you review
 before it runs. A followed one is kept at the commit `bx.lock` holds — a file
 beside `bx.toml`, committed with it, so every machine checks out the same
 commit — and `bx update` is the only thing that moves it. Until `bx update`
@@ -338,6 +343,21 @@ is locked only once it is shown to descend from the one locked before, so a
 branch whose history was rewritten is reported and never locked. `plan` and
 `apply` never ask a remote where a branch is: they read the lock, and `apply`
 fetches only the commit it names.
+
+**`bx upgrade`** does everything `bx update` does, and also asks each pinned
+external's remote for its release tags — `v1.2.3` or `1.2.3`; a pre-release
+such as `v2.0.0-rc.1` is not one — and offers the newest. It shows the edit
+of `rev` in the file that declares it, as a diff, before the plan of the
+checkouts that edit moves; once you approve, it commits `bx.lock` and then
+the rewritten files, both before any checkout moves, and pushes them with the
+rest. A `rev` your `local.toml` declares is rewritten there and never
+committed. A remote with no release tag offers its default branch's tip
+instead. Either way a commit is offered only once it is shown to descend from
+the one pinned, since `apply` moves a checkout only forward: a newer release
+cut from another line is reported and left for you. A file with changes you
+have not committed is refused, as `bx update` refuses an edited `bx.lock`.
+Last, `bx upgrade` says whether a newer bx is released; installing it is
+`bx self-upgrade`'s.
 
 **Links.** Each `[[external.link]]` turns every child directory of `from` in
 the locked commit into a symlink of the same name in `to`, so a new skill

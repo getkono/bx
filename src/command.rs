@@ -1,13 +1,14 @@
 //! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
-//! `bx update`, `bx doctor`, `bx add`, `bx rm`, `bx secret list` and
-//! `bx self-upgrade`, and the refusal of `bx shell-init` and `bx __complete`,
-//! which have none yet.
+//! `bx update`, `bx upgrade`, `bx doctor`, `bx add`, `bx rm`,
+//! `bx secret list` and `bx self-upgrade`, and the refusal of `bx shell-init`
+//! and `bx __complete`, which have none yet.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
 //! `rm`, [`crate::adopt`], for `init`, [`crate::init`] before the
-//! traversal, for `sync`, [`crate::sync`] around it, and for `update`,
-//! [`crate::update`] before it — writes the rendering
+//! traversal, for `sync`, [`crate::sync`] around it, for `update`,
+//! [`crate::update`] before it, and for `upgrade`, [`crate::pin`] beside
+//! that — writes the rendering
 //! to the output it is
 //! handed, and returns the exit status. `self-upgrade` reads no configuration:
 //! it is [`crate::upgrade`] run for the binary that is running. `main` does
@@ -25,6 +26,7 @@ use crate::env::Env;
 use crate::git::Git;
 use crate::init;
 use crate::paths;
+use crate::pin;
 use crate::plan::{self, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
@@ -507,6 +509,66 @@ fn update_with(
     git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, update::Error> {
+    scoped(env, names, Scope::Followed, yes, out, git, ask)
+}
+
+/// What a `bx update` or a `bx upgrade` moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// `bx update`: followed externals, within their branches.
+    Followed,
+    /// `bx upgrade`: those, and each pinned external to its newest release.
+    FollowedAndPinned,
+}
+
+impl Scope {
+    /// The command, as `last-check` and the output name it.
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Followed => "bx update",
+            Self::FollowedAndPinned => "bx upgrade",
+        }
+    }
+
+    /// What `last-check` says after a run abandoned at its question.
+    const fn canceled(self) -> &'static str {
+        match self {
+            Self::Followed => "bx update was canceled, and locked nothing",
+            Self::FollowedAndPinned => "bx upgrade was canceled, and locked or upgraded nothing",
+        }
+    }
+
+    /// What `last-check` says after a declined run.
+    const fn declined(self) -> &'static str {
+        match self {
+            Self::Followed => "bx update was declined, and locked nothing",
+            Self::FollowedAndPinned => "bx upgrade was declined, and locked or upgraded nothing",
+        }
+    }
+
+    /// What `last-check` says after a run that recovered an interrupted
+    /// apply instead.
+    const fn recovered(self) -> &'static str {
+        match self {
+            Self::Followed => "bx update dealt with an interrupted apply first, and locked nothing",
+            Self::FollowedAndPinned => {
+                "bx upgrade dealt with an interrupted apply first, and locked or upgraded nothing"
+            }
+        }
+    }
+}
+
+/// [`update_with`], moving what `scope` names: shared by `bx update` and
+/// `bx upgrade`, so the second does all of the first's work.
+fn scoped(
+    env: &Env,
+    names: &[String],
+    scope: Scope,
+    yes: bool,
+    out: &mut dyn Write,
+    git: &Git,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+) -> Result<Exit, update::Error> {
     if !yes && !env.stdin_tty {
         return Err(Error::NeedsConfirmation.into());
     }
@@ -522,7 +584,7 @@ fn update_with(
         .hold(update::HOLD_WAIT)?
         .ok_or(update::Error::Busy)?;
     // Every other way this ends settles the offer, so no shell asks it again.
-    let why = match updating(env, names, yes, out, git, ask, &repo) {
+    let why = match updating(env, names, scope, yes, out, git, ask) {
         Ok(Updated::Finished(exit)) => return Ok(exit),
         Ok(Updated::Stopped(exit, why)) => Ok((exit, why.to_string())),
         Err(error) => Err(error),
@@ -551,19 +613,19 @@ enum Updated {
     Stopped(Exit, &'static str),
 }
 
-/// [`update_with`], under `update/check.lock`, for the config repo `repo`.
+/// [`scoped`], under `update/check.lock`.
 fn updating(
     env: &Env,
     names: &[String],
+    scope: Scope,
     yes: bool,
     out: &mut dyn Write,
     git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
-    repo: &std::path::Path,
 ) -> Result<Updated, update::Error> {
     let say =
         |out: &mut dyn Write, text: &str| writeln!(out, "{text}").map_err(update::Error::Output);
-    let repo = repo.to_path_buf();
+    let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     // One an interrupted replay left, or the user's own: theirs to finish.
     // Named first, since a replay left open leaves `bx.lock` changed too.
     if update::rebasing(git, &repo) {
@@ -616,7 +678,8 @@ fn updating(
                 out,
                 &format!(
                     "The config repo's {branch} has no upstream, so there is nothing to pull; \
-                     bx update locks on top of it as it stands."
+                     {} locks on top of it as it stands.",
+                    scope.command()
                 ),
             )?;
             None
@@ -628,7 +691,8 @@ fn updating(
                 out,
                 &format!(
                     "The config repo's {branch} tracks {upstream}, which does not exist, so \
-                     there is nothing to pull; bx update locks on top of it as it stands."
+                     there is nothing to pull; {} locks on top of it as it stands.",
+                    scope.command()
                 ),
             )?;
             None
@@ -636,8 +700,11 @@ fn updating(
         Err(sync::Error::NotARepo { .. }) => {
             say(
                 out,
-                "The config repo is not a git repository, so there is nothing to pull or \
-                 commit; bx update writes bx.lock there and commits nothing.",
+                &format!(
+                    "The config repo is not a git repository, so there is nothing to pull or \
+                     commit; {} writes there and commits nothing.",
+                    scope.command()
+                ),
             )?;
             None
         }
@@ -646,7 +713,10 @@ fn updating(
 
     let inputs = Inputs::load(env)?;
     let externals = &inputs.resolved().externals;
-    let chosen = update::select(externals, names, &env.home)?;
+    let (chosen, pinned) = match scope {
+        Scope::Followed => (update::select(externals, names, &env.home)?, Vec::new()),
+        Scope::FollowedAndPinned => pin::select(externals, names, &env.home)?,
+    };
     let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
         .map_err(Error::from)?
         .value;
@@ -665,6 +735,23 @@ fn updating(
                 say(out, &format!("    {}", report::escape(line)))?;
             }
         }
+    }
+    let upgraded = pin::look_all(git, &env.home, &pinned, &ledger);
+    for found in &upgraded {
+        say(out, &found.summary())?;
+        if let pin::Verdict::Moves { log: Some(log), .. } = &found.verdict {
+            for line in log {
+                say(out, &format!("    {}", report::escape(line)))?;
+            }
+        }
+    }
+    let edits = pin::edits(&upgraded, &repo, &env.home)?;
+    pin::refuse_edited(git, &repo, &edits)?;
+    // The configuration rewritten, announced before the plan of the checkouts
+    // it moves, so nothing is written that was not shown.
+    for edit in &edits {
+        out.write_all(pin::shown(edit, &env.home).as_bytes())
+            .map_err(update::Error::Output)?;
     }
 
     let before = inputs.lock().clone();
@@ -705,19 +792,29 @@ fn updating(
     };
     let after = update::proposed(&before, &found, externals, committed);
     let message = update::message(&before, &after);
-    let changed = after != before;
-    let inputs = inputs.with_lock(after.clone());
+    let relocks = after != before;
+    let pins = pin::pins(&upgraded);
+    let repins = !edits.is_empty();
+    let pin_message = pin::message(&upgraded);
+    let changed = relocks || repins;
+    let inputs = inputs.with_lock(after.clone()).with_pins(&pins);
     let mut asked = false;
     let mut recovering = false;
     let mut declined = false;
     let mut failed: Option<update::Error> = None;
-    // Whether the lock was committed, so there is a commit to push.
-    let made = std::cell::Cell::new(false);
-    let lock = |failed: &mut Option<update::Error>| match update::write_and_commit(
-        git, &repo, &after, &message,
-    ) {
-        Ok(commit) => {
-            made.set(made.get() || commit);
+    // How many commits were made — the lock's, the pins' — so there is a
+    // commit to push.
+    let made = std::cell::Cell::new(0_u64);
+    // The lock first, then the pins: a pin commit git refuses puts its layers
+    // back, and leaves the lock's commit for the next run's apply.
+    let commit = || -> Result<u64, update::Error> {
+        let locked = relocks && update::write_and_commit(git, &repo, &after, &message)?;
+        let pinned = repins && pin::write_and_commit(git, &repo, &edits, &pin_message)?;
+        Ok(u64::from(locked) + u64::from(pinned))
+    };
+    let lock = |failed: &mut Option<update::Error>| match commit() {
+        Ok(commits) => {
+            made.set(made.get() + commits);
             true
         }
         Err(error) => {
@@ -750,7 +847,7 @@ fn updating(
         Ok(report) => report,
         Err(Error::Canceled) => {
             say(out, "Canceled. Nothing was locked or applied.")?;
-            return Ok(Updated::Stopped(Exit::Canceled, CANCELED));
+            return Ok(Updated::Stopped(Exit::Canceled, scope.canceled()));
         }
         Err(other) => return Err(other.into()),
     };
@@ -760,17 +857,17 @@ fn updating(
     if recovering {
         say(
             out,
-            "Nothing was locked: an interrupted apply had to be dealt with first. Run bx update \
-             again.",
+            &format!(
+                "Nothing was locked: an interrupted apply had to be dealt with first. Run {} \
+                 again.",
+                scope.command()
+            ),
         )?;
         let exit = match plan::exit(&report, mode) {
             Exit::Converged => Exit::Pending,
             exit => exit,
         };
-        return Ok(Updated::Stopped(
-            exit,
-            "bx update dealt with an interrupted apply first, and locked nothing",
-        ));
+        return Ok(Updated::Stopped(exit, scope.recovered()));
     }
     // A lock that moves nothing `apply` writes — an entry dropped, or a
     // checkout that is a conflict either way — is still the user's to approve.
@@ -782,14 +879,14 @@ fn updating(
                 Ok(approved) => approved,
                 Err(Error::Canceled) => {
                     say(out, "Canceled. Nothing was locked.")?;
-                    return Ok(Updated::Stopped(Exit::Canceled, CANCELED));
+                    return Ok(Updated::Stopped(Exit::Canceled, scope.canceled()));
                 }
                 Err(other) => return Err(other.into()),
             }
         };
         declined = !approved;
         if approved && lock(&mut failed) {
-            say(out, "Locked.")?;
+            say(out, if repins { "Upgraded." } else { "Locked." })?;
         }
         if let Some(error) = failed {
             return Err(error);
@@ -803,6 +900,14 @@ fn updating(
                     | update::Verdict::Unproven { .. }
                     | update::Verdict::Unreachable(_)
             )
+        })
+        || upgraded.iter().any(|found| {
+            matches!(
+                found.verdict,
+                pin::Verdict::Rewritten { .. }
+                    | pin::Verdict::Unproven { .. }
+                    | pin::Verdict::Unreachable(_)
+            )
         });
     let exit = match plan::exit(&report, mode) {
         Exit::Converged if attention => Exit::Pending,
@@ -811,10 +916,7 @@ fn updating(
     // Declined, what was found stays on offer, answered: the same commits
     // are not offered again, and newer ones are.
     if declined {
-        return Ok(Updated::Stopped(
-            exit,
-            "bx update was declined, and locked nothing",
-        ));
+        return Ok(Updated::Stopped(exit, scope.declined()));
     }
     if let Some(pulled) = &pulled {
         // As `bx sync` does: every carried file in one commit, after the
@@ -823,7 +925,7 @@ fn updating(
         if carried > 0 {
             say(out, &committed_carry(carried, pulled))?;
         }
-        let committed = u64::from(made.get()) + u64::from(carried > 0);
+        let committed = made.get() + u64::from(carried > 0);
         push_lock(git, pulled, committed, &report, out)?;
     }
     update::finished(&inputs)?;
@@ -873,8 +975,139 @@ fn push_lock(
     writeln!(out, "{said}").map_err(update::Error::Output)
 }
 
-/// What `last-check` says after a `bx update` abandoned at its question.
-const CANCELED: &str = "bx update was canceled, and locked nothing";
+/// `bx upgrade`: everything [`update`] does, and move each pinned external to
+/// its newest release; then say whether bx itself has a newer release.
+///
+/// The followed externals are looked at and locked exactly as `bx update`
+/// does. Each pinned one `names` selects — every one, with no names — is
+/// looked at with [`pin::look`]; one that moves has its `rev` rewritten in
+/// the layer whose entry won the merge, and that rewrite is shown as a diff
+/// before the plan, which is decided against the new commits. Once approved,
+/// the lock's commit and then one commit of the rewritten committed layers,
+/// [`pin::SUBJECT`], are made **before** any checkout moves; `local.toml` is
+/// rewritten and never committed. The apply, the carry and the push are
+/// `bx update`'s, so the two commits are pushed with every other.
+///
+/// A pin commit whose push was refused is replayed by the next `bx update`
+/// or `bx upgrade` over an upstream that moved, as a lock commit is
+/// ([`update::replay_own_commits`]), unless the upstream changed the same
+/// layer.
+///
+/// A pin is offered only once a checkout of bx's shows the new commit
+/// descends from the one pinned, since `apply` moves a checkout only forward;
+/// a fresh machine clones first, and offers it on the next run.
+///
+/// The binary is only reported on, with [`self_upgrade`]'s check: replacing
+/// it is `bx self-upgrade`'s. A check that fails is said in one line, and
+/// changes no exit status.
+///
+/// With `check`, it moves nothing: [`update::check`] for the followed
+/// externals, [`pin::look`] for the pinned ones, and the binary's check.
+/// It exits [`Exit::Pending`] when any of the three has something newer,
+/// otherwise [`Exit::Error`] when one could not look, and otherwise
+/// [`Exit::Converged`].
+///
+/// # Errors
+///
+/// As [`update`], with [`update::Error::NotExternal`] for a name that is no
+/// external's path, [`update::Error::LayerEdited`] for a committed layer to
+/// rewrite that holds changes nobody committed, and [`update::Error::Pin`]
+/// for a layer that cannot be rewritten.
+pub fn upgrade(
+    env: &Env,
+    names: &[String],
+    yes: bool,
+    check: bool,
+    out: &mut dyn Write,
+) -> Result<Exit, update::Error> {
+    let mode = if check {
+        Upgrading::Check
+    } else {
+        Upgrading::Upgrade { yes }
+    };
+    upgrade_with(
+        env,
+        names,
+        mode,
+        out,
+        &Git::new(env),
+        &mut confirm,
+        &mut |out| self_upgrade(true, false, out),
+    )
+}
+
+/// What `bx upgrade` is asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Upgrading {
+    /// Upgrade, approved without asking when `yes`.
+    Upgrade { yes: bool },
+    /// Only look and report.
+    Check,
+}
+
+/// [`upgrade`], through `git`, with the question asked through `ask`, and
+/// the binary checked by `binary`.
+fn upgrade_with(
+    env: &Env,
+    names: &[String],
+    mode: Upgrading,
+    out: &mut dyn Write,
+    git: &Git,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+    binary: &mut dyn FnMut(&mut dyn Write) -> Result<Exit, upgrade::Error>,
+) -> Result<Exit, update::Error> {
+    if let Upgrading::Upgrade { yes } = mode {
+        let exit = scoped(env, names, Scope::FollowedAndPinned, yes, out, git, ask)?;
+        if let Err(error) = binary(out) {
+            writeln!(out, "bx itself: not checked: {error}").map_err(update::Error::Output)?;
+        }
+        return Ok(exit);
+    }
+    let inputs = Inputs::load(env)?;
+    let (followed, pinned) = pin::select(&inputs.resolved().externals, names, &env.home)?;
+    let mut exits = Vec::new();
+    // Each followed one chosen, by name: with none, `bx update --check`
+    // would look at every followed one instead.
+    if !followed.is_empty() {
+        let followed: Vec<String> = followed
+            .iter()
+            .map(|external| external.path.to_string())
+            .collect();
+        exits.push(update::check(env, &followed, false, git, out)?);
+    }
+    if !pinned.is_empty() {
+        let state = crate::state::StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+        let _held = update::Stamps::of(&state)
+            .hold(update::HOLD_WAIT)?
+            .ok_or(update::Error::Busy)?;
+        let ledger = crate::state::LedgerView::read(inputs.state(), &env.home)
+            .map_err(Error::from)?
+            .value;
+        for found in pin::look_all(git, &env.home, &pinned, &ledger) {
+            writeln!(out, "{}", found.summary()).map_err(update::Error::Output)?;
+            exits.push(match found.verdict {
+                pin::Verdict::Moves { .. } => Exit::Pending,
+                pin::Verdict::Unreachable(_) => Exit::Error,
+                _ => Exit::Converged,
+            });
+        }
+    }
+    exits.push(binary(out).unwrap_or_else(|error| {
+        let _ = writeln!(out, "bx itself: not checked: {error}");
+        Exit::Error
+    }));
+    Ok(worst(&exits))
+}
+
+/// The exit of several checks: [`Exit::Pending`] when any has something
+/// newer, then [`Exit::Error`] when any could not look, then
+/// [`Exit::Converged`].
+fn worst(exits: &[Exit]) -> Exit {
+    [Exit::Pending, Exit::Error]
+        .into_iter()
+        .find(|exit| exits.contains(exit))
+        .unwrap_or(Exit::Converged)
+}
 
 /// `bx init`: create the repo when there is none, answer this account's unset
 /// values, offer the config already on the machine, then plan and apply

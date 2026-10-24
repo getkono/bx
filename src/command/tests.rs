@@ -1205,3 +1205,4 @@ mod doctor_command;
 mod sync_command;
 mod update_command;
 mod update_sync_command;
+mod upgrade_command;

@@ -607,6 +607,34 @@ ffxbALZN3JpDBBEk8TeZk55mo+jjJlOtAf63Q=
         ));
     }
 
+    #[test]
+    fn an_identity_is_read_up_to_the_limit_and_refused_one_byte_past_it() {
+        let home = guarded_home();
+        let ciphertext = encrypt_to(SSH_PUB, b"x");
+        let file = home.child("id");
+        // An age identity's header, padded out: classified as one, and
+        // locked, for as long as the whole of it was read.
+        let padded = |len: usize| {
+            let mut bytes = AGE_HEADER.as_bytes().to_vec();
+            bytes.resize(len, b'\n');
+            bytes
+        };
+        let limit = usize::try_from(IDENTITY_LIMIT).expect("fits");
+        // A few kilobytes, as an identity file is, whatever the limit says.
+        for len in [4 * 1024, limit] {
+            std::fs::write(&file, padded(len)).expect("the identity");
+            assert!(
+                matches!(never(&ciphertext, &file), Err(Refusal::Locked { .. })),
+                "{len} bytes"
+            );
+        }
+        std::fs::write(&file, padded(limit + 1)).expect("one byte over");
+        assert!(matches!(
+            never(&ciphertext, &file),
+            Err(Refusal::NotAnIdentity { .. })
+        ));
+    }
+
     /// An ecdsa key, which age reads and cannot use: age's own test fixture,
     /// protecting nothing.
     const ECDSA_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----

@@ -1458,3 +1458,140 @@ fn add_of_a_tracked_target_is_refused_naming_sync() {
         "{rows:?}"
     );
 }
+
+#[test]
+fn a_held_back_target_refuses_its_own_path_and_no_other() {
+    let values = "[[value]]\nname = \"who\"\nkind = \"string\"\n";
+    let home = repo(&format!("{values}\n{}", inline("~/.blocked", "{{who}}\\n")));
+    plant(&home, ".blocked", b"x\n", 0o644);
+    plant(&home, ".free", b"x\n", 0o644);
+
+    let rows = add_rel(&home, ".blocked");
+    assert!(
+        matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("held back")),
+        "{rows:?}"
+    );
+    assert_eq!(adopted(&add_rel(&home, ".free")), ["~/.free"]);
+}
+
+#[test]
+fn a_toggle_naming_a_target_gated_off_here_keeps_it_out_of_discovery() {
+    // The module's declaration is dropped on this machine, so the toggle in
+    // local.toml is all that still names the path.
+    let gated = format!(
+        "{}when = \"host:no-such-bx-host\"\n",
+        inline("~/.config/gated", "x\\n")
+    );
+    let home = repo("");
+    home.write(".config/bx/modules/elsewhere.toml", &gated);
+    let local = StateDir::resolve(home.path()).local_toml();
+    std::fs::create_dir_all(local.parent().expect("parent")).expect("state dir");
+    std::fs::write(
+        &local,
+        "[[target]]\npath = \"~/.config/gated\"\nenabled = false\n",
+    )
+    .expect("local.toml");
+    for rel in [".config/gated", ".config/free"] {
+        plant(&home, rel, b"x\n", 0o644);
+    }
+
+    let ctx = context(&home);
+    assert!(
+        ctx.layers
+            .iter()
+            .all(|layer| layer.config.targets.is_empty()),
+        "no layer declares the path on this machine"
+    );
+    assert_eq!(
+        discover(&ctx, &home.child(".config")).expect("discover"),
+        [target(&home, ".config/free")]
+    );
+}
+
+#[test]
+fn a_path_that_cannot_be_looked_at_is_a_read_error_not_a_missing_one() {
+    // A regular file where a directory is wanted: `ENOTDIR`, which no
+    // privilege turns into anything else.
+    let home = repo(MINE);
+    plant(&home, ".file", b"x\n", 0o644);
+    let ctx = context(&home);
+
+    let err = add(&ctx, &target(&home, ".file/child")).expect_err("not a directory");
+    assert!(
+        matches!(&err, Error::Read { path, .. } if *path == home.child(".file/child")),
+        "{err:?}"
+    );
+    let err = discover(&ctx, &home.child(".file")).expect_err("not a directory");
+    assert!(
+        matches!(&err, Error::Read { path, .. } if *path == home.child(".file")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_region_declared_over_the_whole_file_is_still_refused_as_part_of_a_file() {
+    let home = repo(&format!(
+        "{}attach = \"region\"\ncomment = \"#\"\n",
+        inline("~/.region", "r\\n")
+    ));
+    plant(&home, ".region", b"r\n", 0o644);
+    let rows = add_rel(&home, ".region");
+    assert!(
+        matches!(rows.as_slice(), [Adoption::Refused { note, .. }] if note.contains("part of a file")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn a_declared_file_bx_owns_at_other_bytes_is_owned_afresh_not_unchanged() {
+    let home = repo(&inline("~/.declared", "old\\n"));
+    plant(&home, ".declared", b"old\n", 0o644);
+    add_rel(&home, ".declared");
+    let entry = ledger(&home)
+        .get(&target(&home, ".declared"))
+        .cloned()
+        .expect("owned");
+    assert_eq!(entry.mechanism, Mechanism::Own);
+
+    // The declaration and the file both moved on, together: the ledger's
+    // digest is the old bytes', and the mode is unchanged.
+    seed(home.path(), &inline("~/.declared", "new\\n"));
+    plant(&home, ".declared", b"new\n", 0o644);
+    let rows = add_rel(&home, ".declared");
+    assert!(
+        matches!(rows.as_slice(), [Adoption::Own { bytes, .. }] if bytes == b"new\n"),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn rm_of_a_tracked_target_whose_repo_copy_alone_conflicts_restores_neither_side() {
+    let home = tracked_onto_a_fresh_machine();
+    plant(&home, ".config/tool/lock", b"mine\n", 0o644);
+    sync_apply(&home);
+    assert_eq!(
+        std::fs::read(body(&home, "lock")).expect("the copy"),
+        b"mine\n",
+        "carried"
+    );
+    // The machine copy back as apply wrote it, so restoring it alone would
+    // be no conflict; the repo copy then moved on another machine.
+    plant(&home, ".config/tool/lock", b"repo\n", 0o644);
+    std::fs::write(body(&home, "lock"), b"theirs\n").expect("theirs");
+
+    let (exit, text) = rm_text(&home, "~/.config/tool/lock");
+    assert_eq!(exit, Exit::Pending, "{text}");
+    assert!(
+        text.starts_with("  ! ~/.config/tool/lock  its repo copy ~/.config/bx/files/lock "),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read(home.child(".config/tool/lock")).expect("kept"),
+        b"repo\n"
+    );
+    assert_eq!(
+        std::fs::read(body(&home, "lock")).expect("the copy"),
+        b"theirs\n"
+    );
+    assert_eq!(layer(&home), TRACKED_NESTED, "still declared");
+}

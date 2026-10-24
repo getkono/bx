@@ -51,6 +51,28 @@ fn sync_fast_forwards_applies_and_converges_then_a_second_run_does_nothing() {
 }
 
 #[test]
+fn a_sync_counts_what_it_changed_and_not_what_was_already_in_place() {
+    let home = guarded_home();
+    cloned(&home, &inline("~/.a", "a\\n"));
+    let env = env(home.path());
+    apply(&env, true, &mut Vec::new()).expect("apply");
+    publish_elsewhere(
+        &home,
+        &format!("{}{}", inline("~/.a", "a\\n"), inline("~/.b", "b\\n")),
+    );
+
+    let mut out = Vec::new();
+    let exit = sync_with(&env, true, &mut out, &git(home.path()), &mut never).expect("sync");
+
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).ends_with("Applied 1 change(s).\n"),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
 fn sync_applies_on_confirmation_and_pushes_what_this_machine_committed() {
     let home = guarded_home();
     let repo = cloned(&home, "");

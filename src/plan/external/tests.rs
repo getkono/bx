@@ -1045,8 +1045,18 @@ fn rm_leaves_something_that_is_not_the_checkout() {
     apply(&home, &layer(&up.first));
     std::fs::remove_dir_all(home.child(AT)).expect("the user removed it");
     std::fs::write(home.child(AT), "a file\n").expect("and put a file there");
-    assert!(matches!(rm(&home).as_slice(), [Restored::Conflict { .. }]));
+    assert!(
+        matches!(
+            rm(&home).as_slice(),
+            [Restored::Conflict { note, dest, .. }]
+                if note == "is a file, not the checkout bx cloned; bx is leaving it and \
+                            forgetting nothing"
+                    && *dest == home.child(AT)
+        ),
+        "the note says what is there"
+    );
     assert!(home.child(AT).is_file());
+    assert!(entry(&home).is_some(), "the entry stays");
 }
 
 #[test]

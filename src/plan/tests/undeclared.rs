@@ -165,6 +165,15 @@ fn a_synced_repo_copy_is_undeclared_once_no_tracked_target_is_held_back() {
     let report = plan(&inputs(&home, &inline("~/.b", "b\\n")));
     assert_eq!(report.actions(), vec![Action::Create, Action::Undeclared]);
     assert_eq!(report.changes[1].target, "~/.config/bx/files/lock");
+
+    // A held-back target that is not tracked declares no repo copy.
+    let blocked = format!(
+        "[[value]]\nname = \"who\"\nkind = \"string\"\nrequired = true\n{}",
+        inline("~/.b", "{{who}}\\n")
+    );
+    let report = plan(&inputs(&home, &blocked));
+    assert_eq!(report.actions(), vec![Action::Blocked, Action::Undeclared]);
+    assert_eq!(report.changes[1].target, "~/.config/bx/files/lock");
 }
 
 #[test]

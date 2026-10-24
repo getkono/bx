@@ -1393,6 +1393,20 @@ fn substitute_replaces_each_placeholder_and_refuses_what_is_not_one() {
 }
 
 #[test]
+fn the_scan_emits_no_empty_literal_around_a_placeholder() {
+    use Piece::{Literal, Name};
+    let cases: [(&str, &[Piece<'_>]); 4] = [
+        ("{{a}}", &[Name("a")]),
+        ("{{a}}{{b}}", &[Name("a"), Name("b")]),
+        ("x{{a}}y", &[Literal("x"), Name("a"), Literal("y")]),
+        ("{{{{", &[Literal("{{")]),
+    ];
+    for (text, pieces) in cases {
+        assert_eq!(scan(text).expect("well formed"), pieces, "{text}");
+    }
+}
+
+#[test]
 fn an_answer_is_itself_substituted_once() {
     // Which is what lets `local.toml` say `sccache_dir =
     // "{{scratch_root}}/sccache"` as well as spelling it out.

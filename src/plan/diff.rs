@@ -251,7 +251,7 @@ impl Diff {
 /// was none, or rolled back to where there was none. `similar` has no hunk for
 /// that, and without the headers the diff was the empty string, which a row
 /// rendered as one blank indented line under nothing.
-fn unified(target: &str, (from, to): (&str, &str), old: &str, new: &str) -> String {
+pub(crate) fn unified(target: &str, (from, to): (&str, &str), old: &str, new: &str) -> String {
     let old: Vec<&str> = old.split_inclusive('\n').collect();
     let new: Vec<&str> = new.split_inclusive('\n').collect();
     let diff = TextDiff::configure()

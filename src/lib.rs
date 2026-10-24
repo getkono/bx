@@ -63,7 +63,9 @@
 //! for a declared external, and for `bx rm`'s checks on a checkout. [`update`]
 //! is `bx update`'s own part: where a followed external's branch is now,
 //! `bx.lock` written and committed before anything moves, and the stamps an
-//! interactive zsh or bash reads to decide whether to ask. [`upgrade`] is `bx self-upgrade`: the
+//! interactive zsh or bash reads to decide whether to ask. [`pin`] is what
+//! `bx upgrade` adds to it: each pinned external's newest release, and its
+//! `rev` rewritten in the layer that declares it. [`upgrade`] is `bx self-upgrade`: the
 //! installer a fresh install runs, fetched from master and run only while its
 //! digest is the one this release pins.
 //!
@@ -129,6 +131,7 @@ pub mod init;
 pub mod journal;
 pub mod lexical;
 pub mod paths;
+pub mod pin;
 pub mod plan;
 pub mod recover;
 pub mod report;

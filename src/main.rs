@@ -1,6 +1,6 @@
 //! The `bx` binary.
 //!
-//! Twelve commands, no manual. Everything the user needs to discover is reachable
+//! Thirteen commands, no manual. Everything the user needs to discover is reachable
 //! from `--help` and the prompts in `bx init`.
 
 use std::io::Write as _;
@@ -69,6 +69,23 @@ enum Command {
         /// The interactive shell's own quiet, bounded check
         #[arg(long, hide = true, conflicts_with_all = ["yes", "check", "snooze", "paths"])]
         background: bool,
+    },
+    /// Everything update does, and move pinned externals to their newest
+    /// release, rewriting `rev` where it is declared; then say whether bx
+    /// itself has a newer release, which `bx self-upgrade` installs
+    Upgrade {
+        /// Only these externals, by path, followed or pinned; every one when
+        /// none
+        paths: Vec<String>,
+        /// Lock, rewrite, commit, apply and push without asking for
+        /// confirmation
+        #[arg(long, conflicts_with = "check")]
+        yes: bool,
+        /// Only look and report: exit 0 when nothing is newer, 2 when
+        /// something is (an external or bx itself), 1 when nothing is but
+        /// something could not be checked; changes no file
+        #[arg(long)]
+        check: bool,
     },
     /// List declared secrets, and whether each decrypts here
     Secret {
@@ -140,6 +157,9 @@ fn main() -> Result<()> {
         }) => {
             let mode = bx::command::UpdateMode::from_flags(yes, check, snooze, background);
             bx::command::update(&env, &paths, mode, &mut out)?
+        }
+        Some(Command::Upgrade { paths, yes, check }) => {
+            bx::command::upgrade(&env, &paths, yes, check, &mut out)?
         }
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
         Some(Command::Secret {

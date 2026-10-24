@@ -136,6 +136,23 @@ pub enum Error {
         .0.display()
     )]
     LockEdited(PathBuf),
+    /// A layer `bx upgrade` rewrites holds an edit nobody committed.
+    #[error(
+        "{} has changes that are not committed; bx upgrade commits the pins it rewrites \
+         there, and would commit those with them. Commit or discard them, then run bx upgrade \
+         again",
+        .0.display()
+    )]
+    LayerEdited(PathBuf),
+    /// A path named to `bx upgrade` is not an external.
+    #[error(
+        "`{0}` is not an [[external]]; bx upgrade moves those that follow a branch and those \
+         pinned with `rev`. Name one by its `path`, or name none to upgrade them all"
+    )]
+    NotExternal(String),
+    /// A pin could not be rewritten in its layer.
+    #[error(transparent)]
+    Pin(#[from] crate::pin::Error),
     /// A path named on the command line is not a followed external.
     #[error(
         "`{0}` is not an [[external]] that follows a branch; bx update moves only those. Name \
@@ -146,7 +163,7 @@ pub enum Error {
     /// changed `bx.lock`, or a tracked copy one of them carried.
     #[error(
         "this machine has {commits} unpushed bx update commit(s), and another machine pushed \
-         its own bx.lock or tracked file over the same file; nothing was changed. To take the \
+         its own bx.lock, tracked file or layer over the same file; nothing was changed. To take the \
          other machine's, run `git -C {} reset --keep @{{upstream}}`, then bx update again; to \
          keep this one's, merge by hand and run bx sync",
         .repo.display()
@@ -318,9 +335,7 @@ pub fn select<'a>(
     }
     let mut chosen = Vec::new();
     for name in names {
-        let path = Portable::parse_in(name, home)
-            .or_else(|_| Portable::from_path(&paths::normalize(Path::new(name)), home))
-            .map_err(|_| Error::NotFollowed(name.clone()))?;
+        let path = named(name, home).ok_or_else(|| Error::NotFollowed(name.clone()))?;
         let external = followed
             .iter()
             .find(|external| external.path == path)
@@ -330,6 +345,14 @@ pub fn select<'a>(
         }
     }
     Ok(chosen)
+}
+
+/// The external's path `name` spells, as written in a layer or as a path on
+/// this machine, or `None` when it spells none.
+pub(crate) fn named(name: &str, home: &Path) -> Option<Portable> {
+    Portable::parse_in(name, home)
+        .or_else(|_| Portable::from_path(&paths::normalize(Path::new(name)), home))
+        .ok()
 }
 
 /// How long [`look_all`] lets `git` wait on the remotes it asks.
@@ -414,10 +437,7 @@ pub fn look(
     };
     let dest = external.path.render(home);
     let reference = format!("refs/heads/{}", follow.branch);
-    let ours = finished_clone(ledger, &external.path)
-        && dest.is_dir()
-        && checkout::own_checkout(git, &dest).is_ok()
-        && matches!(checkout::origin_url(git, &dest), Ok(Some(url)) if url == external.url);
+    let ours = owned(git, ledger, external, &dest);
 
     let tip = if ours {
         git.query(
@@ -481,9 +501,29 @@ pub fn look(
     }
 }
 
+/// Whether `dest` is `external`'s checkout as bx made it: the ledger records
+/// bx's finished clone there, and it is a repository of its own whose
+/// `origin` is the url declared. Only such a checkout is fetched into.
+pub(crate) fn owned(
+    git: &Git,
+    ledger: &crate::state::LedgerView,
+    external: &External,
+    dest: &Path,
+) -> bool {
+    finished_clone(ledger, &external.path)
+        && dest.is_dir()
+        && checkout::own_checkout(git, dest).is_ok()
+        && matches!(checkout::origin_url(git, dest), Ok(Some(url)) if url == external.url)
+}
+
 /// The commit `reference` names on the remote at `url`, asked with
 /// `git ls-remote` from `home`, which needs no repository.
-fn remote_tip(git: &Git, home: &Path, url: &str, reference: &str) -> Result<String, String> {
+pub(crate) fn remote_tip(
+    git: &Git,
+    home: &Path,
+    url: &str,
+    reference: &str,
+) -> Result<String, String> {
     match git.query(home, &["ls-remote", "--exit-code", url, reference]) {
         Ok(listed) => listed
             .lines()
@@ -613,9 +653,11 @@ pub enum Replay {
 }
 
 /// When the config repo's branch has diverged from its upstream only by
-/// commits `bx update` makes, each with one parent — a lock commit, with
-/// [`SUBJECT`] and touching `bx.lock` alone, or a carry of tracked copies,
-/// with [`sync::CARRIED_SUBJECT`] and not touching `bx.lock` — replay them on
+/// commits `bx update` and `bx upgrade` make, each with one parent — a lock
+/// commit, with [`SUBJECT`] and touching `bx.lock` alone, a carry of tracked
+/// copies, with [`sync::CARRIED_SUBJECT`] and not touching `bx.lock`, or a
+/// pin commit, with [`crate::pin::SUBJECT`] and touching committed layers
+/// alone — replay them on
 /// top of the upstream, as `git rebase` does. Every lock and copy they held
 /// is kept, so nothing needs approving again. When the upstream changed one
 /// of their files as well — anywhere in it, whether or not git could merge
@@ -656,6 +698,8 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
             sync::CARRIED_SUBJECT => {
                 !touched.is_empty() && !touched.lines().any(|path| path == lock::FILE)
             }
+            // `bx upgrade`'s rewritten pins: committed layers only.
+            crate::pin::SUBJECT => !touched.is_empty() && touched.lines().all(is_layer),
             _ => false,
         };
         if !own {
@@ -719,6 +763,17 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
             }
         }
     }
+}
+
+/// Whether `path`, relative to the config repo, is a committed layer:
+/// `bx.toml`, or a `.toml` directly in `modules/`.
+fn is_layer(path: &str) -> bool {
+    use crate::config::{GLOBAL_LAYER, MODULES_DIR};
+    path == GLOBAL_LAYER
+        || path
+            .strip_prefix(MODULES_DIR)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|name| !name.contains('/') && name.ends_with(".toml"))
 }
 
 /// Whether a rebase stands open in the config repo at `repo`.
@@ -1801,6 +1856,21 @@ mod tests {
             tip: tip.to_string(),
             log: None,
             count: None,
+        }
+    }
+
+    #[test]
+    fn a_layer_is_bx_toml_or_a_toml_directly_in_modules() {
+        for (path, layer) in [
+            ("bx.toml", true),
+            ("modules/a.toml", true),
+            ("modules/a/b.toml", false),
+            ("modules/a.txt", false),
+            ("modulesa.toml", false),
+            ("other/bx.toml", false),
+            ("bx.lock", false),
+        ] {
+            assert_eq!(is_layer(path), layer, "{path}");
         }
     }
 

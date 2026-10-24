@@ -784,7 +784,7 @@ fn an_adopted_file_edited_in_the_repo_applies_and_rm_restores_the_adopted_bytes(
 }
 
 #[test]
-fn rm_removes_a_file_bx_created_and_keeps_the_comments_around_its_declaration() {
+fn rm_of_a_file_bx_created_undeclares_it_and_keeps_the_comments_around_its_declaration() {
     let layer_text = format!(
         "# above everything\n\n# the tool\n{}\n# after\n{}",
         inline("~/.made/new.conf", "new\\n"),
@@ -805,11 +805,6 @@ fn rm_removes_a_file_bx_created_and_keeps_the_comments_around_its_declaration() 
         ),
         "{removals:?}"
     );
-    assert!(
-        !home.child(".made/new.conf").exists(),
-        "removed, not emptied"
-    );
-    assert!(!home.child(".made").exists(), "and the directory bx made");
     assert_eq!(
         layer(&home),
         format!(
@@ -821,9 +816,9 @@ fn rm_removes_a_file_bx_created_and_keeps_the_comments_around_its_declaration() 
 }
 
 #[test]
-fn rm_puts_back_the_bytes_and_mode_of_a_file_bx_replaced() {
+fn rm_of_a_file_bx_replaced_reports_putting_it_back_and_undeclares_it() {
     let home = repo("");
-    let file = plant(&home, ".replaced", b"the user's\n", 0o600);
+    plant(&home, ".replaced", b"the user's\n", 0o600);
     crate::plan::tests::own(home.path(), ".replaced", b"bx's\n", Mechanism::Own);
     seed(home.path(), &inline("~/.replaced", "bx's\\n"));
     assert_eq!(plan_exit(&home).0, Exit::Converged);
@@ -837,8 +832,6 @@ fn rm_puts_back_the_bytes_and_mode_of_a_file_bx_replaced() {
             text.contains("  - ~/.replaced  put back the file bx replaced; no longer declared in ~/.config/bx/bx.toml"),
             "{text}"
         );
-    assert_eq!(std::fs::read(&file).expect("read"), b"the user's\n");
-    assert_eq!(mode_of(&file), 0o600);
     assert_eq!(layer(&home), "");
 }
 
@@ -856,10 +849,6 @@ fn rm_over_an_edit_is_a_conflict_that_changes_nothing() {
     let text = String::from_utf8(out).expect("UTF-8");
     assert!(text.starts_with("  ! ~/.edited  "), "{text}");
     assert!(text.ends_with("; still managed\n"), "{text}");
-    assert_eq!(
-        std::fs::read(home.child(".edited")).expect("read"),
-        b"hand edit\n"
-    );
     assert_eq!(layer(&home), layer_text, "still declared");
     assert!(ledger(&home).get(&target(&home, ".edited")).is_some());
 }

@@ -477,6 +477,7 @@ mod tests {
             paths("config::values"),
             vec![
                 PathBuf::from("config/values/local.rs"),
+                PathBuf::from("config/values/tests.rs"),
                 PathBuf::from("config/values.rs"),
             ],
             "sorted by path component, so a directory sorts before its sibling file"

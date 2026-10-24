@@ -1,6 +1,3 @@
 # Files over scripts/line-check's limit when it was last lowered. This list only
 # shrinks: split a file below the limit, then delete its line. Lowering the
 # limit is the one way a line is added, for a file already over the new limit.
-src/env_guard/tests.rs
-src/journal/session/tests.rs
-src/plan/mod.rs

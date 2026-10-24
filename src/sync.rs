@@ -1083,102 +1083,83 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn every_state_file_name_in_an_outgoing_commit_refuses_the_push() {
-        let digest = crate::state::ContentHash::of(b"prior\n").to_hex();
-        for path in [
-            "local.toml".to_string(),
-            "nested/ledger.mpk".to_string(),
-            "journal.mpk".to_string(),
-            format!("state/restore/{digest}"),
-        ] {
+    fn a_state_file_in_any_outgoing_commit_refuses_the_push_naming_it() {
+        let restore = format!(
+            "state/restore/{}",
+            crate::state::ContentHash::of(b"prior\n").to_hex()
+        );
+        /// One outgoing commit: each path with the bytes it writes, or `None`
+        /// where it removes the path.
+        type Commit<'a> = Vec<(&'a str, Option<&'a str>)>;
+        // Each case: the outgoing commits, in order, then the path the
+        // refusal names.
+        let cases: [(Vec<Commit>, &str); 8] = [
+            (vec![vec![("local.toml", Some("x"))]], "local.toml"),
+            (
+                vec![vec![("nested/ledger.mpk", Some("x"))]],
+                "nested/ledger.mpk",
+            ),
+            (vec![vec![("journal.mpk", Some("x"))]], "journal.mpk"),
+            (vec![vec![(restore.as_str(), Some("x"))]], restore.as_str()),
+            // Committed and then deleted: still in the history pushed.
+            (
+                vec![
+                    vec![("local.toml", Some("[values]\n"))],
+                    vec![("local.toml", None)],
+                ],
+                "local.toml",
+            ),
+            // The seeded `bx.toml` is empty, so the upstream already has the
+            // empty blob this `local.toml` is.
+            (vec![vec![("local.toml", Some(""))]], "local.toml"),
+            // `a.toml` sorts first, so an object list names the shared blob
+            // by it.
+            (
+                vec![vec![
+                    ("a.toml", Some("shared\n")),
+                    ("journal.mpk", Some("shared\n")),
+                ]],
+                "journal.mpk",
+            ),
+            // In the middle of several outgoing commits.
+            (
+                vec![
+                    vec![("mine.toml", Some("a\n"))],
+                    vec![("sub/ledger.mpk", Some("b\n"))],
+                    vec![("mine.toml", Some("c\n"))],
+                ],
+                "sub/ledger.mpk",
+            ),
+        ];
+        for (commits, named) in cases {
             let home = guarded_home();
             let repo = cloned(&home, "");
-            let file = repo.join(&path);
-            std::fs::create_dir_all(file.parent().expect("a parent")).expect("parents");
-            std::fs::write(&file, "x").expect("the state file");
-            commit_all(home.path(), &repo, "oops");
+            assert_eq!(std::fs::read(repo.join("bx.toml")).expect("bx.toml"), b"");
+            for commit in &commits {
+                for (path, bytes) in commit {
+                    let file = repo.join(path);
+                    match bytes {
+                        Some(bytes) => {
+                            std::fs::create_dir_all(file.parent().expect("a parent"))
+                                .expect("parents");
+                            std::fs::write(&file, bytes).expect("the file");
+                        }
+                        None => std::fs::remove_file(&file).expect("remove"),
+                    }
+                }
+                commit_all(home.path(), &repo, "outgoing");
+            }
             let head = rev(home.path(), &repo, "HEAD");
 
-            let error = pull(&env(home.path()), &git(home.path())).expect_err(&path);
+            let error = pull(&env(home.path()), &git(home.path())).expect_err(named);
 
             let Error::WouldPushState { paths, upstream } = &error else {
-                panic!("{path}: {error:?}");
+                panic!("{commits:?}: {error:?}");
             };
-            assert_eq!(paths, &vec![path.clone()]);
-            assert_eq!(upstream, "origin/master");
-            assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+            assert_eq!(paths, &vec![named.to_string()], "{commits:?}");
+            assert_eq!(upstream, "origin/master", "{commits:?}");
+            assert_eq!(rev(home.path(), &repo, "HEAD"), head, "{commits:?}");
         }
-    }
-
-    #[test]
-    fn a_state_file_committed_and_then_deleted_is_still_refused() {
-        let home = guarded_home();
-        let repo = cloned(&home, "");
-        std::fs::write(repo.join("local.toml"), "[values]\n").expect("local.toml");
-        commit_all(home.path(), &repo, "oops");
-        std::fs::remove_file(repo.join("local.toml")).expect("remove");
-        commit_all(home.path(), &repo, "undo");
-        let head = rev(home.path(), &repo, "HEAD");
-
-        let error = pull(&env(home.path()), &git(home.path())).expect_err("still in history");
-        let Error::WouldPushState { paths, upstream } = &error else {
-            panic!("{error:?}");
-        };
-        assert_eq!(paths, &vec!["local.toml".to_string()]);
-        assert_eq!(upstream, "origin/master");
-        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
-    }
-
-    #[test]
-    fn a_state_file_whose_bytes_the_upstream_already_has_is_still_refused() {
-        let home = guarded_home();
-        let repo = cloned(&home, "");
-        // The seeded `bx.toml` is empty, so the upstream already has the
-        // empty blob this `local.toml` is.
-        assert_eq!(std::fs::read(repo.join("bx.toml")).expect("bx.toml"), b"");
-        std::fs::write(repo.join("local.toml"), "").expect("local.toml");
-        commit_all(home.path(), &repo, "oops");
-
-        let error = pull(&env(home.path()), &git(home.path())).expect_err("empty local.toml");
-        let Error::WouldPushState { paths, .. } = &error else {
-            panic!("{error:?}");
-        };
-        assert_eq!(paths, &vec!["local.toml".to_string()]);
-    }
-
-    #[test]
-    fn a_state_file_sharing_its_bytes_with_another_outgoing_path_is_still_refused() {
-        let home = guarded_home();
-        let repo = cloned(&home, "");
-        // `a.toml` sorts first, so an object list names the shared blob by it.
-        std::fs::write(repo.join("a.toml"), "shared\n").expect("a.toml");
-        std::fs::write(repo.join("journal.mpk"), "shared\n").expect("journal.mpk");
-        commit_all(home.path(), &repo, "oops");
-
-        let error = pull(&env(home.path()), &git(home.path())).expect_err("shared blob");
-        let Error::WouldPushState { paths, .. } = &error else {
-            panic!("{error:?}");
-        };
-        assert_eq!(paths, &vec!["journal.mpk".to_string()]);
-    }
-
-    #[test]
-    fn a_state_file_in_any_of_several_outgoing_commits_is_refused() {
-        let home = guarded_home();
-        let repo = cloned(&home, "");
-        std::fs::write(repo.join("mine.toml"), "a\n").expect("mine");
-        commit_all(home.path(), &repo, "mine");
-        std::fs::create_dir_all(repo.join("sub")).expect("sub");
-        std::fs::write(repo.join("sub/ledger.mpk"), "b\n").expect("ledger");
-        commit_all(home.path(), &repo, "oops");
-        std::fs::write(repo.join("mine.toml"), "c\n").expect("mine again");
-        commit_all(home.path(), &repo, "later");
-
-        let error = pull(&env(home.path()), &git(home.path())).expect_err("middle commit");
-        let Error::WouldPushState { paths, .. } = &error else {
-            panic!("{error:?}");
-        };
-        assert_eq!(paths, &vec!["sub/ledger.mpk".to_string()]);
     }
 
     #[test]

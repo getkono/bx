@@ -600,9 +600,7 @@ fn parse_local(path: &Path, text: Option<&str>) -> Result<DocumentMut, Error> {
 pub(crate) mod tests {
     use super::*;
     use crate::plan::tests::{env, seed};
-    use crate::testing::{
-        GuardedHome, chmod, guarded_home, ignored_child, mode_of, run_ignored_child,
-    };
+    use crate::testing::{GuardedHome, chmod, guarded_home, mode_of};
 
     /// Answers from a script, recording what was asked.
     #[derive(Default)]
@@ -1268,45 +1266,6 @@ pub(crate) mod tests {
         assert!(matches!(error, Error::ReadLocal { .. }), "{error:?}");
     }
 
-    /// Set on the child that actually calls [`Terminal`].
-    const TERMINAL_CHILD: &str = "BX_TEST_INIT_TERMINAL_CHILD";
-
-    #[test]
-    #[ignore = "spawned by the test below; it must run with a stdin that is not a terminal"]
-    fn terminal_child() {
-        if std::env::var_os(TERMINAL_CHILD).is_none() {
-            return;
-        }
-        let decl = config::parse_str(
-            "[[value]]\nname = \"a\"\nkind = \"string\"\n",
-            Path::new("bx.toml"),
-            Path::new("/"),
-        )
-        .expect("a declaration")
-        .values
-        .remove(0);
-        for problem in [None, Some("no")] {
-            assert!(matches!(
-                Terminal.value(&decl, problem),
-                Err(Error::Prompt(inquire::InquireError::NotTTY))
-            ));
-        }
-        let offered = [Portable::parse_in("~/.a", Path::new("/h")).expect("portable")];
-        assert!(matches!(
-            Terminal.adopt(&offered),
-            Err(Error::Prompt(inquire::InquireError::NotTTY))
-        ));
-    }
-
-    #[test]
-    fn the_terminal_prompts_without_a_terminal_are_errors_and_never_answers() {
-        // As `command::tests::confirm_without_a_terminal_is_a_prompt_error_and_never_an_answer`:
-        // in a child whose stdin is certainly not a terminal, so this never
-        // hangs on a developer's machine.
-        run_ignored_child(
-            ignored_child("init::tests::terminal_child")
-                .env(TERMINAL_CHILD, "1")
-                .stdin(std::process::Stdio::null()),
-        );
-    }
+    // [`Terminal`]'s questions without a terminal are put in
+    // `command::tests::prompts_child`, beside the other prompts'.
 }

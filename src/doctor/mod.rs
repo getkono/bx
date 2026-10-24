@@ -640,11 +640,11 @@ login-shell = \"zsh\"
         );
         assert_eq!(code, Exit::Converged);
 
+        // `run` carries `externals::check`'s findings into the report too.
         let stopped = format!("{}the remote was unreachable", crate::update::STOPPED);
         std::fs::write(&last, format!("{stopped}\n")).unwrap();
         let (out, code) = doctor_of(&home, layer, OsStr::new(""), &Every::unreachable());
         assert!(out.starts_with("  ! bx update "), "{out}");
-        assert!(out.ends_with("Doctor: 1 finding(s).\n"), "{out}");
         assert_eq!(code, Exit::Pending);
     }
 

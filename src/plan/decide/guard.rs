@@ -357,6 +357,56 @@ mod tests {
             std::fs::read_to_string(home.child(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
         }
 
+        /// Plan `layer` and assert that every row is `Unchanged`: the run has
+        /// converged, and a further apply would write nothing. The plan is
+        /// returned for what else a test reads from its rows.
+        #[track_caller]
+        fn assert_converges(home: &GuardedHome, layer: &str) -> Report {
+            let report = plan(home, layer);
+            assert!(
+                report
+                    .changes
+                    .iter()
+                    .all(|change| change.action == Action::Unchanged),
+                "{:?}",
+                rows(&report)
+            );
+            report
+        }
+
+        /// The zsh interactive file and the `~/.zshrc` region that sources it.
+        const ZSH_TARGETS: [&str; 2] = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"];
+
+        /// [`ZSH_TARGETS`] as `rm` leaves them over a `~/.zshrc` the user
+        /// wrote first.
+        const ZSH_RESTORED: [(&str, Option<&str>); 2] = [
+            (".local/share/bx/zshrc.zsh", None),
+            (".zshrc", Some("alias ll='ls -l'\n")),
+        ];
+
+        /// `rm` `targets`, then assert each of `expected` holds its bytes
+        /// again, or is gone where it names none: what each file held before
+        /// bx.
+        #[track_caller]
+        fn assert_rm_restores(
+            home: &GuardedHome,
+            targets: &[&str],
+            expected: &[(&str, Option<&str>)],
+        ) {
+            let state = crate::state::StateDir::resolve(home.path());
+            let targets: Vec<Portable> = targets
+                .iter()
+                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
+                .collect();
+            crate::restore::restore(&state, home.path(), &targets).expect("rm");
+            for (rel, bytes) in expected {
+                match bytes {
+                    Some(bytes) => assert_eq!(read(home, rel), *bytes, "{rel}"),
+                    None => assert!(!home.child(rel).exists(), "{rel} is left behind"),
+                }
+            }
+        }
+
         #[test]
         fn a_variable_switched_off_or_moved_leaves_its_old_fragment_empty() {
             // PR #75 note D1: a place no variable lands in any more emits no
@@ -392,15 +442,7 @@ mod tests {
                 read(&home, ".local/share/bx/zshrc.zsh"),
                 interactive(&format!("{header}export PAGER=less\n"))
             );
-            let second = plan(&home, &after);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, &after);
 
             // Every variable gone: both fragments are left empty, and the
             // regions stay, sourcing them.
@@ -508,15 +550,7 @@ mod tests {
             }
 
             // Idempotent: an empty second plan, and nothing rewritten.
-            let second = plan(&home, &layer);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, &layer);
             assert!(!apply(&home, &layer).executed);
             assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), written);
 
@@ -534,14 +568,7 @@ mod tests {
             );
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
-                .iter()
-                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-                .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
-            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert_rm_restores(&home, &ZSH_TARGETS, &ZSH_RESTORED);
         }
 
         /// The source configuration's history and shell options.
@@ -584,34 +611,26 @@ mod tests {
             assert!(!written.contains("histappend"), "{written}");
 
             // Idempotent: an empty second plan, and nothing rewritten.
-            let second = plan(&home, HISTORY);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, HISTORY);
             assert!(!apply(&home, HISTORY).executed);
             assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), written);
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = [
-                "~/.local/share/bx/zshrc.zsh",
-                "~/.zshrc",
-                "~/.local/share/bx/bashrc.bash",
-                "~/.bashrc",
-            ]
-            .iter()
-            .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-            .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
-            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
-            assert!(!home.child(".local/share/bx/bashrc.bash").exists());
-            assert!(!home.child(".bashrc").exists());
+            assert_rm_restores(
+                &home,
+                &[
+                    ZSH_TARGETS[0],
+                    ZSH_TARGETS[1],
+                    "~/.local/share/bx/bashrc.bash",
+                    "~/.bashrc",
+                ],
+                &[
+                    ZSH_RESTORED[0],
+                    ZSH_RESTORED[1],
+                    (".local/share/bx/bashrc.bash", None),
+                    (".bashrc", None),
+                ],
+            );
         }
 
         #[test]
@@ -644,28 +663,16 @@ mod tests {
             );
 
             // Idempotent: an empty second plan, and nothing rewritten.
-            let second = plan(&home, KEYBINDINGS);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, KEYBINDINGS);
             assert!(!apply(&home, KEYBINDINGS).executed);
             assert_eq!(read(&home, ".local/share/bx/zshrc.zsh"), written);
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc", "~/.inputrc"]
-                .iter()
-                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-                .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
-            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
-            assert!(!home.child(".inputrc").exists());
+            assert_rm_restores(
+                &home,
+                &[ZSH_TARGETS[0], ZSH_TARGETS[1], "~/.inputrc"],
+                &[ZSH_RESTORED[0], ZSH_RESTORED[1], (".inputrc", None)],
+            );
         }
 
         #[test]
@@ -817,15 +824,7 @@ mod tests {
             );
 
             // Idempotent while the tool is missing.
-            let second = plan(&home, &layer);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, &layer);
 
             // Installing the tool is a change the next plan shows, and the
             // alias arrives, written plainly, with no `command -v`.
@@ -854,15 +853,7 @@ mod tests {
             );
             assert!(!written.contains("command -v"), "{written}");
             assert!(!written.contains("off"), "{written}");
-            let settled = plan(&home, &layer);
-            assert!(
-                settled
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&settled)
-            );
+            assert_converges(&home, &layer);
 
             // Invariant 2: the written `aliases` phase is not an environment
             // fragment, so sourcing its bytes, with its runtime condition
@@ -896,14 +887,7 @@ mod tests {
             }
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
-                .iter()
-                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-                .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
-            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert_rm_restores(&home, &ZSH_TARGETS, &ZSH_RESTORED);
         }
 
         #[test]
@@ -967,15 +951,7 @@ mod tests {
             }
 
             // Idempotent: an empty second plan, and nothing rewritten.
-            let second = plan(&home, SHARED);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, SHARED);
             assert!(!apply(&home, SHARED).executed);
             assert_eq!(read(&home, ".local/share/bx/bashrc.bash"), file);
             assert_eq!(read(&home, ".bashrc"), format!("{bashrc}{region}"));
@@ -997,21 +973,21 @@ mod tests {
             );
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = [
-                "~/.local/share/bx/zshrc.zsh",
-                "~/.zshrc",
-                "~/.local/share/bx/bashrc.bash",
-                "~/.bashrc",
-                "~/.inputrc",
-            ]
-            .iter()
-            .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-            .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert_eq!(read(&home, ".bashrc"), bashrc);
-            assert!(!home.child(".local/share/bx/bashrc.bash").exists());
-            assert!(!home.child(".inputrc").exists());
+            assert_rm_restores(
+                &home,
+                &[
+                    ZSH_TARGETS[0],
+                    ZSH_TARGETS[1],
+                    "~/.local/share/bx/bashrc.bash",
+                    "~/.bashrc",
+                    "~/.inputrc",
+                ],
+                &[
+                    (".bashrc", Some(bashrc)),
+                    (".local/share/bx/bashrc.bash", None),
+                    (".inputrc", None),
+                ],
+            );
         }
 
         #[test]
@@ -1147,15 +1123,7 @@ mod tests {
 
             // Idempotent while the value is unanswered: nothing to write, and
             // the row still says why the function is missing.
-            let second = plan(&home, layer);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            let second = assert_converges(&home, layer);
             let held = row(&second, "~/.local/share/bx/zshrc.zsh")
                 .note
                 .as_deref()
@@ -1185,15 +1153,7 @@ mod tests {
                      function __bx_hook_track {{\nreturn 0\n}}\n{registration}"
                 )
             );
-            let settled = plan(&home, layer);
-            assert!(
-                settled
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&settled)
-            );
+            assert_converges(&home, layer);
 
             // Invariant 2: sourcing the written `functions` phase exports
             // nothing and changes no parameter but zsh's hook arrays.
@@ -1246,14 +1206,7 @@ mod tests {
             }
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
-                .iter()
-                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-                .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
-            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert_rm_restores(&home, &ZSH_TARGETS, &ZSH_RESTORED);
         }
 
         #[test]
@@ -1305,15 +1258,7 @@ mod tests {
             // The file's presence is never an input: creating it changes no
             // plan, and nothing bx wrote reads it.
             home.write(".fzf.zsh", "print -r -- fzf\n");
-            let present = plan(&home, layer);
-            assert!(
-                present
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&present)
-            );
+            assert_converges(&home, layer);
 
             // Answering the value is a change the next plan shows, and the
             // source arrives substituted, in the phase it names.
@@ -1332,25 +1277,10 @@ mod tests {
                     interactive("")
                 )
             );
-            let settled = plan(&home, layer);
-            assert!(
-                settled
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&settled)
-            );
+            assert_converges(&home, layer);
 
             // Reversible: `rm` puts back the bytes each file held before bx.
-            let state = crate::state::StateDir::resolve(home.path());
-            let targets: Vec<Portable> = ["~/.local/share/bx/zshrc.zsh", "~/.zshrc"]
-                .iter()
-                .map(|raw| Portable::parse_in(raw, home.path()).expect("portable"))
-                .collect();
-            crate::restore::restore(&state, home.path(), &targets).expect("rm");
-            assert!(!home.child(".local/share/bx/zshrc.zsh").exists());
-            assert_eq!(read(&home, ".zshrc"), "alias ll='ls -l'\n");
+            assert_rm_restores(&home, &ZSH_TARGETS, &ZSH_RESTORED);
             assert_eq!(
                 read(&home, ".fzf.zsh"),
                 "print -r -- fzf\n",
@@ -1435,15 +1365,7 @@ mod tests {
             .iter()
             .map(|rel| read(&home, rel))
             .collect();
-            let second = plan(&home, &layer);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, &layer);
             let again = apply(&home, &layer);
             assert!(!again.executed);
             let rewritten: Vec<String> = [
@@ -1577,15 +1499,7 @@ mod tests {
             );
 
             // Unchanged machine, unchanged bytes.
-            let again = plan(&home, &layer);
-            assert!(
-                again
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&again)
-            );
+            assert_converges(&home, &layer);
 
             // Installing the missing tool is a change the next plan shows.
             std::fs::write(missing, "#!/bin/sh\n").expect("write");
@@ -1952,15 +1866,7 @@ mod tests {
             // Applying twice: an empty second plan, and the same bytes.
             let written = read(&home, ".local/share/bx/zshenv.zsh");
             let bash_written = read(&home, ".local/share/bx/bashrc.bash");
-            let second = plan(&home, &layer);
-            assert!(
-                second
-                    .changes
-                    .iter()
-                    .all(|change| change.action == Action::Unchanged),
-                "{:?}",
-                rows(&second)
-            );
+            assert_converges(&home, &layer);
             assert!(!apply(&home, &layer).executed);
             assert_eq!(read(&home, ".local/share/bx/zshenv.zsh"), written);
             assert_eq!(read(&home, ".local/share/bx/bashrc.bash"), bash_written);

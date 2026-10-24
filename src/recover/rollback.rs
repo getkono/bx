@@ -265,7 +265,7 @@ mod tests {
     use crate::recover::*;
 
     use std::path::{Path, PathBuf};
-    use std::process::Output;
+    use std::process::{Command, Output};
 
     use crate::fs::{self, Mode};
     use crate::journal::tests::{
@@ -394,6 +394,32 @@ mod tests {
     /// The variable the crash seam reads, once, at `Session::open`.
     const CRASH_AT: &str = "BX_CRASH_AT";
 
+    /// The [`Scenario`] the crash child runs, by name. Absent, it is
+    /// [`FILES`].
+    const CRASH_SCENARIO: &str = "BX_CRASH_SCENARIO";
+
+    /// What one crashing session does: the requests [`crash_child`] makes, in
+    /// order, and what stands under the home before it runs.
+    struct Scenario {
+        name: &'static str,
+        requests: fn(&Path) -> Vec<Request>,
+        plant: fn(&Path),
+    }
+
+    /// Files: [`crash_requests`] over [`plant_crash_fixture`].
+    const FILES: Scenario = Scenario {
+        name: "files",
+        requests: crash_requests,
+        plant: plant_crash_fixture,
+    };
+
+    /// Links: [`link_requests`] over [`plant_link_fixture`].
+    const LINKS: Scenario = Scenario {
+        name: "links",
+        requests: link_requests,
+        plant: plant_link_fixture,
+    };
+
     /// The four requests the crash child makes, in the order it makes them: a
     /// modify at a non-default mode, a create in a directory bx must invent, a
     /// plain modify, and a removal of a private file from a private directory
@@ -452,10 +478,39 @@ mod tests {
         // invent two directories, and a rollback has to remove both.
     }
 
-    /// The bytes and mode at one destination, or `None` where nothing is.
-    type FileState = Option<(Vec<u8>, Mode)>;
+    /// What stands at one destination.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Found {
+        /// A file's bytes and mode.
+        File(Vec<u8>, Mode),
+        /// A symbolic link's text.
+        Link(PathBuf),
+    }
 
-    /// What the crash harness compares before and after: bytes and mode at
+    /// What stands at one destination, or `None` where nothing is.
+    type FileState = Option<Found>;
+
+    /// What stands at `dest`, following no link.
+    fn found_at(dest: &Path) -> FileState {
+        match link_at(dest) {
+            Some(text) => Some(Found::Link(text)),
+            None => peek(dest).map(|(bytes, mode)| Found::File(bytes, mode)),
+        }
+    }
+
+    /// What `request` leaves at its destination once it has landed.
+    fn landed(request: &Request) -> FileState {
+        match &request.content {
+            Content::Bytes { bytes, .. } => Some(Found::File(bytes.clone(), request.mode)),
+            Content::Link { text, .. } => Some(Found::Link(text.clone())),
+            Content::Absent { .. } | Content::LinkAbsent { .. } => None,
+            Content::Dir { .. } | Content::DirAbsent { .. } => {
+                unreachable!("no crash scenario writes a directory")
+            }
+        }
+    }
+
+    /// What the crash harness compares before and after: what stands at
     /// each destination, and the mode of each directory between a
     /// destination and the home — the ones a write invents and the ones a
     /// removal claims — or `None` where there is none.
@@ -476,9 +531,9 @@ mod tests {
             .map(|meta| Mode::from_bits(meta.permissions().mode() & 0o7777))
     }
 
-    /// The crash harness's snapshot of `home`.
-    fn crash_snapshot(home: &Path) -> Snapshot {
-        let requests = crash_requests(home);
+    /// The crash harness's snapshot of `home` under `scenario`.
+    fn snapshot(scenario: &Scenario, home: &Path) -> Snapshot {
+        let requests = (scenario.requests)(home);
         let mut dirs: Vec<PathBuf> = requests
             .iter()
             .flat_map(|request| {
@@ -496,7 +551,7 @@ mod tests {
         Snapshot {
             files: requests
                 .into_iter()
-                .map(|request| (request.dest.clone(), peek(&request.dest)))
+                .map(|request| (request.dest.clone(), found_at(&request.dest)))
                 .collect(),
             dirs: dirs
                 .into_iter()
@@ -540,23 +595,33 @@ mod tests {
             .collect()
     }
 
-    /// Re-invoke this test binary, crashing at `phase` of write `index`.
+    /// Re-invoke this test binary, crashing at `phase` of write `index` of
+    /// [`FILES`].
     fn spawn_crash_child(home: &Path, index: usize, phase: &str) -> Output {
-        spawn_child("recover::rollback::tests::crash_child", home, index, phase)
+        spawn_scenario_child(&FILES, home, index, phase)
     }
 
-    /// Re-invoke this test binary to run the ignored test `child`, crashing
-    /// at `phase` of write `index`.
-    fn spawn_child(child: &str, home: &Path, index: usize, phase: &str) -> Output {
-        crate::testing::ignored_child(child)
+    /// Re-invoke this test binary, crashing at `phase` of write `index` of
+    /// `scenario`.
+    fn spawn_scenario_child(scenario: &Scenario, home: &Path, index: usize, phase: &str) -> Output {
+        crash_command("recover::rollback::tests::crash_child", home, index, phase)
+            .env(CRASH_SCENARIO, scenario.name)
+            .output()
+            .expect("spawn the crash child")
+    }
+
+    /// The command that re-invokes this test binary to run the ignored test
+    /// `child`, crashing at `phase` of write `index`.
+    fn crash_command(child: &str, home: &Path, index: usize, phase: &str) -> Command {
+        let mut command = crate::testing::ignored_child(child);
+        command
             .env(CRASH_AT, format!("{index}:{phase}"))
             .env(CRASH_HOME, home)
             // cargo-llvm-cov points this at a pattern the parent owns. The child
             // is going to abort, so it would write no profile anyway; removing
             // it makes that independent of how coverage is configured.
-            .env_remove("LLVM_PROFILE_FILE")
-            .output()
-            .expect("spawn the crash child")
+            .env_remove("LLVM_PROFILE_FILE");
+        command
     }
 
     /// The crashing half of the harness.
@@ -572,9 +637,14 @@ mod tests {
             return;
         };
         let home = PathBuf::from(home);
+        let scenario = if std::env::var_os(CRASH_SCENARIO).is_some_and(|name| name == LINKS.name) {
+            LINKS
+        } else {
+            FILES
+        };
         let state = StateDir::resolve(&home);
         let mut session = apply_session(&state, &home);
-        for request in crash_requests(&home) {
+        for request in (scenario.requests)(&home) {
             session.apply(request).expect("apply");
         }
         session.finish().expect("finish");
@@ -610,99 +680,6 @@ mod tests {
         std::fs::create_dir_all(home.join(".local/bin")).expect("the link fixture's parents");
         std::os::unix::fs::symlink("../src/tool", home.join(".local/bin/tool")).expect("a link");
         std::os::unix::fs::symlink("bx made this", home.join(".gone")).expect("a link");
-    }
-
-    /// What the link crash harness compares: the text at each destination, or
-    /// `None` where no link is, and whether `~/.config` is there.
-    fn link_snapshot(home: &Path) -> (Vec<Option<PathBuf>>, bool) {
-        (
-            link_requests(home)
-                .iter()
-                .map(|request| link_at(&request.dest))
-                .collect(),
-            home.join(".config").exists(),
-        )
-    }
-
-    /// The crashing half of [`a_crash_at_every_link_boundary_is_recoverable`].
-    #[test]
-    #[ignore = "spawned by the link crash harness; it aborts on purpose"]
-    fn link_crash_child() {
-        let Some(home) = std::env::var_os(CRASH_HOME) else {
-            return;
-        };
-        let home = PathBuf::from(home);
-        let state = StateDir::resolve(&home);
-        let mut session = apply_session(&state, &home);
-        for request in link_requests(&home) {
-            session.apply(request).expect("apply");
-        }
-        session.finish().expect("finish");
-    }
-
-    #[test]
-    fn a_crash_at_every_link_boundary_is_recoverable() {
-        let guard = guarded_home();
-        for index in 0..link_requests(guard.path()).len() {
-            for phase in crash_phases() {
-                let removal = matches!(
-                    link_requests(guard.path())[index].content,
-                    Content::LinkAbsent { .. }
-                );
-                if removal && matches!(phase, "after-stage" | "after-fill") {
-                    continue;
-                }
-                let case = format!("{index}:{phase}");
-                let home = guard.child(format!("link-crash-{index}-{phase}"));
-                plant_link_fixture(&home);
-                let before = link_snapshot(&home);
-
-                let out = spawn_child(
-                    "recover::rollback::tests::link_crash_child",
-                    &home,
-                    index,
-                    phase,
-                );
-                assert!(
-                    !out.status.success(),
-                    "{case}: the child was supposed to die; it said {}",
-                    String::from_utf8_lossy(&out.stdout),
-                );
-
-                // The old link or the new one, never anything else.
-                for (request, (found, was)) in link_requests(&home)
-                    .iter()
-                    .zip(link_snapshot(&home).0.into_iter().zip(before.0.clone()))
-                {
-                    let new = match &request.content {
-                        Content::Link { text, .. } => Some(text.clone()),
-                        _ => None,
-                    };
-                    assert!(found == was || found == new, "{case}: {found:?}");
-                }
-
-                let state = StateDir::resolve(&home);
-                let interrupted = pending(&state)
-                    .expect("pending")
-                    .expect("a crash leaves an interrupted session");
-                assert!(interrupted.blocked().next().is_none(), "{case}");
-                assert!(
-                    matches!(
-                        recover(&state).expect("recover"),
-                        Outcome::RolledBack { .. }
-                    ),
-                    "{case}"
-                );
-                // As for a file: the Intent names the temporary link and the
-                // directories made for it before either exists, so the
-                // rollback leaves neither at any boundary (#119).
-                let (links, config) = link_snapshot(&home);
-                assert_eq!(links, before.0, "{case}: not rolled back");
-                assert_eq!(config, before.1, "{case}: ~/.config stands");
-                let temps = leftover_temps(&home);
-                assert!(temps.is_empty(), "{case}: {temps:?}");
-            }
-        }
     }
 
     #[test]
@@ -808,12 +785,14 @@ mod tests {
             session.finish().expect("finish");
             fs::set_mode(&vault, Mode::PRIVATE_DIR).expect("the user makes ~/.vault private");
 
-            let out = spawn_child(
+            let out = crash_command(
                 "recover::rollback::tests::rm_crash_child",
                 &home,
                 index,
                 phase,
-            );
+            )
+            .output()
+            .expect("spawn the crash child");
             assert!(
                 !out.status.success(),
                 "{case}: the child was supposed to die; it said {}",
@@ -946,7 +925,7 @@ mod tests {
         let guard = guarded_home();
         let home = guard.child("deep");
         plant_crash_fixture(&home);
-        let before = crash_snapshot(&home);
+        let before = snapshot(&FILES, &home);
         let index = crash_requests(&home)
             .iter()
             .position(|request| {
@@ -977,7 +956,7 @@ mod tests {
             intent.created_dirs.iter().all(|dir| !dir.exists()),
             "and every directory the write made",
         );
-        assert_eq!(crash_snapshot(&home), before);
+        assert_eq!(snapshot(&FILES, &home), before);
     }
 
     #[test]
@@ -1162,7 +1141,7 @@ mod tests {
         let guard = guarded_home();
         let home = guard.child("crashed");
         plant_crash_fixture(&home);
-        let before = crash_snapshot(&home);
+        let before = snapshot(&FILES, &home);
 
         // Dying one boundary after the intent is durable: the destination has
         // not been replaced yet, so the rollback has nothing to write.
@@ -1178,7 +1157,7 @@ mod tests {
             recover(&state).expect("recover"),
             Outcome::RolledBack { undone: 1 },
         );
-        assert_eq!(crash_snapshot(&home), before);
+        assert_eq!(snapshot(&FILES, &home), before);
     }
 
     #[test]
@@ -1776,7 +1755,7 @@ mod tests {
                 let case = format!("{phase}, earlier apply: {earlier_apply}");
                 let home = guard.child(format!("finish-{phase}-{earlier_apply}"));
                 plant_crash_fixture(&home);
-                let before = crash_snapshot(&home);
+                let before = snapshot(&FILES, &home);
                 let state = StateDir::resolve(&home);
                 let owned: Vec<Portable> = crash_requests(&home)
                     .into_iter()
@@ -1814,19 +1793,7 @@ mod tests {
 
                 // Every write landed.
                 for request in crash_requests(&home) {
-                    let found = peek(&request.dest);
-                    match &request.content {
-                        Content::Bytes { bytes: wanted, .. } => {
-                            assert_eq!(found, Some((wanted.clone(), request.mode)), "{case}");
-                        }
-                        Content::Absent { .. } => assert_eq!(found, None, "{case}"),
-                        Content::Dir { .. }
-                        | Content::DirAbsent { .. }
-                        | Content::Link { .. }
-                        | Content::LinkAbsent { .. } => {
-                            unreachable!("{case}: the crash fixture writes files only")
-                        }
-                    }
+                    assert_eq!(found_at(&request.dest), landed(&request), "{case}");
                 }
 
                 let interrupted = pending(&state).expect("pending").expect("a journal stands");
@@ -1884,7 +1851,8 @@ mod tests {
                     restored.iter().all(|done| !done.is_conflict()),
                     "{case}: {restored:?}"
                 );
-                for ((dest, was), (_, is)) in before.files.iter().zip(crash_snapshot(&home).files) {
+                for ((dest, was), (_, is)) in before.files.iter().zip(snapshot(&FILES, &home).files)
+                {
                     if dest.ends_with(".vault/gone.conf") {
                         assert_eq!(is, None, "{case}: the session released and removed it");
                     } else {
@@ -1898,56 +1866,53 @@ mod tests {
 
     #[test]
     fn a_crash_at_every_write_boundary_is_recoverable() {
+        a_crash_at_every_boundary_is_recoverable(&FILES);
+    }
+
+    #[test]
+    fn a_crash_at_every_link_boundary_is_recoverable() {
+        a_crash_at_every_boundary_is_recoverable(&LINKS);
+    }
+
+    /// Crash `scenario`'s session at every boundary of every request, and
+    /// recover each crash back to exactly what stood before it.
+    fn a_crash_at_every_boundary_is_recoverable(scenario: &Scenario) {
         let guard = guarded_home();
-        for index in 0..crash_requests(guard.path()).len() {
+        let requests = (scenario.requests)(guard.path());
+        for (index, request) in requests.iter().enumerate() {
             for phase in crash_phases() {
                 // A removal stages nothing, so it never reaches the two staging
                 // boundaries and a child asked to die there would not.
                 if matches!(
-                    crash_requests(guard.path())[index].content,
-                    Content::Absent { .. }
+                    request.content,
+                    Content::Absent { .. } | Content::LinkAbsent { .. }
                 ) && matches!(phase, "after-stage" | "after-fill")
                 {
                     continue;
                 }
-                let home = guard.child(format!("crash-{index}-{phase}"));
-                plant_crash_fixture(&home);
-                let before = crash_snapshot(&home);
+                let case = format!("{}:{index}:{phase}", scenario.name);
+                let home = guard.child(format!("crash-{}-{index}-{phase}", scenario.name));
+                (scenario.plant)(&home);
+                let before = snapshot(scenario, &home);
 
-                let out = spawn_crash_child(&home, index, phase);
+                let out = spawn_scenario_child(scenario, &home, index, phase);
                 assert!(
                     !out.status.success(),
-                    "the child was supposed to die at {index}:{phase}; it said {}",
+                    "{case}: the child was supposed to die; it said {}",
                     String::from_utf8_lossy(&out.stdout),
                 );
 
                 // 1. Old or new, never torn. This is what A5's atomic write
                 //    buys, and this assertion is what proves it.
-                for (dest, found) in crash_snapshot(&home).files {
-                    let request = crash_requests(&home)
-                        .into_iter()
-                        .find(|candidate| candidate.dest == dest)
-                        .expect("a fixture destination");
-                    let was = before
-                        .files
-                        .iter()
-                        .find(|(path, _)| *path == dest)
-                        .and_then(|(_, state)| state.clone());
-                    let is_new = match &request.content {
-                        Content::Bytes { bytes: wanted, .. } => found
-                            .as_ref()
-                            .is_some_and(|(bytes, mode)| bytes == wanted && *mode == request.mode),
-                        Content::Absent { .. } => found.is_none(),
-                        Content::Dir { .. }
-                        | Content::DirAbsent { .. }
-                        | Content::Link { .. }
-                        | Content::LinkAbsent { .. } => {
-                            unreachable!("the crash fixture writes files only")
-                        }
-                    };
+                let after = snapshot(scenario, &home);
+                for ((request, (dest, found)), (_, was)) in (scenario.requests)(&home)
+                    .iter()
+                    .zip(after.files)
+                    .zip(&before.files)
+                {
                     assert!(
-                        found == was || is_new,
-                        "{} was torn by a crash at {index}:{phase}: {found:?}",
+                        found == *was || found == landed(request),
+                        "{case}: {} was torn: {found:?}",
                         dest.display(),
                     );
                 }
@@ -1957,18 +1922,31 @@ mod tests {
                 let interrupted = pending(&state)
                     .expect("pending")
                     .expect("a crash leaves an interrupted session");
-                assert_eq!(interrupted.kind, SessionKind::Apply);
-                assert!(!interrupted.complete);
+                // The child ran this scenario and not another.
+                let dests: Vec<PathBuf> = (scenario.requests)(&home)
+                    .into_iter()
+                    .map(|request| request.dest)
+                    .collect();
+                assert!(
+                    interrupted
+                        .unfinished
+                        .iter()
+                        .all(|write| dests.contains(&write.dest)),
+                    "{case}: {:?}",
+                    interrupted.unfinished
+                );
+                assert_eq!(interrupted.kind, SessionKind::Apply, "{case}");
+                assert!(!interrupted.complete, "{case}");
                 assert!(
                     interrupted.blocked().next().is_none(),
-                    "nothing edited the destinations, so nothing is blocked",
+                    "{case}: nothing edited the destinations, so nothing is blocked",
                 );
 
                 // 3. Recovery rolls it back.
                 let outcome = recover(&state).expect("recover");
                 assert!(
                     matches!(outcome, Outcome::RolledBack { .. }),
-                    "got {outcome:?} at {index}:{phase}",
+                    "{case}: got {outcome:?}",
                 );
 
                 // 4. Byte- and mode-identical to the pre-run snapshot, the
@@ -1977,31 +1955,32 @@ mod tests {
                 //    will invent before the stage makes either, so no crash
                 //    leaves one the journal does not name (#119).
                 assert_eq!(
-                    crash_snapshot(&home),
+                    snapshot(scenario, &home),
                     before,
-                    "rollback at {index}:{phase} did not restore the fixture",
+                    "{case}: the rollback did not restore the fixture",
                 );
 
                 // 5. Nothing bx staged is left: recovery removes the one
                 //    temporary file each intent names, and never unlinks by
                 //    pattern in a directory the user owns.
                 let temps = leftover_temps(&home);
-                assert!(
-                    temps.is_empty(),
-                    "a crash at {index}:{phase} left {temps:?}"
-                );
+                assert!(temps.is_empty(), "{case}: left {temps:?}");
                 assert!(
                     !home.join(".config").exists(),
-                    "the directories the session invented are gone too",
+                    "{case}: the directories the session invented are gone too",
                 );
 
                 // 6. The journal is gone.
-                assert!(!state.journal().exists());
-                assert!(pending(&state).expect("pending").is_none());
+                assert!(!state.journal().exists(), "{case}");
+                assert!(pending(&state).expect("pending").is_none(), "{case}");
 
                 // 7. Recovery is idempotent.
-                assert_eq!(recover(&state).expect("recover twice"), Outcome::Nothing);
-                assert_eq!(crash_snapshot(&home), before);
+                assert_eq!(
+                    recover(&state).expect("recover twice"),
+                    Outcome::Nothing,
+                    "{case}"
+                );
+                assert_eq!(snapshot(scenario, &home), before, "{case}");
             }
         }
     }

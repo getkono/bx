@@ -1792,11 +1792,18 @@ mod tests {
             .to_string()
     }
 
+    /// Every default a target that names only a path and a body takes: an
+    /// absent mode is `None`, not a guess.
     #[test]
     fn a_minimal_target_parses() {
         let target = parse(&with("")).unwrap();
 
         assert_eq!(target.path.as_str(), "~/.gitconfig");
+        assert_eq!(
+            target.path,
+            Portable::parse_in("~/.gitconfig", home()).unwrap(),
+            "the natural key is the path"
+        );
         assert_eq!(target.body, Body::File(PathBuf::from("files/gitconfig")));
         assert_eq!(target.mode, None);
         assert_eq!(target.attach, Attach::Own);
@@ -1807,12 +1814,239 @@ mod tests {
         assert!(target.enabled);
     }
 
+    /// Each key a minimal target may add lands in its own field and moves no
+    /// other: the whole target is compared, not the one field.
     #[test]
-    fn the_natural_key_is_the_path() {
-        assert_eq!(
-            parse(&with("")).unwrap().path,
-            Portable::parse_in("~/.gitconfig", home()).unwrap()
-        );
+    fn each_key_a_target_accepts_sets_its_field_and_no_other() {
+        /// What a key changes in the minimal target.
+        type Change = fn(&mut Target);
+        let minimal = parse(&with("")).unwrap();
+        let cases: [(&str, Change); 8] = [
+            ("attach = \"own\"\n", |_| {}),
+            ("attach = \"region\"\ncomment = \"#\"\n", |t| {
+                t.attach = Attach::Region { comment: '#' };
+            }),
+            ("mode = \"0600\"\n", |t| {
+                t.mode = Some(Mode::from_bits(0o600))
+            }),
+            ("direction = \"track\"\n", |t| {
+                t.direction = Direction::Track
+            }),
+            ("format = \"env.d\"\n", |t| t.format = Format::EnvD),
+            ("requires = [\"starship\", \"git\"]\n", |t| {
+                t.requires = vec!["starship".to_string(), "git".to_string()];
+            }),
+            // Removing the entry is A3's merge rule; the model records the flag.
+            ("enabled = false\n", |t| t.enabled = false),
+            ("references = [\"~/.gitconfig.local\"]\n", |t| {
+                t.references = vec![Portable::parse_in("~/.gitconfig.local", home()).unwrap()];
+            }),
+        ];
+        for (extra, change) in cases {
+            let mut expected = minimal.clone();
+            change(&mut expected);
+            assert_eq!(parse(&with(extra)).unwrap(), expected, "{extra}");
+        }
+    }
+
+    /// Each body is read as written, or normalised where it is a repo path,
+    /// with the attachment and mode the body implies.
+    #[test]
+    fn each_body_parses_to_what_it_names() {
+        let include = "Include ~/.ssh/config.d/*.conf";
+        let cases = [
+            (
+                "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"\"\"\n[user]\n\tname = x\n\"\"\"\n",
+                Body::Inline("[user]\n\tname = x\n".to_string()),
+                Attach::Own,
+                None,
+            ),
+            // An empty inline body is a zero-byte file, not a missing body.
+            (
+                "[[target]]\npath = \"~/.hushlogin\"\ncontent = \"\"\n",
+                Body::Inline(String::new()),
+                Attach::Own,
+                None,
+            ),
+            (
+                "[[target]]\npath = \"~/a\"\nfile = \"files/./sub//starship.toml\"\n",
+                Body::File(PathBuf::from("files/sub/starship.toml")),
+                Attach::Own,
+                None,
+            ),
+            (
+                "[[target]]\npath = \"~/.ssh\"\ndir = true\nmode = \"0700\"\n",
+                Body::Dir,
+                Attach::Own,
+                Some(Mode::from_bits(0o700)),
+            ),
+            // An include target's body is its line.
+            (
+                "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
+                 include = \"Include ~/.ssh/config.d/*.conf\"\n",
+                Body::Inline(include.to_string()),
+                Attach::Include {
+                    line: include.to_string(),
+                },
+                None,
+            ),
+        ];
+        for (text, body, attach, mode) in cases {
+            let target = parse(text).unwrap_or_else(|e| panic!("{text}: {e}"));
+            assert_eq!(
+                (target.body, target.attach, target.mode),
+                (body, attach, mode),
+                "{text}"
+            );
+        }
+    }
+
+    /// The variant a parse error was raised as.
+    fn variant(error: &Error) -> &'static str {
+        match error {
+            Error::MissingKey { .. } => "MissingKey",
+            Error::WrongType { .. } => "WrongType",
+            Error::UnknownKey { .. } => "UnknownKey",
+            Error::BadValue { .. } => "BadValue",
+            _ => "another",
+        }
+    }
+
+    /// Each target the parser refuses, by the variant it is raised as and the
+    /// parts of the message that tell the author what to change.
+    #[test]
+    fn each_malformed_target_is_refused_saying_why() {
+        let dir = |extra: &str| format!("[[target]]\npath = \"~/.ssh\"\ndir = true\n{extra}");
+        let bare = |rest: &str| format!("[[target]]\n{rest}");
+        const NO_FORMAT: &str = "no content, so `format` has nothing to describe";
+        let bad_values = [
+            (with("content = \"x\"\n"), "exactly one body"),
+            (
+                with("secret = \"s.age\"\nmode = \"0600\"\n"),
+                "exactly one body",
+            ),
+            (with("secret = \"s.age\"\nmode = \"0600\"\n"), "`secret`"),
+            (bare("path = \"~/a\"\nfile = \"\"\n"), "must name a file"),
+            (bare("path = \"~/a\"\nfile = \"./\"\n"), "must name a file"),
+            (
+                dir("attach = \"region\"\ncomment = \"#\"\n"),
+                "always attached as `own`",
+            ),
+            (
+                dir("attach = \"include\"\ninclude = \"x\"\n"),
+                "always attached as `own`",
+            ),
+            (
+                bare("path = \"~/.config/zed\"\ndir = true\nformat = \"jsonc\"\n"),
+                NO_FORMAT,
+            ),
+            (
+                bare("path = \"~/.config/env.d\"\ndir = true\nformat = \"env.d\"\n"),
+                NO_FORMAT,
+            ),
+            (bare("path = \"~/.ssh\"\ndir = false\n"), "only ever `true`"),
+            (
+                bare("path = \"files/gitconfig\"\nfile = \"f\"\n"),
+                "must start with `~` or `/`",
+            ),
+            (
+                with("references = [\"relative/path\"]\n"),
+                "must start with `~` or `/`",
+            ),
+            // A layer is parsed against a home so that a file under it has
+            // exactly one spelling. Accepting both would let one file acquire
+            // two keys that `check_unique` cannot see. `references` is the
+            // other place a target carries a portable path, and entry A7
+            // reports drift keyed on it.
+            (
+                bare("path = \"/var/home/example/.gitconfig\"\nfile = \"f\"\n"),
+                "~/.gitconfig",
+            ),
+            (
+                bare("path = \"/var/home/example/.gitconfig\"\nfile = \"f\"\n"),
+                "bx.toml:2",
+            ),
+            (
+                with("references = [\"/var/home/example/.gitconfig.local\"]\n"),
+                "~/.gitconfig.local",
+            ),
+            (with("mode = 600\n"), "quoted octal string"),
+            (with("mode = 600\n"), "mode = \"0600\""),
+            (with("attach = \"region\"\n"), "needs a `comment` character"),
+            (with("comment = \"#\"\n"), "attach = \"region\""),
+            (
+                with("attach = \"region\"\ncomment = \"//\"\n"),
+                "single character",
+            ),
+            (with("attach = \"include\"\n"), "needs an `include` line"),
+            (with("include = \"Include x\"\n"), "attach = \"include\""),
+            (with("attach = \"symlink\"\n"), "\"own\", \"region\""),
+            (with("direction = \"watch\"\n"), "\"apply\" or \"track\""),
+            (with("owns = [\"a.b\"]\n"), "format = \"jsonc\""),
+            (with("format = \"envd\"\n"), "\"env.d\""),
+            (
+                with("exclude = [\"*.md\"]\n"),
+                "only means something beside `tree`",
+            ),
+            // `parse_target` cannot expand a tree; only the layer loader can.
+            (tree(""), "loaded from"),
+            (
+                bare("path = \"~\"\nsymlink = \"/elsewhere\"\n"),
+                "only a `dir = true` target",
+            ),
+            (
+                bare("path = \"~/.zshrc\"\ngenerated = \"shell-init\"\n"),
+                "no generator named",
+            ),
+            (
+                bare("path = \"~/.zshrc\"\ngenerated = \"shell-init\"\n"),
+                "bx.toml:3",
+            ),
+        ];
+        let wrong_types = [
+            (
+                with("enabled = \"yes\"\n"),
+                "`enabled` must be a boolean, found string",
+            ),
+            (
+                with("requires = \"starship\"\n"),
+                "an array of strings, found string",
+            ),
+            (
+                with("requires = [1]\n"),
+                "an array of strings, found integer",
+            ),
+            (
+                bare("path = 1\nfile = \"f\"\n"),
+                "`path` must be a string, found integer",
+            ),
+        ];
+        // `tree` is offered among the body keys.
+        let missing = [
+            (
+                bare("path = \"~/.gitconfig\"\n"),
+                "missing the required key",
+            ),
+            (bare("path = \"~/.gitconfig\"\n"), "`dir` or `tree`"),
+        ];
+        let unknown = [
+            (with("hardlink = true\n"), "unknown key `hardlink`"),
+            (with("hardlink = true\n"), "[[target]]"),
+            (with("hardlink = true\n"), "bx.toml:4"),
+        ];
+        for (expected, cases) in [
+            ("BadValue", &bad_values[..]),
+            ("WrongType", &wrong_types),
+            ("MissingKey", &missing),
+            ("UnknownKey", &unknown),
+        ] {
+            for (text, part) in cases {
+                let error = parse(text).expect_err(text);
+                assert_eq!(variant(&error), expected, "{text}: {error}");
+                assert!(error.to_string().contains(part), "{part}: {error}");
+            }
+        }
+        assert!(parse_generated("shell-init").is_none());
     }
 
     #[test]
@@ -1822,47 +2056,6 @@ mod tests {
 
         assert_eq!(target.origin.line, 3, "the [[target]] header's own line");
         assert_eq!(target.origin.file, Path::new("bx.toml"));
-    }
-
-    #[test]
-    fn a_target_with_no_body_is_rejected() {
-        let text = "[[target]]\npath = \"~/.gitconfig\"\n";
-        assert!(message(text).contains("missing the required key"));
-    }
-
-    #[test]
-    fn a_target_with_two_bodies_is_rejected() {
-        let text = "[[target]]\npath = \"~/.gitconfig\"\nfile = \"f\"\ncontent = \"x\"\n";
-        assert!(message(text).contains("exactly one body"));
-    }
-
-    #[test]
-    fn an_inline_body_is_taken_verbatim() {
-        let text =
-            "[[target]]\npath = \"~/.gitconfig\"\ncontent = \"\"\"\n[user]\n\tname = x\n\"\"\"\n";
-        assert_eq!(
-            parse(text).unwrap().body,
-            Body::Inline("[user]\n\tname = x\n".to_string())
-        );
-    }
-
-    #[test]
-    fn an_unknown_generator_is_rejected() {
-        let text = "[[target]]\npath = \"~/.zshrc\"\ngenerated = \"shell-init\"\n";
-        let message = message(text);
-
-        assert!(message.contains("no generator named"), "{message}");
-        assert!(message.contains("bx.toml:3"), "{message}");
-        assert!(parse_generated("shell-init").is_none());
-    }
-
-    #[test]
-    fn a_directory_target_declares_itself_a_directory() {
-        let text = "[[target]]\npath = \"~/.ssh\"\ndir = true\nmode = \"0700\"\n";
-        let target = parse(text).unwrap();
-
-        assert_eq!(target.body, Body::Dir);
-        assert_eq!(target.mode, Some(Mode::parse_octal("0700").unwrap()));
     }
 
     #[test]
@@ -1972,92 +2165,10 @@ mod tests {
     }
 
     #[test]
-    fn a_secret_is_one_body_among_the_others() {
-        let message = message(&with("secret = \"s.age\"\nmode = \"0600\"\n"));
-        assert!(message.contains("exactly one body"), "{message}");
-        assert!(message.contains("`secret`"), "{message}");
-    }
-
-    #[test]
-    fn a_body_file_must_name_something() {
-        assert!(message("[[target]]\npath = \"~/a\"\nfile = \"\"\n").contains("must name a file"));
-        assert!(
-            message("[[target]]\npath = \"~/a\"\nfile = \"./\"\n").contains("must name a file")
-        );
-    }
-
-    #[test]
-    fn a_body_file_is_normalised() {
-        let target =
-            parse("[[target]]\npath = \"~/a\"\nfile = \"files/./sub//starship.toml\"\n").unwrap();
-
-        assert_eq!(
-            target.body,
-            Body::File(PathBuf::from("files/sub/starship.toml"))
-        );
-    }
-
-    #[test]
-    fn a_directory_target_has_no_attachment_but_its_own() {
-        let text = "[[target]]\npath = \"~/.ssh\"\ndir = true\n\
-                    attach = \"region\"\ncomment = \"#\"\n";
-        assert!(message(text).contains("always attached as `own`"));
-
-        let text = "[[target]]\npath = \"~/.ssh\"\ndir = true\n\
-                    attach = \"include\"\ninclude = \"x\"\n";
-        assert!(message(text).contains("always attached as `own`"));
-    }
-
-    #[test]
-    fn a_directory_target_has_no_format() {
-        let text = "[[target]]\npath = \"~/.config/zed\"\ndir = true\nformat = \"jsonc\"\n";
-        assert!(message(text).contains("no content, so `format` has nothing to describe"));
-
-        let text = "[[target]]\npath = \"~/.config/environment.d\"\ndir = true\n\
-                    format = \"env.d\"\n";
-        assert!(message(text).contains("no content, so `format` has nothing to describe"));
-    }
-
-    #[test]
-    fn a_directory_target_is_never_declared_false() {
-        let text = "[[target]]\npath = \"~/.ssh\"\ndir = false\n";
-        assert!(message(text).contains("only ever `true`"));
-    }
-
-    #[test]
     fn the_default_modes_document_what_none_means() {
         assert_eq!(Mode::DEFAULT_FILE.to_string(), "0644");
         assert_eq!(Mode::DEFAULT_DIR.to_string(), "0755");
         assert_eq!(Mode::DEFAULT_DIR.bits(), 0o755);
-    }
-
-    #[test]
-    fn a_relative_target_path_is_rejected() {
-        let text = "[[target]]\npath = \"files/gitconfig\"\nfile = \"f\"\n";
-        assert!(message(text).contains("must start with `~` or `/`"));
-    }
-
-    #[test]
-    fn an_absolute_target_path_under_home_is_rejected_with_its_line() {
-        // A layer is parsed against a home so that a file under it has exactly
-        // one spelling. Accepting both would let one file acquire two keys that
-        // `check_unique` cannot see.
-        let text = "[[target]]\npath = \"/var/home/example/.gitconfig\"\nfile = \"f\"\n";
-        let message = message(text);
-
-        assert!(message.contains("~/.gitconfig"), "{message}");
-        assert!(message.contains("bx.toml:2"), "{message}");
-    }
-
-    #[test]
-    fn an_absolute_reference_under_home_is_rejected_too() {
-        // `references` is the other place a target carries a portable path, and
-        // entry A7 reports drift keyed on it.
-        let message = message(&with(
-            "references = [\"/var/home/example/.gitconfig.local\"]\n",
-        ));
-
-        assert!(message.contains("~/.gitconfig.local"), "{message}");
     }
 
     /// A bare root is a directory, and only a directory target may name it.
@@ -2218,14 +2329,6 @@ mod tests {
     }
 
     #[test]
-    fn a_mode_given_as_an_integer_names_the_string_form() {
-        let message = message(&with("mode = 600\n"));
-
-        assert!(message.contains("quoted octal string"), "{message}");
-        assert!(message.contains("mode = \"0600\""), "{message}");
-    }
-
-    #[test]
     fn a_non_octal_mode_is_rejected() {
         assert!(message(&with("mode = \"0688\"\n")).contains("octal digits"));
         assert!(message(&with("mode = \"rw-\"\n")).contains("octal digits"));
@@ -2254,51 +2357,6 @@ mod tests {
         assert!(message(&with("mode = \"00644\"\n")).contains("octal digits"));
     }
 
-    #[test]
-    fn an_absent_mode_is_none_not_a_guess() {
-        assert_eq!(parse(&with("")).unwrap().mode, None);
-    }
-
-    #[test]
-    fn attach_defaults_to_own() {
-        assert_eq!(parse(&with("")).unwrap().attach, Attach::Own);
-        assert_eq!(
-            parse(&with("attach = \"own\"\n")).unwrap().attach,
-            Attach::Own
-        );
-    }
-
-    #[test]
-    fn a_region_needs_a_comment_character() {
-        let target = parse(&with("attach = \"region\"\ncomment = \"#\"\n")).unwrap();
-        assert_eq!(target.attach, Attach::Region { comment: '#' });
-
-        assert!(message(&with("attach = \"region\"\n")).contains("needs a `comment` character"));
-    }
-
-    #[test]
-    fn a_comment_character_without_a_region_is_rejected() {
-        assert!(message(&with("comment = \"#\"\n")).contains("attach = \"region\""));
-    }
-
-    #[test]
-    fn a_multi_character_comment_is_rejected() {
-        let text = with("attach = \"region\"\ncomment = \"//\"\n");
-        assert!(message(&text).contains("single character"));
-    }
-
-    #[test]
-    fn an_include_carries_its_line() {
-        let text = "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
-                    include = \"Include ~/.ssh/config.d/*.conf\"\n";
-        assert_eq!(
-            parse(text).unwrap().attach,
-            Attach::Include {
-                line: "Include ~/.ssh/config.d/*.conf".to_string()
-            }
-        );
-    }
-
     /// An include target's body is its line; a second body is unreachable.
     ///
     /// `parse_body` synthesised `Body::Inline(include_line)` only when *no* body
@@ -2325,28 +2383,6 @@ mod tests {
                 "`{body}` beside an include line: {message}"
             );
         }
-    }
-
-    #[test]
-    fn an_include_without_a_line_is_rejected() {
-        assert!(message(&with("attach = \"include\"\n")).contains("needs an `include` line"));
-    }
-
-    #[test]
-    fn an_include_line_without_an_include_attach_is_rejected() {
-        assert!(message(&with("include = \"Include x\"\n")).contains("attach = \"include\""));
-    }
-
-    #[test]
-    fn an_include_body_defaults_to_its_line() {
-        let text = "[[target]]\npath = \"~/.ssh/config\"\nattach = \"include\"\n\
-                    include = \"Include ~/.ssh/config.d/*.conf\"\n";
-        let target = parse(text).unwrap();
-
-        assert_eq!(
-            target.body,
-            Body::Inline("Include ~/.ssh/config.d/*.conf".to_string()),
-        );
     }
 
     /// An `include` line is type-checked and now value-checked.
@@ -2423,30 +2459,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_attach_is_rejected() {
-        assert!(message(&with("attach = \"symlink\"\n")).contains("\"own\", \"region\""));
-    }
-
-    #[test]
-    fn direction_defaults_to_apply() {
-        assert_eq!(parse(&with("")).unwrap().direction, Direction::Apply);
-    }
-
-    #[test]
-    fn track_is_parsed() {
-        assert_eq!(
-            parse(&with("direction = \"track\"\n")).unwrap().direction,
-            Direction::Track
-        );
-        assert!(message(&with("direction = \"watch\"\n")).contains("\"apply\" or \"track\""));
-    }
-
-    #[test]
-    fn format_defaults_to_opaque() {
-        assert_eq!(parse(&with("")).unwrap().format, Format::Opaque);
-    }
-
-    #[test]
     fn jsonc_owns_dotted_key_paths() {
         let text =
             with("format = \"jsonc\"\nowns = [\"agent.default_model.provider\", \"vim_mode\"]\n");
@@ -2464,11 +2476,6 @@ mod tests {
     }
 
     #[test]
-    fn owned_keys_without_jsonc_are_rejected() {
-        assert!(message(&with("owns = [\"a.b\"]\n")).contains("format = \"jsonc\""));
-    }
-
-    #[test]
     fn an_empty_key_path_segment_is_rejected() {
         let text = with("format = \"jsonc\"\nowns = [\"a..b\"]\n");
         assert!(message(&text).contains("empty segment"));
@@ -2480,15 +2487,6 @@ mod tests {
             KeyPath::parse(".a"),
             Err(KeyPathError::EmptySegment(".a".to_string()))
         );
-    }
-
-    #[test]
-    fn env_d_is_spelled_with_a_dot() {
-        assert_eq!(
-            parse(&with("format = \"env.d\"\n")).unwrap().format,
-            Format::EnvD
-        );
-        assert!(message(&with("format = \"envd\"\n")).contains("\"env.d\""));
     }
 
     /// A structured format describes a file bx owns whole, so it needs `own`.
@@ -2656,27 +2654,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exclude_needs_a_tree() {
-        let message = message(&with("exclude = [\"*.md\"]\n"));
-        assert!(
-            message.contains("only means something beside `tree`"),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn parse_target_refuses_a_tree_it_cannot_expand() {
-        let message = message(&tree(""));
-        assert!(message.contains("loaded from"), "{message}");
-    }
-
-    #[test]
-    fn a_target_with_no_body_names_tree_among_the_body_keys() {
-        let message = message("[[target]]\npath = \"~/.x\"\n");
-        assert!(message.contains("`dir` or `tree`"), "{message}");
-    }
-
     /// A symlink target, plus whatever else the test needs.
     fn symlink(text: &str, extra: &str) -> String {
         format!("[[target]]\npath = \"~/.local/bin/tool\"\nsymlink = {text:?}\n{extra}")
@@ -2764,12 +2741,6 @@ mod tests {
     }
 
     #[test]
-    fn a_symlink_may_not_be_the_home_or_above_it() {
-        let text = "[[target]]\npath = \"~\"\nsymlink = \"/elsewhere\"\n";
-        assert!(message(text).contains("only a `dir = true` target"));
-    }
-
-    #[test]
     fn link_text_renders_only_a_leading_home() {
         let home = home();
         for (text, rendered) in [
@@ -2781,75 +2752,6 @@ mod tests {
         ] {
             assert_eq!(link_text(text, home), PathBuf::from(rendered), "{text}");
         }
-    }
-
-    /// An empty inline body is a zero-byte file, not a missing body.
-    #[test]
-    fn an_empty_content_is_a_body() {
-        let text = "[[target]]\npath = \"~/.hushlogin\"\ncontent = \"\"\n";
-        assert_eq!(parse(text).unwrap().body, Body::Inline(String::new()));
-    }
-
-    #[test]
-    fn requires_defaults_to_empty() {
-        assert!(parse(&with("")).unwrap().requires.is_empty());
-        assert_eq!(
-            parse(&with("requires = [\"starship\", \"git\"]\n"))
-                .unwrap()
-                .requires,
-            ["starship".to_string(), "git".to_string()]
-        );
-    }
-
-    #[test]
-    fn references_are_portable_paths() {
-        let target = parse(&with("references = [\"~/.gitconfig.local\"]\n")).unwrap();
-
-        assert_eq!(
-            target.references,
-            [Portable::parse_in("~/.gitconfig.local", home()).unwrap()]
-        );
-        assert!(
-            message(&with("references = [\"relative/path\"]\n"))
-                .contains("must start with `~` or `/`")
-        );
-    }
-
-    #[test]
-    fn enabled_defaults_to_true() {
-        assert!(parse(&with("")).unwrap().enabled);
-    }
-
-    #[test]
-    fn enabled_false_is_parsed_not_dropped() {
-        // Removing the entry is A3's merge rule; the model records the flag.
-        assert!(!parse(&with("enabled = false\n")).unwrap().enabled);
-    }
-
-    #[test]
-    fn an_unknown_target_key_is_rejected_with_its_line() {
-        let message = message(&with("hardlink = true\n"));
-
-        assert!(message.contains("unknown key `hardlink`"), "{message}");
-        assert!(message.contains("[[target]]"), "{message}");
-        assert!(message.contains("bx.toml:4"), "{message}");
-    }
-
-    #[test]
-    fn a_key_of_the_wrong_type_names_both_types() {
-        assert!(
-            message(&with("enabled = \"yes\"\n"))
-                .contains("`enabled` must be a boolean, found string")
-        );
-        assert!(
-            message(&with("requires = \"starship\"\n"))
-                .contains("an array of strings, found string")
-        );
-        assert!(message(&with("requires = [1]\n")).contains("an array of strings, found integer"));
-        assert!(
-            message("[[target]]\npath = 1\nfile = \"f\"\n")
-                .contains("`path` must be a string, found integer")
-        );
     }
 
     mod interactive {

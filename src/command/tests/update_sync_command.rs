@@ -293,6 +293,31 @@ fn a_carry_another_machine_changed_elsewhere_in_the_file_is_left_for_a_person() 
 }
 
 #[test]
+fn a_carry_whose_file_another_machine_renamed_is_left_for_a_person() {
+    let home = guarded_home();
+    let repo = tracking(&home);
+    let hook = refusing_pushes(&repo);
+    home.write(".lock", "b\n");
+    update(&home, &mut Vec::new()).expect("committed, and not pushed");
+    std::fs::remove_file(hook).expect("the hook");
+    // Unedited, so rename detection would list only the new path.
+    let other = crate::sync::tests::other(&home);
+    run(home.path(), &other, &["mv", "files/lock", "files/moved"]);
+    commit_all(home.path(), &other, "renamed");
+    run(home.path(), &other, &["push", "--quiet"]);
+    let head = rev(home.path(), &repo, "HEAD");
+
+    let error = update(&home, &mut Vec::new()).expect_err("the copy moved upstream");
+    assert!(
+        matches!(error, update::Error::LockDiverged { commits: 1, .. }),
+        "{error}"
+    );
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head, "nothing replayed");
+    assert!(!update::rebasing(&git(home.path()), &repo));
+    assert!(clean(&home, &repo));
+}
+
+#[test]
 fn a_declined_update_over_only_a_carry_writes_and_pushes_nothing() {
     let home = guarded_home();
     let repo = tracking(&home);

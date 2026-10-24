@@ -714,9 +714,17 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
     // Any file both sides changed to different bytes is refused before the
     // replay, not only one whose hunks overlap: git would merge edits to
     // different lines of it, and keep neither machine's lock or copy as it
-    // was. One both changed alike is the upstream already holding it.
-    let theirs = git.query(repo, &["diff", "--name-only", "HEAD...@{upstream}"])?;
-    let apart = git.query(repo, &["diff", "--name-only", "HEAD", "@{upstream}"])?;
+    // was. One both changed alike is the upstream already holding it. No
+    // renames: one would list only its new path, and the old path a carry
+    // changed would escape the refusal.
+    let theirs = git.query(
+        repo,
+        &["diff", "--name-only", "--no-renames", "HEAD...@{upstream}"],
+    )?;
+    let apart = git.query(
+        repo,
+        &["diff", "--name-only", "--no-renames", "HEAD", "@{upstream}"],
+    )?;
     if theirs
         .lines()
         .any(|path| ours.contains(path) && apart.lines().any(|differs| differs == path))

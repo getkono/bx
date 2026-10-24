@@ -936,6 +936,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_converged_pull_neither_lists_outgoing_commits_nor_merges() {
+        let home = guarded_home();
+        cloned(&home, "");
+        // Git's own trace of every command it runs, rather than a stand-in
+        // written here, which another test thread's fork can make `ETXTBSY`.
+        let trace = home.child("git.trace");
+        let git = git(home.path()).with_env("GIT_TRACE", &trace);
+
+        let pulled = pull(&env(home.path()), &git).expect("pull");
+
+        assert_eq!((pulled.ahead, pulled.fast_forwarded), (0, 0));
+        let trace = std::fs::read_to_string(trace).expect("the trace");
+        let ran: Vec<&str> = trace
+            .lines()
+            .filter_map(|line| {
+                line.split_once("trace: built-in: git ")?
+                    .1
+                    .split(' ')
+                    .next()
+            })
+            .collect();
+        assert!(ran.contains(&"fetch"), "{trace}");
+        assert!(!ran.contains(&"log") && !ran.contains(&"merge"), "{trace}");
+    }
+
+    #[test]
     fn a_branch_behind_its_upstream_is_fast_forwarded() {
         let home = guarded_home();
         let repo = cloned(&home, "");

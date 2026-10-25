@@ -893,6 +893,29 @@ fn rm_of_a_declared_target_bx_never_wrote_only_undeclares_it_in_every_layer() {
 }
 
 #[test]
+fn rm_undeclares_a_table_through_the_comment_its_last_value_ends_on() {
+    // The last value's span ends before the comment on its line, so the
+    // table's end is the end of that line, not the end of the value.
+    let home = repo(&format!(
+        "[[target]]\npath = \"~/.never\"\ncontent = \"n\\n\" # mine\n# after\n{}",
+        inline("~/.kept", "kept\\n")
+    ));
+
+    let removals = rm_rel(&home, ".never");
+    assert!(
+        matches!(
+            removals.as_slice(),
+            [Removal { restored: Restored::Unmanaged { .. }, undeclared, .. }] if undeclared.len() == 1
+        ),
+        "{removals:?}"
+    );
+    assert_eq!(
+        layer(&home),
+        format!("# after\n{}", inline("~/.kept", "kept\\n"))
+    );
+}
+
+#[test]
 fn rm_of_a_secret_target_reports_its_ciphertext_as_left_in_the_repo() {
     let home =
         repo("[[target]]\npath = \"~/.token\"\nsecret = \"secrets/token.age\"\nmode = \"0600\"\n");

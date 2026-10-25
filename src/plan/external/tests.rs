@@ -491,6 +491,28 @@ fn a_failed_clone_is_blocked_and_leaves_nothing_behind() {
 }
 
 #[test]
+fn a_failed_clone_after_another_external_blocks_its_own_row() {
+    let home = guarded_home();
+    let up = upstream(&home);
+    // The second external's url rewrites to a remote that does not exist, so
+    // its clone fails after the first one's succeeds: the row it stops is the
+    // second external's, not the one before it.
+    let layer = format!(
+        "{}[[external]]\npath = \"~/.zsh/plugins/b\"\nurl = \
+         \"https://example.invalid/missing\"\nrev = \"{}\"\n",
+        layer(&up.first),
+        up.first
+    );
+
+    let applied = apply(&home, &layer);
+    assert!(applied.executed);
+    assert_eq!(stopped(&applied), ["~/.zsh/plugins/b"], "{applied:?}");
+    assert_eq!(row(&applied, &format!("~/{AT}")).action, Action::Create);
+    assert_eq!(row(&applied, "~/.zsh/plugins/b").action, Action::Blocked);
+    assert_eq!(checked_out(&home), up.first);
+}
+
+#[test]
 fn only_a_finished_clone_is_one_bx_reads_or_fetches_into() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());

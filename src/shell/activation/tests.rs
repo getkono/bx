@@ -591,6 +591,9 @@ fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
     let chars = |s: &str| s.chars().collect::<Vec<_>>();
     assert_eq!(expansion(&chars("${(L)"), &chars("}")), Some(true));
     assert_eq!(expansion(&chars("${(j: :)"), &chars("=/x}")), Some(false));
+    // A subscript is skipped to its own closing bracket.
+    assert_eq!(expansion(&chars("${"), &chars("[1]=/x}")), Some(false));
+    assert_eq!(expansion(&chars("${"), &chars("[1]}")), Some(true));
     // What a declared root allows, the guard allows here too.
     let rooted = RootSet::new(Path::new("/home/u"), &[PathBuf::from("/scratch")]);
     assert!(relocations("export CARGO_HOME=/scratch/cargo\n", &rooted).is_empty());
@@ -1095,6 +1098,8 @@ fn the_path_is_replaced_by_a_reference_quoted_for_where_it_stands() {
         // An escaped quote opens nothing.
         ("x=\\' '/a:/b'", "x=\\' \"$PATH\""),
         ("x=\"\\\" /a:/b\"", "x=\"\\\" ${PATH}\""),
+        // Inside `$'…'` a double quote is text, so it opens nothing.
+        ("x=$'a\"b' '/a:/b'", "x=$'a\"b' \"$PATH\""),
         // Part of a longer path is not the value.
         ("x='/a:/b/c' y=/z/a:/b", "x='/a:/b/c' y=/z/a:/b"),
     ];

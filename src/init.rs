@@ -941,13 +941,16 @@ pub(crate) mod tests {
     }
 
     /// Answers `root` and `email`, and edits `local.toml` while asking, as a
-    /// person in another terminal, or another `bx init`, would.
+    /// person in another terminal, or another `bx init`, would. Its answers
+    /// are valid, so a refusal is a defect: answering the same again would
+    /// loop forever, so it panics instead.
     struct EditsWhileAsking {
         local: PathBuf,
     }
 
     impl Ask for EditsWhileAsking {
-        fn value(&mut self, decl: &ValueDecl, _: Option<&str>) -> Result<String, Error> {
+        fn value(&mut self, decl: &ValueDecl, problem: Option<&str>) -> Result<String, Error> {
+            assert!(problem.is_none(), "{} refused: {problem:?}", decl.name);
             std::fs::write(
                 &self.local,
                 "# theirs\n[values]\nnote = \"theirs\"\nemail = \"old@b.invalid\"\n",

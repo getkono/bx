@@ -675,9 +675,12 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
         repo,
         &["rev-list", "--format=%P%x00%s", "@{upstream}..HEAD"],
     )?;
-    let mut commits = 0;
+    let lines: Vec<&str> = listed.lines().collect();
+    let pairs = lines.chunks(2);
+    // Each pair is one commit, and any that is not this machine's own returns.
+    let commits = pairs.len();
     let mut ours = std::collections::BTreeSet::new();
-    for pair in listed.lines().collect::<Vec<_>>().chunks(2) {
+    for pair in pairs {
         let [header, body] = pair else {
             return Ok(Replay::NotOwn);
         };
@@ -692,21 +695,20 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
             repo,
             &["diff-tree", "--no-commit-id", "--name-only", "-r", commit],
         )?;
-        let own = match subject {
-            SUBJECT => touched == lock::FILE,
-            // Tracked copies only: never the lock, which is a lock commit's.
-            sync::CARRIED_SUBJECT => {
-                !touched.is_empty() && !touched.lines().any(|path| path == lock::FILE)
-            }
-            // `bx upgrade`'s rewritten pins: committed layers only.
-            crate::pin::SUBJECT => !touched.is_empty() && touched.lines().all(is_layer),
-            _ => false,
-        };
+        // Every one of them touches some file.
+        let own = !touched.is_empty()
+            && match subject {
+                SUBJECT => touched == lock::FILE,
+                // Tracked copies only: never the lock, which is a lock commit's.
+                sync::CARRIED_SUBJECT => !touched.lines().any(|path| path == lock::FILE),
+                // `bx upgrade`'s rewritten pins: committed layers only.
+                crate::pin::SUBJECT => touched.lines().all(is_layer),
+                _ => false,
+            };
         if !own {
             return Ok(Replay::NotOwn);
         }
         ours.extend(touched.lines().map(str::to_string));
-        commits += 1;
     }
     if commits == 0 {
         return Ok(Replay::NotOwn);
@@ -750,10 +752,7 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
                 .parse()
                 .unwrap_or(0),
         )),
-        // Never started — a working tree in the way, a refusing hook — and
-        // nothing to undo: git's own words say why.
-        Err(error) if !rebasing(git, repo) => Err(error.into()),
-        Err(error) => {
+        Err(error) if rebasing(git, repo) => {
             // Asked before the abort, and never in its way: a replay is
             // never left open by choice. One whose abort fails is open all
             // the same, and is named as one, as the next run would name it.
@@ -770,6 +769,9 @@ pub fn replay_own_commits(git: &Git, repo: &Path) -> Result<Replay, Error> {
                 Ok(Replay::Conflicted(commits))
             }
         }
+        // Never started — a working tree in the way, a refusing hook — and
+        // nothing to undo: git's own words say why.
+        Err(error) => Err(error.into()),
     }
 }
 

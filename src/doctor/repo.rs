@@ -675,6 +675,31 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o755),
         )
         .expect("executable");
+        // Another test thread that forks while the wrapper is open for
+        // writing holds that descriptor until its child calls `exec`, and
+        // running the wrapper inside that window fails with `ETXTBSY`, which
+        // doctor would report as a git it cannot start. The window closes on
+        // its own, so the wrapper is run once here, retrying only that error,
+        // before doctor runs it. `--version` leaves `$3` empty, so no body
+        // reacts to the warm-up.
+        let mut warmed = false;
+        for _ in 0..200 {
+            match std::process::Command::new(&wrapper)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .output()
+            {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(e) => panic!("the wrapper would not run: {e}"),
+                Ok(_) => {
+                    warmed = true;
+                    break;
+                }
+            }
+        }
+        assert!(warmed, "the wrapper stayed busy");
         let state = StateDir::resolve(home.path());
         let ledger = LedgerView::read(&state, home.path())
             .expect("the ledger")

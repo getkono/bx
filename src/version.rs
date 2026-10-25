@@ -67,8 +67,29 @@ fn built(epoch: &str) -> String {
 }
 
 /// `seconds` after the Unix epoch as a UTC `YYYY-MM-DDTHH:MM:SSZ`.
+///
+/// The date is the proleptic Gregorian one, by Neri and Schneider's Euclidean
+/// affine functions ("Euclidean affine functions and their application to
+/// calendar algorithms", 2022). It counts from 1 March of year 0, so a leap
+/// day is the last day of its year. A century is 146 097 quarter days, a
+/// four-year cycle 1 461 days, and one affine map takes the day of the year to
+/// its month and day of month, the month in its high 16 bits.
 pub(crate) fn utc(seconds: u64) -> String {
-    let (year, month, day) = civil_from_days(seconds / 86_400);
+    // Four times the days since 0000-03-01, plus three: 1970-01-01 is day
+    // 719 468 of that count.
+    let quarters = seconds / 86_400 * 4 + 2_877_875;
+    // Four times the day of the century, plus three: the remainder with its
+    // two low bits set is the remainder rounded down to a whole day, plus three.
+    let of_century = (quarters % 146_097) | 3;
+    let day_of_year = of_century % 1_461 / 4;
+    let month_day = 2_141 * day_of_year + 197_913;
+    // Counted from March, January and February are months 13 and 14 of the
+    // year before.
+    let january = day_of_year >= 306;
+    let year = quarters / 146_097 * 100 + of_century / 1_461 + u64::from(january);
+    let month = month_day / 65_536;
+    let month = if january { month - 12 } else { month };
+    let day = month_day % 65_536 / 2_141 + 1;
     let of_day = seconds % 86_400;
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
@@ -76,27 +97,6 @@ pub(crate) fn utc(seconds: u64) -> String {
         of_day % 3_600 / 60,
         of_day % 60
     )
-}
-
-/// The proleptic Gregorian date `days` after 1970-01-01. Counts from 1 March of
-/// year 0, so a leap day is the last day of its year, and in 400-year eras,
-/// each exactly 146 097 days long.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let shifted = days + 719_468;
-    let era = shifted / 146_097;
-    let day_of_era = shifted % 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let shifted_month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
-    let month = if shifted_month < 10 {
-        shifted_month + 3
-    } else {
-        shifted_month - 9
-    };
-    let year = year_of_era + era * 400 + u64::from(month <= 2);
-    (year, month, day)
 }
 
 #[cfg(test)]

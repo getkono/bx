@@ -578,6 +578,22 @@ fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
     // An unreadable refusal quotes its line.
     let quoted = relocations("true\n  export CARGO_HOME\n", &strict);
     assert_eq!(quoted[0].value, "export CARGO_HOME");
+    // A judged value is the whole word, a space inside its quotes included.
+    let values: Vec<String> = relocations(
+        "CARGO_HOME='/tmp/a b' c\nCARGO_HOME=\"/tmp/c d\" c\nCARGO_HOME=/tmp/e\\ f c\n",
+        &strict,
+    )
+    .into_iter()
+    .map(|v| v.value)
+    .collect();
+    assert_eq!(values, ["'/tmp/a b'", "\"/tmp/c d\"", "/tmp/e\\ f"]);
+    // A flag group is skipped back to its own opening parenthesis.
+    let chars = |s: &str| s.chars().collect::<Vec<_>>();
+    assert_eq!(expansion(&chars("${(L)"), &chars("}")), Some(true));
+    assert_eq!(expansion(&chars("${(j: :)"), &chars("=/x}")), Some(false));
+    // A subscript is skipped to its own closing bracket.
+    assert_eq!(expansion(&chars("${"), &chars("[1]=/x}")), Some(false));
+    assert_eq!(expansion(&chars("${"), &chars("[1]}")), Some(true));
     // What a declared root allows, the guard allows here too.
     let rooted = RootSet::new(Path::new("/home/u"), &[PathBuf::from("/scratch")]);
     assert!(relocations("export CARGO_HOME=/scratch/cargo\n", &rooted).is_empty());
@@ -1066,13 +1082,24 @@ fn the_path_is_replaced_by_a_reference_quoted_for_where_it_stands() {
             "x=\"$(echo \"${PATH}\")\" \"$PATH\"",
         ),
         ("x=`echo /a:/b`", "x=`echo \"$PATH\"`"),
+        // A single quote is text inside double quotes, but opens a span
+        // again inside a substitution they hold.
+        ("x=\"it's /a:/b\"", "x=\"it's ${PATH}\""),
+        ("x=\"`echo '/a:/b'`\"", "x=\"`echo \"$PATH\"`\""),
         ("x=$(( (1) )) '/a:/b'", "x=$(( (1) )) \"$PATH\""),
+        // A parenthesis a substitution holds closes inside it, not it.
+        (
+            "x=\"$( (true); echo /a:/b )\"",
+            "x=\"$( (true); echo \"$PATH\" )\"",
+        ),
         // A comment's quote opens nothing; the value in it is replaced too.
         ("# it's /a:/b\nx='/a:/b'", "# it's \"$PATH\"\nx=\"$PATH\""),
         ("echo ${#a} '/a:/b'", "echo ${#a} \"$PATH\""),
         // An escaped quote opens nothing.
         ("x=\\' '/a:/b'", "x=\\' \"$PATH\""),
         ("x=\"\\\" /a:/b\"", "x=\"\\\" ${PATH}\""),
+        // Inside `$'…'` a double quote is text, so it opens nothing.
+        ("x=$'a\"b' '/a:/b'", "x=$'a\"b' \"$PATH\""),
         // Part of a longer path is not the value.
         ("x='/a:/b/c' y=/z/a:/b", "x='/a:/b/c' y=/z/a:/b"),
     ];

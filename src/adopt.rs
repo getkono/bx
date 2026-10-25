@@ -860,7 +860,10 @@ fn decide_file(
                     "is already declared at {origin} as tracked; bx sync carries it into the repo"
                 )));
             }
-            if declared.attach != Attach::Own || declared.format != Format::Opaque {
+            if !matches!(
+                (&declared.attach, &declared.format),
+                (Attach::Own, Format::Opaque)
+            ) {
                 return Ok(refused(format!(
                     "is already declared at {origin} as part of a file; bx add adopts whole files"
                 )));
@@ -879,7 +882,7 @@ fn decide_file(
                     )));
                 }
             };
-            if wanted != bytes || Mode::resolve(declared.mode, Kind::File) != mode {
+            if (&wanted, Mode::resolve(declared.mode, Kind::File)) != (&bytes, mode) {
                 return Ok(refused(format!(
                     "is already declared at {origin}, and differs from what it declares; \
                      `bx plan` shows how"
@@ -887,7 +890,7 @@ fn decide_file(
             }
             let digest = ContentHash::of(&bytes);
             let owned = ledger.get(target).is_some_and(|entry| {
-                entry.mechanism == Mechanism::Own && entry.written == digest && entry.mode == mode
+                (&entry.mechanism, &entry.written, entry.mode) == (&Mechanism::Own, &digest, mode)
             });
             Ok(if owned {
                 Adoption::Unchanged {
@@ -919,7 +922,7 @@ fn decide_file(
                 .as_str()
                 .strip_prefix("~/")
                 .unwrap_or(target.as_str());
-            if rel.contains("{{") || rel.contains("}}") {
+            if ["{{", "}}"].into_iter().any(|braces| rel.contains(braces)) {
                 return Ok(refused(
                     "has `{{` or `}}` in its path, which a body path would read as a value \
                      placeholder"
@@ -942,9 +945,10 @@ fn decide_file(
                 )));
             }
             let in_repo = ctx.repo.join(&body);
-            let reuse = match fs::observe(&in_repo)? {
-                present if present.kind == Kind::Absent => false,
-                present if present.bytes.as_deref() == Some(bytes.as_slice()) => true,
+            let present = fs::observe(&in_repo)?;
+            let reuse = match (present.kind, present.bytes) {
+                (Kind::Absent, _) => false,
+                (_, held) if held.as_deref() == Some(bytes.as_slice()) => true,
                 _ => {
                     return Ok(refused(format!(
                         "cannot be copied: the repo already holds {} with other content; \

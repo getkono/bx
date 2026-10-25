@@ -208,27 +208,24 @@ pub fn load_exclusive(path: &Path, lock: &ExclusiveLock) -> Result<Loaded, Error
 /// or why it is neither.
 fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
     // Looked at before it is opened, following no link. See
-    // `Error::NotAJournal`.
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if !meta.file_type().is_file() => {
+    // `Error::NotAJournal`. A journal unlinked since that look — `pending`
+    // takes no lock, and a session may just have finished — is as absent as
+    // one never there.
+    let looked = std::fs::symlink_metadata(path).and_then(|meta| {
+        Ok(if meta.file_type().is_file() {
+            Ok(std::fs::read(path)?)
+        } else {
+            Err(fs::Kind::from(meta.file_type()))
+        })
+    });
+    let bytes = match looked {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(kind)) => {
             return Err(Error::NotAJournal {
                 path: path.to_path_buf(),
-                kind: fs::Kind::from(meta.file_type()),
+                kind,
             });
         }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
-        Err(source) => {
-            return Err(Error::Io {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
-    }
-    // A journal unlinked since that look — `pending` takes no lock, and a
-    // session may just have finished — is as absent as one never there.
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Ok(Loaded::Absent)),
         Err(source) => {
             return Err(Error::Io {
@@ -238,41 +235,41 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
         }
     };
 
-    if bytes.len() <= MAGIC.len() {
+    let Some((&found, after)) = bytes
+        .strip_prefix(MAGIC.as_slice())
+        .and_then(<[u8]>::split_first)
+    else {
         // A prefix of the magic is a header a crash tore.
         return Ok(if MAGIC.starts_with(&bytes) {
             Ok(Loaded::Unterminated(Vec::new()))
         } else {
             Err("it does not start with a bx journal header")
         });
-    }
-    if &bytes[..MAGIC.len()] != MAGIC.as_slice() {
-        return Ok(Err("it does not start with a bx journal header"));
-    }
-    let found = bytes[MAGIC.len()];
+    };
     // Before anything else is classified: a newer format is not damage, and
     // nothing this build could decide about its bytes is believable.
-    if found > FORMAT {
-        return Err(Error::FutureVersion {
-            path: path.to_path_buf(),
-            found,
-            supported: FORMAT,
-        });
-    }
-    if found != FORMAT {
-        return Ok(Err("it is a journal format this bx cannot read"));
+    match found.cmp(&FORMAT) {
+        std::cmp::Ordering::Greater => {
+            return Err(Error::FutureVersion {
+                path: path.to_path_buf(),
+                found,
+                supported: FORMAT,
+            });
+        }
+        std::cmp::Ordering::Less => {
+            return Ok(Err("it is a journal format this bx cannot read"));
+        }
+        std::cmp::Ordering::Equal => {}
     }
     // A header cut inside its nonce is still a header a crash tore.
-    let Some(nonce) = bytes
-        .get(MAGIC.len() + 1..HEADER)
-        .and_then(|nonce| <[u8; NONCE]>::try_from(nonce).ok())
-    else {
+    let Some(&nonce) = after.first_chunk::<NONCE>() else {
         return Ok(Ok(Loaded::Unterminated(Vec::new())));
     };
 
     let mut records = Vec::new();
     let mut at = HEADER;
-    let mut discarded = 0;
+    // How many bytes past the last whole frame were not one.
+    let mut discarded = None;
     while at < bytes.len() {
         match frame(&bytes, at, &nonce) {
             Ok((record, next)) => {
@@ -299,10 +296,11 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
                 ));
             }
             Err(_) => {
-                discarded = bytes.len() - at;
+                let torn = bytes.len() - at;
+                discarded = Some(torn);
                 tracing::warn!(
                     path = %path.display(),
-                    discarded,
+                    discarded = torn,
                     "the write-ahead journal ends in bytes that are not a whole frame; \
                      the whole frames before them are rolled back, and the file is set \
                      aside rather than deleted once it is recovered",
@@ -318,7 +316,7 @@ fn inspect(path: &Path) -> Result<Result<Loaded, &'static str>, Error> {
 
     Ok(Ok(if matches!(records.last(), Some(Record::End(_))) {
         Loaded::Terminated(records)
-    } else if discarded > 0 {
+    } else if let Some(discarded) = discarded {
         Loaded::Torn { records, discarded }
     } else {
         Loaded::Unterminated(records)

@@ -149,12 +149,27 @@ pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
 /// terminal goes away mid-question, must not be read as approval. Everything
 /// around this — `yes`, no terminal, declined, accepted, a failing prompt — is
 /// decided in [`apply_with`] and tested through its `ask` seam; this wrapper
-/// exists only to put the question.
+/// only discards what was typed ahead and puts the question.
+///
+/// Nothing typed before the question is shown answers it: the Enter after the
+/// `y` that answered the shell's `bx: update now?` would otherwise be read
+/// here as the default, and a `y` typed ahead as approval.
 fn confirm() -> Result<bool, Error> {
+    discard_typeahead(std::io::stdin());
     inquire::Confirm::new("Apply these changes?")
         .with_default(false)
         .prompt()
         .map_err(confirmation_failed)
+}
+
+/// Discard what was typed on `terminal` and not yet read. A refusal is only
+/// logged: where `terminal` is not one, nothing can have been typed ahead on
+/// it, and a terminal that refuses fails the prompt that follows, which
+/// reports it.
+fn discard_typeahead(terminal: impl std::os::fd::AsFd) {
+    if let Err(error) = rustix::termios::tcflush(terminal, rustix::termios::QueueSelector::IFlush) {
+        tracing::debug!(%error, "typeahead not discarded");
+    }
 }
 
 /// What a confirmation prompt's failure is: [`Error::Canceled`] when it was

@@ -1201,6 +1201,62 @@ fn colour_follows_the_terminal_and_no_color() {
     assert!(!rendered(&env(home.path())).contains('\x1b'));
 }
 
+/// A pseudo-terminal: what is written to the first end is typed on the
+/// second, the end a program reads its keys from.
+fn pseudo_terminal() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let keyboard = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a pseudo-terminal");
+    grantpt(&keyboard).expect("granted");
+    unlockpt(&keyboard).expect("unlocked");
+    let name = ptsname(&keyboard, Vec::new()).expect("its name");
+    let terminal = rustix::fs::open(
+        name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("its terminal end");
+    (keyboard, terminal)
+}
+
+/// How many typed bytes wait to be read on `terminal`, once some arrive or
+/// `within` has passed: the terminal takes what was written to the keyboard
+/// end a moment later, not at once.
+fn waiting(terminal: &std::os::fd::OwnedFd, within: std::time::Duration) -> u64 {
+    let until = std::time::Instant::now() + within;
+    loop {
+        let waiting = rustix::io::ioctl_fionread(terminal).expect("a terminal");
+        if waiting > 0 || std::time::Instant::now() >= until {
+            return waiting;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_confirmation_discards_what_was_typed_before_it_was_asked() {
+    let (keyboard, terminal) = pseudo_terminal();
+    // The Enter after the `y` that answered the shell's `bx: update now?`.
+    rustix::io::write(&keyboard, b"\r").expect("an Enter typed ahead");
+    assert_eq!(
+        waiting(&terminal, std::time::Duration::from_secs(5)),
+        1,
+        "the Enter waits on the terminal, so the question would read it"
+    );
+    discard_typeahead(&terminal);
+    assert_eq!(
+        waiting(&terminal, std::time::Duration::from_millis(200)),
+        0,
+        "nothing typed before the question is left to answer it"
+    );
+
+    // Somewhere that is not a terminal has nothing typed ahead, and the
+    // question goes on to be asked, or refused, as before.
+    let (read, mut write) = std::io::pipe().expect("a pipe");
+    write.write_all(b"y\n").expect("piped input");
+    discard_typeahead(&read);
+    assert_eq!(rustix::io::ioctl_fionread(&read).expect("a pipe"), 2);
+}
+
 mod doctor_command;
 mod sync_command;
 mod update_command;

@@ -71,8 +71,9 @@ toml_edit = { version = "0.25.14", features = ["serde"] }
 sha2 = "0.11.0"
 # Atomic writes: temp file in the destination directory, fsync, rename.
 tempfile = "3.27.0"
-# File modes, fsync, and the advisory lock on the state directory.
-rustix = { version = "1.1.4", features = ["fs", "process", "system"] }
+# File modes, fsync, the advisory lock on the state directory, and discarding
+# what was typed ahead of a confirmation.
+rustix = { version = "1.1.4", features = ["fs", "process", "system", "termios"] }
 thiserror = "2.0.20"
 eyre = "0.6.14"
 color-eyre = "0.6.5"
@@ -82,6 +83,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 [dev-dependencies]
 assert_cmd = "2.2.2"
 proptest = "1.11.0"
+# A pseudo-terminal to type ahead on, for the confirmation's tests.
+rustix = { version = "1.1.4", features = ["pty"] }
 
 [profile.release]
 # bx is a short-lived, frequently-installed binary fetched over the network:

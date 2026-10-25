@@ -850,10 +850,11 @@ fn live_path(output: &str, path: &OsStr) -> String {
     let mut chars = output.char_indices().peekable();
     while let Some((at, c)) = chars.next() {
         let top = stack.last().copied().unwrap_or(Quoting::Plain);
-        if output[at..].starts_with(path)
-            && is_edge(output[..at].chars().next_back())
-            && is_edge(output[at + path.len()..].chars().next())
-        {
+        let whole = output[at..]
+            .strip_prefix(path)
+            .filter(|_| is_edge(output[..at].chars().next_back()))
+            .filter(|after| is_edge(after.chars().next()));
+        if whole.is_some() {
             match top {
                 Quoting::Single => {
                     if !closed {
@@ -871,7 +872,10 @@ fn live_path(output: &str, path: &OsStr) -> String {
                 Quoting::Double => out.push_str("${PATH}"),
                 _ => out.push_str("\"$PATH\""),
             }
-            while chars.next_if(|&(next, _)| next < at + path.len()).is_some() {}
+            // Past the rest of the value: `c` was its first character.
+            for _ in path.chars().skip(1) {
+                chars.next();
+            }
             continue;
         }
         if comment {
@@ -947,8 +951,8 @@ fn live_path(output: &str, path: &OsStr) -> String {
             }
             (Quoting::Substitution(depth), ')') => {
                 stack.pop();
-                if depth > 0 {
-                    stack.push(Quoting::Substitution(depth - 1));
+                if let Some(depth) = depth.checked_sub(1) {
+                    stack.push(Quoting::Substitution(depth));
                 }
                 out.push(c);
             }
@@ -1124,9 +1128,8 @@ fn assembled(chars: &[char]) -> Vec<(usize, String)> {
                 split |= quoted && !name.is_empty();
                 quoted = false;
                 name.push(c);
-            } else if c == '\''
-                || c == '"'
-                || (c == '\\' && chars.get(k + 1).is_some_and(|n| is_name_char(*n)))
+            } else if matches!(c, '\'' | '"')
+                || matches!(chars[k..], ['\\', n, ..] if is_name_char(n))
             {
                 quoted = true;
             } else {
@@ -1138,7 +1141,7 @@ fn assembled(chars: &[char]) -> Vec<(usize, String)> {
             k += 1;
             continue;
         }
-        let expands = start > 0 && chars[start - 1] == '$' && is_name_char(chars[start]);
+        let expands = chars[..start].ends_with(&['$']) && is_name_char(chars[start]);
         let comment = line_of(chars, start).trim_start().starts_with('#');
         if !split || expands || comment {
             continue;
@@ -1282,31 +1285,29 @@ fn command_word(command: &str) -> Option<&str> {
 /// `Some(false)` when it assigns it (`${NAME=…}`, `${NAME:=…}`,
 /// `${NAME::=…}`), and `None` when it is not in one. `$NAME` reads it too.
 fn expansion(before: &[char], after: &[char]) -> Option<bool> {
-    if before.last() == Some(&'$') {
+    if before.ends_with(&['$']) {
         return Some(true);
     }
     // Flags a `${…}` may carry before its name: `${#…}`, `${(j: :)…}`.
-    let mut open = before.len();
-    while open > 0 && "#!^=~+".contains(before[open - 1]) {
-        open -= 1;
+    let mut open = before;
+    while let Some((_, flagged)) = open.split_last().filter(|(c, _)| "#!^=~+".contains(**c)) {
+        open = flagged;
     }
-    if open > 0 && before[open - 1] == ')' {
-        open = before[..open].iter().rposition(|c| *c == '(')?;
+    if let Some((')', flagged)) = open.split_last() {
+        open = &flagged[..flagged.iter().rposition(|c| *c == '(')?];
     }
-    if !before[..open].ends_with(&['$', '{']) {
+    if !open.ends_with(&['$', '{']) {
         return None;
     }
-    let mut k = 0;
-    if after.first() == Some(&'[') {
-        k = after
-            .iter()
-            .position(|c| *c == ']')
-            .map_or(after.len(), |p| p + 1);
-    }
-    let rest = &after[k..];
-    let assigns = rest.starts_with(&['='])
-        || rest.starts_with(&[':', '='])
-        || rest.starts_with(&[':', ':', '=']);
+    // Past a subscript, to the end where none closes.
+    let rest = if after.starts_with(&['[']) {
+        after.splitn(2, |c| *c == ']').nth(1).unwrap_or_default()
+    } else {
+        after
+    };
+    let assigns = [&['='][..], &[':', '='], &[':', ':', '=']]
+        .into_iter()
+        .any(|operator| rest.starts_with(operator));
     Some(!assigns)
 }
 
@@ -1353,27 +1354,27 @@ fn command_before(before: &[char], edges: &[char]) -> String {
 /// The shell word `text` begins with, as written — quotes and escapes kept —
 /// or `None` when a quote in it does not close.
 fn word(text: &[char]) -> Option<String> {
-    let mut k = 0;
-    while let Some(&c) = text.get(k) {
-        match c {
+    // What is left of `text` past the word so far.
+    let mut rest = text;
+    while let Some((c, after)) = rest.split_first() {
+        rest = match c {
             ' ' | '\t' | '\n' | ';' | '&' | '|' | ')' | '<' | '>' => break,
-            '\'' => k += 2 + text[k + 1..].iter().position(|c| *c == '\'')?,
+            '\'' => after.splitn(2, |c| *c == '\'').nth(1)?,
             '"' => {
-                let mut j = k + 1;
+                let mut quoted = after;
                 loop {
-                    match text.get(j)? {
-                        '\\' => j += 2,
-                        '"' => break,
-                        _ => j += 1,
+                    match quoted.split_first()? {
+                        ('\\', escaped) => quoted = escaped.get(1..).unwrap_or_default(),
+                        ('"', closed) => break closed,
+                        (_, more) => quoted = more,
                     }
                 }
-                k = j + 1;
             }
-            '\\' => k += 2,
-            _ => k += 1,
-        }
+            '\\' => after.get(1..).unwrap_or_default(),
+            _ => after,
+        };
     }
-    Some(text[..k.min(text.len())].iter().collect())
+    Some(text[..text.len() - rest.len()].iter().collect())
 }
 
 /// The whole line the character at `at` is on.

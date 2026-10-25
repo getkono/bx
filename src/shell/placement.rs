@@ -264,18 +264,21 @@ pub(crate) fn place_envs(
     let mut placed = Vec::new();
     for place in Place::ALL {
         let here: Vec<&(&EnvDecl, Resolution<Var>)> = lands_in(place).collect();
-        let repeats_path = place == Place::Zprofile && platform == Platform::Macos;
+        let repeats_path = matches!((place, platform), (Place::Zprofile, Platform::Macos));
         let entries = if place == Place::Zshenv || repeats_path {
             path
         } else {
             &[]
         };
-        let inherited = if repeats_path && !path.is_empty() {
+        // Entries this fragment repeats from the `zshenv` one.
+        let repeated = repeats_path && !path.is_empty();
+        let inherited = if repeated {
             exported.clone()
         } else {
             Vec::new()
         };
-        let (interactive, declared, defined, optional) = if place == Place::Zshrc {
+        let zshrc = place == Place::Zshrc;
+        let (interactive, declared, defined, optional) = if zshrc {
             (plugins, aliases, functions, sources)
         } else {
             (&[][..], &[][..], &[][..], &[][..])
@@ -283,7 +286,7 @@ pub(crate) fn place_envs(
         let plugin = interactive.iter().find(|p| p.enabled);
         let alias = declared.iter().find(|a| a.enabled);
         let function = defined.iter().find(|f| f.enabled);
-        let table_here = table_origin.filter(|_| place == Place::Zshrc);
+        let table_here = table_origin.filter(|_| zshrc);
         let source = optional.iter().find(|s| s.enabled);
         let origin = match (
             here.first(),
@@ -302,10 +305,7 @@ pub(crate) fn place_envs(
             (None, None, None, None, None, Some(table), _) => table.clone(),
             (None, None, None, None, None, None, Some(source)) => source.origin.clone(),
             (None, None, None, None, None, None, None) => {
-                match activation_origin
-                    .or(followed_origin)
-                    .filter(|_| place == Place::Zshrc)
-                {
+                match activation_origin.or(followed_origin).filter(|_| zshrc) {
                     Some(origin) => origin.clone(),
                     None => continue,
                 }
@@ -328,7 +328,7 @@ pub(crate) fn place_envs(
         // The repeated entries are held back with the `zshenv` fragment, so a
         // login zsh never reads them in `~/.zprofile` alone, and an entry that
         // refers to a held-back variable is never judged without it.
-        if repeats_path && !entries.is_empty() {
+        if repeated {
             held.extend(zshenv_held.iter().copied());
         }
         placed.push(if held.is_empty() {
@@ -339,14 +339,18 @@ pub(crate) fn place_envs(
                     Resolution::Blocked(_) => None,
                 })
                 .collect();
-            let generator = match fragment_gen(place, vars, entries.to_vec(), inherited) {
-                Gen::Env(env) if place == Place::EnvironmentD && platform == Platform::Macos => {
+            let generator = match (
+                fragment_gen(place, vars, entries.to_vec(), inherited),
+                place,
+                platform,
+            ) {
+                (Gen::Env(env), Place::EnvironmentD, Platform::Macos) => {
                     Gen::LaunchAgent(LaunchAgent {
                         env,
                         home: values.home().to_path_buf(),
                     })
                 }
-                Gen::Interactive(file) => Gen::Interactive(Box::new(
+                (Gen::Interactive(file), ..) => Gen::Interactive(Box::new(
                     file.with_plugins(interactive)?
                         .with_history(history.clone())
                         .with_keybindings(keybindings.clone())
@@ -356,7 +360,7 @@ pub(crate) fn place_envs(
                         .with_omitted(super::omitted(Shell::Zsh, merged))
                         .with_update_prompt(followed_origin.is_some()),
                 )),
-                other => other,
+                (other, ..) => other,
             };
             Resolution::Ready(fragment_target(place, fragment.clone(), generator, &origin))
         } else {

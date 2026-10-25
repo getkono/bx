@@ -884,58 +884,60 @@ fn live_path(output: &str, path: &OsStr) -> String {
             continue;
         }
         let next = chars.peek().map(|&(_, next)| next);
-        match (top, c) {
-            (Quoting::Single, '\'') => {
+        // Single quotes come first: nothing inside them is special but the
+        // quote that closes them, so no later arm sees `Quoting::Single`.
+        match (top, c, next) {
+            (Quoting::Single, '\'', _) => {
                 stack.pop();
                 if !closed {
                     out.push('\'');
                 }
                 closed = false;
             }
-            (Quoting::Single, _) => {
+            (Quoting::Single, _, _) => {
                 if closed {
                     out.push('\'');
                     closed = false;
                 }
                 out.push(c);
             }
-            (_, '\\') if top != Quoting::Single => {
+            (_, '\\', _) => {
                 out.push(c);
                 if let Some((_, escaped)) = chars.next() {
                     out.push(escaped);
                 }
             }
-            (Quoting::AnsiC, '\'') | (Quoting::Double, '"') | (Quoting::Backtick, '`') => {
+            (Quoting::AnsiC, '\'', _) | (Quoting::Double, '"', _) | (Quoting::Backtick, '`', _) => {
                 stack.pop();
                 out.push(c);
             }
-            (Quoting::AnsiC, _) => out.push(c),
-            (_, '$') if next == Some('(') => {
+            (Quoting::AnsiC, _, _) => out.push(c),
+            (_, '$', Some('(')) => {
                 stack.push(Quoting::Substitution(0));
                 out.push(c);
                 out.extend(chars.next().map(|(_, open)| open));
             }
-            (_, '`') => {
+            (_, '`', _) => {
                 stack.push(Quoting::Backtick);
                 out.push(c);
             }
-            (Quoting::Double, _) => out.push(c),
-            (_, '$') if next == Some('\'') => {
+            (Quoting::Double, _, _) => out.push(c),
+            (_, '$', Some('\'')) => {
                 stack.push(Quoting::AnsiC);
                 out.push(c);
                 out.extend(chars.next().map(|(_, open)| open));
             }
-            (_, '\'') => {
+            (_, '\'', _) => {
                 stack.push(Quoting::Single);
                 out.push(c);
                 opened = out.len();
             }
-            (_, '"') => {
+            (_, '"', _) => {
                 stack.push(Quoting::Double);
                 out.push(c);
             }
             // A comment begins only where a word would.
-            (_, '#')
+            (_, '#', _)
                 if output[..at]
                     .chars()
                     .next_back()
@@ -944,12 +946,12 @@ fn live_path(output: &str, path: &OsStr) -> String {
                 comment = true;
                 out.push(c);
             }
-            (Quoting::Substitution(depth), '(') => {
+            (Quoting::Substitution(depth), '(', _) => {
                 stack.pop();
                 stack.push(Quoting::Substitution(depth + 1));
                 out.push(c);
             }
-            (Quoting::Substitution(depth), ')') => {
+            (Quoting::Substitution(depth), ')', _) => {
                 stack.pop();
                 if let Some(depth) = depth.checked_sub(1) {
                     stack.push(Quoting::Substitution(depth));

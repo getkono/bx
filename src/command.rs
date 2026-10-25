@@ -665,10 +665,10 @@ fn updating(
     // gone, or no repository at all, there is nowhere to push.
     let pulled = match pulled {
         Ok(pulled) => {
-            if pulled.fast_forwarded > 0 {
+            if pulled.fast_forwarded != 0 {
                 say(out, &fast_forwarded(&pulled))?;
             }
-            if pulled.recovered > 0 {
+            if pulled.recovered != 0 {
                 say(out, &recovered_carry(&pulled))?;
             }
             Some(pulled)
@@ -922,10 +922,11 @@ fn updating(
         // As `bx sync` does: every carried file in one commit, after the
         // lock's, and pushed with it.
         let carried = sync::commit_carried(env, git, &pulled.repo)?;
-        if carried > 0 {
+        let carry = carried != 0;
+        if carry {
             say(out, &committed_carry(carried, pulled))?;
         }
-        let committed = made.get() + u64::from(carried > 0);
+        let committed = made.get() + u64::from(carry);
         push_lock(git, pulled, committed, &report, out)?;
     }
     update::finished(&inputs)?;

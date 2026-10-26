@@ -77,7 +77,8 @@ wrong even if it passes CI.
 - **toml_edit** — hand-authored config, and comment-preserving edits to other
   tools' TOML. Commands and hand-editing must be the same operation.
 - **tempfile + rustix** — atomic writes (temp in destination dir, fsync,
-  rename), file modes, and the advisory state-dir lock.
+  rename), file modes, the advisory state-dir lock, and discarding what was
+  typed ahead of a confirmation.
 - **eyre + color-eyre** — application error reporting; `main` installs
   color-eyre at startup with its location and backtrace-hint sections off, so
   an error reads as its message chain alone.

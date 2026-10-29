@@ -1,0 +1,118 @@
+#!/bin/sh
+# mutants-census-summary — merge a sharded mutation census and prove it whole.
+#
+#   scripts/mutants-census-summary DIR SHARDS OUT > SUMMARY.md
+#
+# SHARDS is how many the census was dealt across, a positive integer.
+# DIR holds one directory per shard, census-0 to census-(SHARDS-1), as the
+# census workflow downloads them. Each holds the commit the shard tested
+# (sha.txt), the mutants it was dealt (listed.txt, from `cargo mutants --list`
+# with the shard's arguments) and the run's mutants.out, whose caught.txt,
+# missed.txt, timeout.txt and unviable.txt name each mutant by the line --list
+# prints for it.
+#
+# OUT receives the four outcome lists and listed.txt merged across shards and
+# sorted, and unaccounted.txt: every mutant dealt to a shard with no outcome,
+# because the shard ran out of time or never ran. A Markdown summary goes to
+# stdout: the commit, the count of each outcome, and the missed and timed-out
+# mutants per file.
+#
+# The census is whole only when every shard is present, every shard tested the
+# same commit, no mutant was dealt twice, and every mutant dealt has exactly
+# one outcome and every outcome was dealt. Anything else is listed in the
+# summary, and the script exits 1 after writing it, so a lost shard fails the
+# job rather than shrinking the census.
+
+set -eu
+
+[ $# -eq 3 ] || { echo "usage: $0 DIR SHARDS OUT" >&2; exit 2; }
+dir=$1
+shards=$2
+out=$3
+case $shards in
+    '' | *[!0-9]* | 0*) echo "$0: SHARDS must be a positive integer, not '$shards'" >&2; exit 2 ;;
+esac
+outcomes="caught missed timeout unviable"
+export LC_ALL=C
+
+mkdir -p "$out"
+problems=$(mktemp)
+trap 'rm -f "$problems"' EXIT
+
+: > "$out/listed.txt"
+for outcome in $outcomes; do : > "$out/$outcome.txt"; done
+: > "$out/shas.txt"
+
+shard=0
+while [ "$shard" -lt "$shards" ]; do
+    from=$dir/census-$shard
+    if [ ! -f "$from/listed.txt" ] || [ ! -f "$from/sha.txt" ]; then
+        echo "- shard $shard is missing" >> "$problems"
+    else
+        cat "$from/listed.txt" >> "$out/listed.txt"
+        cat "$from/sha.txt" >> "$out/shas.txt"
+        for outcome in $outcomes; do
+            if [ -f "$from/mutants.out/$outcome.txt" ]; then
+                cat "$from/mutants.out/$outcome.txt" >> "$out/$outcome.txt"
+            fi
+        done
+    fi
+    shard=$((shard + 1))
+done
+
+sort -u "$out/shas.txt" -o "$out/shas.txt"
+if [ "$(wc -l < "$out/shas.txt")" -gt 1 ]; then
+    echo "- the shards tested different commits: $(tr '\n' ' ' < "$out/shas.txt")" >> "$problems"
+fi
+sha=$(head -n 1 "$out/shas.txt")
+rm "$out/shas.txt"
+
+for list in listed $outcomes; do sort "$out/$list.txt" -o "$out/$list.txt"; done
+
+uniq -d "$out/listed.txt" | sed 's/^/- dealt twice: /' >> "$problems"
+for outcome in $outcomes; do cat "$out/$outcome.txt"; done | sort > "$out/.tested"
+uniq -d "$out/.tested" | sed 's/^/- more than one outcome: /' >> "$problems"
+sort -u "$out/listed.txt" > "$out/.dealt"
+sort -u "$out/.tested" -o "$out/.tested"
+comm -23 "$out/.dealt" "$out/.tested" > "$out/unaccounted.txt"
+comm -13 "$out/.dealt" "$out/.tested" | sed 's/^/- an outcome nobody was dealt: /' >> "$problems"
+rm "$out/.dealt" "$out/.tested"
+if [ -s "$out/unaccounted.txt" ]; then
+    echo "- mutants dealt with no outcome: $(wc -l < "$out/unaccounted.txt" | tr -d ' ') (unaccounted.txt)" >> "$problems"
+fi
+
+count() { wc -l < "$out/$1.txt" | tr -d ' '; }
+
+echo "# Mutation census"
+echo
+echo "Commit: \`${sha:-unknown}\`, $shards shards."
+echo
+echo "| Outcome | Mutants |"
+echo "| --- | --- |"
+echo "| dealt | $(count listed) |"
+for outcome in $outcomes; do echo "| $outcome | $(count "$outcome") |"; done
+echo "| unaccounted | $(count unaccounted) |"
+echo
+echo "## Missed and timed out, by file"
+echo
+if [ -s "$out/missed.txt" ] || [ -s "$out/timeout.txt" ]; then
+    echo "| File | Missed | Timeout |"
+    echo "| --- | --- | --- |"
+    {
+        sed 's/:.*//; s/$/ missed/' "$out/missed.txt"
+        sed 's/:.*//; s/$/ timeout/' "$out/timeout.txt"
+    } | awk '
+        { n[$1, $2]++; files[$1] = 1 }
+        END { for (f in files) printf "| `%s` | %d | %d |\n", f, n[f, "missed"], n[f, "timeout"] }
+    ' | sort
+else
+    echo "None."
+fi
+
+if [ -s "$problems" ]; then
+    echo
+    echo "## The census is not whole"
+    echo
+    cat "$problems"
+    exit 1
+fi

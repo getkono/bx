@@ -76,12 +76,13 @@ usage = 'arg "[base]" help="Ref whose baseline and limit this one may not outgro
 run = 'scripts/line-check ${usage_base:-}'
 
 [tasks.shellcheck]
-description = "ShellCheck every shell script: the installer, the bench harness and its stubs, the line check and the mutants diff filter (CI, pre-commit)"
+description = "ShellCheck every shell script: the installer, the bench harness and its stubs, the line check, the mutants diff filter and the census summary (CI, pre-commit)"
 # install.sh runs on machines with nothing else on them, so a shell bug there is
 # the one bug a user cannot work around; the bench and line-check scripts gate
 # the startup budget and the line limit, which a bug would silently disable,
-# and the mutants diff filter decides which mutants a pull request is held to.
-run = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh bench/stubs/fzf bench/stubs/mise bench/stubs/starship bench/stubs/zoxide scripts/line-check scripts/mutants-diff-filter"
+# the mutants diff filter decides which mutants a pull request is held to, and
+# the census summary decides whether a full mutation census is whole.
+run = "shellcheck install.sh bench/run.sh bench/stubs/gen.sh bench/stubs/fzf bench/stubs/mise bench/stubs/starship bench/stubs/zoxide scripts/line-check scripts/mutants-diff-filter scripts/mutants-census-summary"
 
 [tasks.actionlint]
 description = "Lint the GitHub Actions workflows (CI, pre-commit)"

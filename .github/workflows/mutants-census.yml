@@ -138,12 +138,13 @@ jobs:
   summary:
     name: Census summary
     needs: [resolve, census]
-    if: always()
+    # Whatever the shards did, as long as there was a commit to deal them at.
+    if: always() && needs.resolve.result == 'success'
     runs-on: ubuntu-latest
     steps:
+      # The merge script comes from the dispatched ref, not the census commit,
+      # which may predate it; the commit the shards tested is in their sha.txt.
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.sha }}
       - uses: actions/download-artifact@v4
         with:
           pattern: census-*

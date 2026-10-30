@@ -137,9 +137,10 @@ jobs:
     # install.sh runs on machines that have nothing else on them, so a bug there
     # is the one bug a user cannot work around. bench/run.sh gates the startup
     # budget, so a bug there silently disables that gate. scripts/line-check is
-    # the file-length gate, which a bug would disable just as silently, and
+    # the file-length gate, which a bug would disable just as silently,
     # scripts/mutants-diff-filter decides which mutants a pull request is held
-    # to.
+    # to, and scripts/mutants-census-summary decides whether a full mutation
+    # census is whole.
     #
     # Every check runs through the same mise task hk runs locally. shellcheck
     # and actionlint are the only tools this job calls, and `mise run` would

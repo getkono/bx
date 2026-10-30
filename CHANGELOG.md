@@ -9,6 +9,50 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/getkono/bx/compare/v0.1.3...v0.1.4) - 2026-10-30
+
+### Added
+
+- *(upgrade)* add bx upgrade, moving pinned externals to their newest release ([#322](https://github.com/getkono/bx/pull/322))
+- *(update)* do all of bx sync's work, and judge a check against the upstream ([#319](https://github.com/getkono/bx/pull/319))
+- *(doctor)* show the rest of update/last-check as notes that leave doctor Converged ([#297](https://github.com/getkono/bx/pull/297))
+- *(doctor)* report the config repo's and followed checkouts' local state ([#295](https://github.com/getkono/bx/pull/295))
+- *(update)* push the lock commit after a successful update ([#294](https://github.com/getkono/bx/pull/294))
+- *(doctor)* name a bx update that stopped, from update/last-check ([#293](https://github.com/getkono/bx/pull/293))
+- *(update)* judge the background check against the config repo's upstream ([#291](https://github.com/getkono/bx/pull/291))
+- *(update)* coordinate the update prompt across shells ([#288](https://github.com/getkono/bx/pull/288))
+
+### Fixed
+
+- *(command)* discard typeahead before asking whether to apply ([#331](https://github.com/getkono/bx/pull/331))
+- *(update)* refuse a carry whose file the upstream renamed ([#325](https://github.com/getkono/bx/pull/325))
+- *(sync)* serialise config-repo writers under the update lock ([#296](https://github.com/getkono/bx/pull/296))
+- *(update)* settle the offer on every outcome of bx update ([#290](https://github.com/getkono/bx/pull/290))
+- *(sync)* name an upstream that does not exist instead of failing in git ([#275](https://github.com/getkono/bx/pull/275))
+
+### Other
+
+- add a dispatched full-crate mutation census ([#332](https://github.com/getkono/bx/pull/332))
+- settle the mutants a file-by-file pass over #323's files finds ([#329](https://github.com/getkono/bx/pull/329))
+- restructure the functions with the most mutants into equivalent forms ([#330](https://github.com/getkono/bx/pull/330))
+- squash the mutants the partial cargo-mutants run missed ([#327](https://github.com/getkono/bx/pull/327))
+- *(adopt)* leave the bytes rm puts back to the restore tests ([#326](https://github.com/getkono/bx/pull/326))
+- *(test)* clear the line-check baseline by moving oversized tests to sibling files ([#324](https://github.com/getkono/bx/pull/324))
+- share the plan, journal and recover scenario machinery instead of re-proving it ([#316](https://github.com/getkono/bx/pull/316))
+- keep end-to-end tests to the seams unit tests cannot reach ([#321](https://github.com/getkono/bx/pull/321))
+- *(config)* state each config rule once, at the level that owns it ([#314](https://github.com/getkono/bx/pull/314))
+- tabulate the state, fs, report, detect and paths case lists ([#317](https://github.com/getkono/bx/pull/317))
+- *(env_guard)* fold the round-numbered regression tests into one table ([#315](https://github.com/getkono/bx/pull/315))
+- share the test setup hand-rolled across modules ([#313](https://github.com/getkono/bx/pull/313))
+- announce every self-skipping test and pin loose assertions ([#311](https://github.com/getkono/bx/pull/311))
+- *(env_guard)* record why the source censuses match whole lines ([#312](https://github.com/getkono/bx/pull/312))
+- give every source scan one rule for where shipped code ends ([#310](https://github.com/getkono/bx/pull/310))
+- hold files to 2153 lines with a limit that only goes down ([#309](https://github.com/getkono/bx/pull/309))
+- *(bench)* fail the Linux bench step when the bench fails ([#287](https://github.com/getkono/bx/pull/287))
+- *(git)* observe the killed grandchild without /proc so the check holds on macOS ([#286](https://github.com/getkono/bx/pull/286))
+- resolve version-manager shims before running real programs ([#285](https://github.com/getkono/bx/pull/285))
+- *(bench)* gate the shell-startup budget on macOS ([#283](https://github.com/getkono/bx/pull/283))
+
 ## [0.1.3](https://github.com/getkono/bx/compare/v0.1.2...v0.1.3) - 2026-10-17
 
 ### Added

@@ -91,7 +91,9 @@ jobs:
         with:
           version: "0.11.30"
       # What this shard is dealt, and at which commit, so the summary can tell
-      # a mutant never tested from one that was never dealt.
+      # a mutant never tested from one that was never dealt. The list is drawn
+      # without colour: CARGO_TERM_COLOR above makes cargo-mutants style it,
+      # and the outcome files it is compared with are plain.
       - name: Deal
         env:
           SHARD: ${{ matrix.shard }}
@@ -99,7 +101,7 @@ jobs:
         run: |
           set -- --shard "$SHARD/$SHARDS" --sharding round-robin
           if [ -n "$RE" ]; then set -- "$@" --re "$RE"; fi
-          mise run mutants --list "$@" > listed.txt
+          mise run mutants --list --colors never "$@" > listed.txt
           git rev-parse HEAD > sha.txt
           wc -l < listed.txt
       # A missed mutant (exit 2) or a timeout (3) is what a census is for, and

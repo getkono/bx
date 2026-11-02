@@ -18,6 +18,8 @@ documentation.
   `bx --version`, which `src/version.rs` lays out. Best-effort; never fail the
   build when git is unavailable.
 - `bench/` — the hermetic shell-startup benchmark. See `bench/README.md`.
+- `examples/starter/` — the config repo the README tells a new user to copy,
+  exercised by `tests/starter_example.rs`.
 - `install.sh` — the only distribution channel. POSIX sh, shellcheck-clean.
 
 Put logic in the library with tests; keep `main.rs` minimal. Logic moved into

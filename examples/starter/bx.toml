@@ -1,0 +1,43 @@
+# A small starting configuration: a zsh setup and a starship prompt.
+#
+# Copy this directory to ~/.config/bx, then run `bx init`. Nothing here needs an
+# answer, and nothing here names an account or a machine, so the copy is yours
+# to edit and safe to publish.
+
+# ===========================================================================
+# Starship
+# ===========================================================================
+
+# The prompt's config, at the path starship reads by default. bx installs no
+# tools: `requires` only has `bx doctor` report starship when it is missing.
+[[target]]
+path     = "~/.config/starship.toml"
+file     = "home/.config/starship.toml"
+requires = ["starship"]
+
+# `starship init` runs when `bx plan` does and its output is cached, so a shell
+# start does not run it again. Install starship later and `bx apply` picks it up.
+[[activation]]
+name    = "starship"
+command = ["starship", "init", "{shell}"]
+phase   = "completions"
+shells  = ["zsh"]
+
+# ===========================================================================
+# Zsh
+# ===========================================================================
+
+[history]
+size         = 10000
+ignore_space = true
+share        = true
+
+[history.file]
+zsh = "~/.zsh_history"
+
+[aliases]
+ll = "ls -l"
+
+[keybindings]
+home = "beginning-of-line"
+end  = "end-of-line"

@@ -56,6 +56,31 @@ Esc or Ctrl-C at any question stops it there. What it had already written stays
 and has already been reported, and the next `bx init` picks up from that point.
 Answers you typed in a run that stopped at a later value question are not kept.
 
+### Start from an example
+
+[`examples/starter`](examples/starter) is a small config repo: a starship prompt
+and a zsh setup declared in bx's own sections. Copy it to where `bx init`
+looks, then run `init`, which keeps a repo it finds. With no repo there yet:
+
+```bash
+git clone --depth 1 https://github.com/getkono/bx /tmp/bx
+config="${XDG_CONFIG_HOME:-$HOME/.config}"
+mkdir -p "$config"
+cp -R /tmp/bx/examples/starter "$config/bx"
+bx init
+```
+
+bx installs no tools, so install starship yourself. Until you do, the prompt is
+left out and shells still start; `plan` and `apply` report the activation as
+blocked and exit 2. Run `bx apply` once it is installed. A
+`~/.config/starship.toml` or `~/.inputrc` you already have is reported as a
+conflict and left as it is.
+
+The declarations are not only for zsh. The alias, history size and keybindings
+also reach bash, through `~/.bashrc` and `~/.inputrc` (and `~/.bash_profile` on
+macOS), and readline-linked programs read `~/.inputrc` too. The prompt is
+zsh-only.
+
 ## Commands
 
 There are thirteen. You should not need a manual.

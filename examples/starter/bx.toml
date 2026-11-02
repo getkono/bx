@@ -24,17 +24,12 @@ phase   = "completions"
 shells  = ["zsh"]
 
 # ===========================================================================
-# Zsh
+# Shell
 # ===========================================================================
 
-[history]
-size         = 10000
-ignore_space = true
-share        = true
-
-[history.file]
-zsh = "~/.zsh_history"
-
+# Rendered for zsh and bash alike. There is no [history] here on purpose: a
+# declared `size` truncates a longer history file already on the machine, which
+# `bx rm` cannot bring back, so choose one only knowing your own.
 [aliases]
 ll = "ls -l"
 

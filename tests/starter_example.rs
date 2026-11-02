@@ -148,9 +148,16 @@ fn zsh_starts_cleanly(machine: &Machine, script: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "zsh: {output:#?}");
     assert!(
-        ["not found", "error", "invalid", "bad substitution"]
-            .iter()
-            .all(|complaint| !stderr.contains(complaint)),
+        [
+            "not found",
+            "error",
+            "invalid",
+            "bad substitution",
+            "no such",
+            "permission denied",
+        ]
+        .iter()
+        .all(|complaint| !stderr.contains(complaint)),
         "zsh complained starting up:\n{stderr}"
     );
 }
@@ -207,10 +214,7 @@ fn zsh_gets_the_declarations_and_the_prompt() {
     machine.converged(&["apply", "--yes"]);
     zsh_starts_cleanly(
         &machine,
-        "alias ll >/dev/null && [[ $HISTSIZE == 10000 ]] \
-         && [[ -o histignorespace ]] && [[ -o sharehistory ]] \
-         && [[ $HISTFILE == $HOME/.zsh_history ]] \
-         && [[ -n ${__bench_starship_loaded-} ]]",
+        "alias ll >/dev/null && [[ -n ${__bench_starship_loaded-} ]]",
     );
     let zsh = std::fs::read_to_string(machine.home.child(".local/share/bx/zshrc.zsh"))
         .expect("the generated zsh file");
@@ -228,8 +232,7 @@ fn bash_gets_the_alias_and_the_keybindings_but_not_the_prompt() {
         .args([
             "-i",
             "-c",
-            "alias ll >/dev/null && [[ $HISTSIZE == 10000 ]] \
-             && [[ -z ${__bench_starship_loaded-} ]]",
+            "alias ll >/dev/null && [[ -z ${__bench_starship_loaded-} ]]",
         ])
         .output()
         .expect("bash runs");
@@ -251,6 +254,22 @@ fn an_inputrc_already_there_is_not_overwritten() {
         "{applied:#?}"
     );
     assert_eq!(applied.status.code(), Some(2), "{applied:#?}");
+    let stdout = String::from_utf8_lossy(&applied.stdout);
+    assert!(stdout.contains("1 conflict"), "{stdout}");
+
+    // The way out the README gives: delete the [keybindings] from the copy.
+    // It is the manifest's last section.
+    let manifest = std::fs::read_to_string(machine.home.child(".config/bx/bx.toml"))
+        .expect("the copied manifest");
+    let (kept, _) = manifest
+        .split_once("[keybindings]")
+        .expect("the example declares keybindings");
+    machine.home.write(".config/bx/bx.toml", kept);
+    machine.converged(&["apply", "--yes"]);
+    assert_eq!(
+        std::fs::read_to_string(machine.home.child(".inputrc")).expect("~/.inputrc"),
+        mine
+    );
 }
 
 #[test]
@@ -267,6 +286,37 @@ fn installing_starship_later_and_applying_brings_the_prompt() {
     machine.install_starship();
     machine.converged(&["apply", "--yes"]);
     zsh_starts_cleanly(&machine, "[[ -n ${__bench_starship_loaded-} ]]");
+}
+
+#[test]
+fn a_long_history_already_there_keeps_every_line() {
+    let machine = Machine::with_starship();
+    let lines: String = (0..30_000).map(|n| format!("echo {n}\n")).collect();
+    machine.home.write(".bash_history", &lines);
+    machine.home.write(".zsh_history", &lines);
+    machine
+        .home
+        .write(".bashrc", "HISTSIZE=100000\nHISTFILESIZE=100000\n");
+    let zshrc = format!("{ZSHRC}HISTFILE=~/.zsh_history\nHISTSIZE=100000\nSAVEHIST=100000\n");
+    machine.home.write(".zshrc", &zshrc);
+    machine.converged(&["apply", "--yes"]);
+
+    for shell in ["bash", "zsh"] {
+        let output = machine
+            .command(shell)
+            .args(["-i", "-c", "exit"])
+            .output()
+            .expect("the shell runs");
+        assert!(output.status.success(), "{shell}: {output:#?}");
+    }
+    for file in [".bash_history", ".zsh_history"] {
+        let kept = std::fs::read_to_string(machine.home.child(file)).expect("the history");
+        assert!(
+            kept.lines().count() >= 30_000,
+            "{file} kept {} lines",
+            kept.lines().count()
+        );
+    }
 }
 
 #[test]

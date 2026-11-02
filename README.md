@@ -61,13 +61,15 @@ Answers you typed in a run that stopped at a later value question are not kept.
 [`examples/starter`](examples/starter) is a small config repo: a starship prompt
 and a zsh setup declared in bx's own sections. Copy it to where `bx init`
 looks, then run `init`, which keeps a repo it finds. This is instead of the
-plain `bx init` above, and only for a machine with no config repo yet: over an
-existing one, `cp` nests the example where bx does not read it.
+plain `bx init` above, and only for a machine with no config repo yet: the first
+test stops it otherwise, because `cp` would nest the example where bx does not
+read it.
 
 ```bash
-src="$(mktemp -d)" &&
+config="${XDG_CONFIG_HOME:-$HOME/.config}" &&
+  [ ! -e "$config/bx" ] &&
+  src="$(mktemp -d)" &&
   git clone --depth 1 https://github.com/getkono/bx "$src" &&
-  config="${XDG_CONFIG_HOME:-$HOME/.config}" &&
   mkdir -p "$config" &&
   cp -R "$src/examples/starter" "$config/bx" &&
   bx init
@@ -79,13 +81,15 @@ blocked and exit 2. Run `bx apply` once it is installed.
 
 A `~/.config/starship.toml` or `~/.inputrc` you already have is reported as a
 conflict, left as it is, and exits 2 on every run until you settle it. To keep
-yours, delete the `[[target]]` or the `[keybindings]` from your copy of
-`bx.toml`.
+yours, delete the whole `[[target]]` or `[keybindings]` section, its keys too,
+from your copy of `bx.toml`. Deleting `[keybindings]` also removes those bindings
+from zsh.
 
 The declarations are not only for zsh. The alias and keybindings also reach bash,
 through `~/.bashrc` and `~/.inputrc` (and `~/.bash_profile` on macOS), and
 readline-linked programs read `~/.inputrc` too. The prompt is zsh-only. `bx sync`
-needs the copy to be a git repository, so run `git init` there if you want it.
+needs the copy to be a git repository with a remote, which the copy does not
+start with.
 
 ## Commands
 

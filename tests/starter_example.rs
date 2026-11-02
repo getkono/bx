@@ -3,12 +3,13 @@
 //!
 //! Nothing else exercises this example: the acceptance suite and the bench both
 //! use `bench/fixtures/bx`. So the invariants a reader is promised by copying it
-//! are held here, along with the two ways a first run differs from a tidy one:
-//! a prompt config already on the machine, and starship not installed.
+//! are held here, along with the ways a first run differs from a tidy one:
+//! config or a long history already on the machine, and starship not installed.
 
 mod common;
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -301,15 +302,27 @@ fn a_long_history_already_there_keeps_every_line() {
     machine.home.write(".zshrc", &zshrc);
     machine.converged(&["apply", "--yes"]);
 
-    for shell in ["bash", "zsh"] {
-        let output = machine
+    // A session read from stdin, not `-c`: zsh writes its history file back only
+    // as a session ends, so `zsh -i -c exit` would leave it alone whatever the
+    // limit said. zsh goes first so that a limit on both shells is caught there.
+    for (shell, file) in [("zsh", ".zsh_history"), ("bash", ".bash_history")] {
+        let mut session = machine
             .command(shell)
-            .args(["-i", "-c", "exit"])
-            .output()
+            .arg("-i")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .expect("the shell runs");
+        session
+            .stdin
+            .take()
+            .expect("the piped stdin")
+            .write_all(b"echo hi\nexit\n")
+            .expect("the session's input");
+        let output = session.wait_with_output().expect("the shell ends");
         assert!(output.status.success(), "{shell}: {output:#?}");
-    }
-    for file in [".bash_history", ".zsh_history"] {
+
         let kept = std::fs::read_to_string(machine.home.child(file)).expect("the history");
         assert!(
             kept.lines().count() >= 30_000,

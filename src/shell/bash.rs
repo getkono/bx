@@ -597,6 +597,7 @@ mod tests {
     use super::*;
     use crate::config::env::Var;
     use crate::config::parse_str;
+    use crate::config::resolution::BlockReason;
     use crate::config::when::tools;
     use crate::shell::testing::{installed, run};
     use std::path::PathBuf;
@@ -780,6 +781,8 @@ mod tests {
             file(1)
         );
         assert_eq!(paths("[history]\nsize = 5\n"), file(1));
+        assert_eq!(paths("[[function]]\nname = \"f\"\nbody = \"x\"\n"), file(1));
+        assert_eq!(paths("[[source]]\nname = \"s\"\npath = \"~/s\"\n"), file(1));
         assert_eq!(paths("\n[shell-options]\nhistappend = false\n"), file(2));
         assert_eq!(
             paths("[keybindings]\nend = \"end-of-line\"\n"),
@@ -793,6 +796,10 @@ mod tests {
             "[history.file]\nzsh = \"~/.zsh_history\"\n",
             "[shell-options]\n",
             "[keybindings]\n",
+            "[[function]]\nname = \"f\"\nbody = \"x\"\nenabled = false\n",
+            "[[function]]\nname = \"f\"\nbody = \"x\"\nshells = [\"zsh\"]\n",
+            "[[source]]\nname = \"s\"\npath = \"~/s\"\nenabled = false\n",
+            "[[source]]\nname = \"s\"\npath = \"~/s\"\nshells = [\"zsh\"]\n",
         ] {
             assert!(paths(text).is_empty(), "{text}");
         }
@@ -958,6 +965,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![FILE.to_string()]
         );
+        // A file is named as placed by a ready target at its own path, or by
+        // an entry held back under it, and by nothing else.
+        let vacated_paths = |placed: &[Resolution<Target>]| -> Vec<String> {
+            described(&vacated(placed, &|_, _| true, home, &origin))
+                .into_iter()
+                .map(|(path, _, _)| path)
+                .collect()
+        };
+        let inputrc = placed_by(&load("[keybindings]\nend = \"end-of-line\"\n")).expect("places");
+        assert_eq!(vacated_paths(&inputrc), [FILE]);
+        let held = Resolution::Blocked(BlockedEntry {
+            key: FILE.to_string(),
+            origin: origin.clone(),
+            reason: BlockReason::UnsetValue {
+                names: vec!["v".to_string()],
+            },
+            hint: String::new(),
+        });
+        assert_eq!(vacated_paths(&[held]), [INPUTRC]);
     }
 
     /// Every shared declaration but aliases, history and keybindings, with

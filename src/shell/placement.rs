@@ -835,6 +835,26 @@ mod tests {
         assert!(zsh_on(bash_only, Platform::Macos).is_empty());
     }
 
+    #[test]
+    fn only_an_enabled_activation_with_a_zsh_command_places_the_interactive_file() {
+        let activation = "[[activation]]\nname = \"a\"\ncommand = [\"a\", \"init\", \"zsh\"]\n";
+        let placed = zsh_on(activation, Platform::Linux);
+        let paths: Vec<&str> = placed.iter().map(|(p, ..)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                fragment_path(Place::Zshrc, Platform::Linux),
+                Place::Zshrc.startup_file().expect("a startup file"),
+            ]
+        );
+        for text in [
+            format!("{activation}enabled = false\n"),
+            format!("{activation}shells = [\"bash\"]\n"),
+        ] {
+            assert!(zsh_on(&text, Platform::Linux).is_empty(), "{text}");
+        }
+    }
+
     /// Every ready target `text` places for zsh on `platform`.
     fn targets_on(text: &str, platform: Platform) -> Vec<Target> {
         let config = parse_str(text, Path::new("/repo/bx.toml"), Path::new(HOME)).expect("parses");

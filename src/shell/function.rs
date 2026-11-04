@@ -712,7 +712,7 @@ mod tests {
                     [[function]]\nname = \"zonly\"\nbody = \"echo z\"\nhook = \"precmd\"\n\
                     shells = [\"zsh\"]\n\
                     [[function]]\nname = \"both\"\nbody = \"echo zsh\"\nhook = \"chpwd\"\n\
-                    bash = \"echo {{a}} bash\"\n\
+                    when = \"interactive\"\nbash = \"echo {{a}} bash\"\n\
                     [[function]]\nname = \"bonly\"\nbody = \"echo b\"\nshells = [\"bash\"]\n";
         let config = load(text).expect("parses");
         let values = ResolvedValues::resolve(
@@ -729,6 +729,17 @@ mod tests {
              function plain {\necho x\n}\n\
              function both {\necho x bash\n}\n\
              function bonly {\necho b\n}\n"
+        );
+        // The condition gates only zsh's registration, so bash's function
+        // carries neither the hook nor the condition.
+        assert_eq!(
+            bash,
+            [
+                function("plain", "echo x", None, None),
+                function("both", "echo x bash", None, None),
+                function("bonly", "echo b", None, None),
+            ]
+            .map(Resolution::Ready)
         );
     }
 

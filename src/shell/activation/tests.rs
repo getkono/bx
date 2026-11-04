@@ -462,6 +462,7 @@ fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
         ("CARGO_HOME=\"unclosed\n", &[(1, "CARGO_HOME", Unreadable)]),
         ("CARGO_HOME='unclosed\n", &[(1, "CARGO_HOME", Unreadable)]),
         ("eval CARGO_HOME\\=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
+        ("CARGO_HOME\\=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
         ("export CARGO_HOME\n", &[(1, "CARGO_HOME", Unreadable)]),
         (
             "export \\\n  CARGO_HOME\n",
@@ -536,6 +537,8 @@ fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
             &[(1, "CARGO_HOME", Unreadable)],
         ),
         ("(( ++CARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
+        ("(( ++ CARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
+        ("(( --\tCARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
         // Review item D7: a relocating name assembled from quoted or
         // escaped pieces is the name once quotes are removed, so it is
         // refused wherever it stands.
@@ -1094,6 +1097,10 @@ fn the_path_is_replaced_by_a_reference_quoted_for_where_it_stands() {
         ),
         // A comment's quote opens nothing; the value in it is replaced too.
         ("# it's /a:/b\nx='/a:/b'", "# it's \"$PATH\"\nx=\"$PATH\""),
+        // One begins after a blank or an operator too, but not inside a word.
+        ("x=1 # it's\nx='/a:/b'", "x=1 # it's\nx=\"$PATH\""),
+        ("x=1;# it's\nx='/a:/b'", "x=1;# it's\nx=\"$PATH\""),
+        ("x=a#'/a:/b'", "x=a#\"$PATH\""),
         ("echo ${#a} '/a:/b'", "echo ${#a} \"$PATH\""),
         // An escaped quote opens nothing.
         ("x=\\' '/a:/b'", "x=\\' \"$PATH\""),

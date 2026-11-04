@@ -1085,6 +1085,14 @@ fn a_state_file_longer_than_the_limit_is_never_read_whole() {
         "{:?}",
         at_limit.health,
     );
+    // And read whole: a read bounded below the limit would hand back a
+    // truncated file the judgement above cannot tell from the real one.
+    match read_state_file(&path).expect("read") {
+        StateRead::Bytes(bytes) => {
+            assert_eq!(u64::try_from(bytes.len()).expect("len"), MAX_STATE_FILE);
+        }
+        other => panic!("an at-limit file is its bytes, got {other:?}"),
+    }
 }
 
 #[test]

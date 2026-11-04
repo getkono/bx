@@ -525,6 +525,15 @@ mod tests {
                     entry.hint
                 );
             }
+            // A value written in `file` directly is named with its text, and
+            // with no chain of values it is built from.
+            assert!(
+                entry.hint.contains(&format!(
+                    "`file` takes `cfg_dir` as {answer:?}, which is rooted"
+                )),
+                "{kind} {answer}: {}",
+                entry.hint
+            );
             assert_eq!(ready(&answered, 1).path.as_str(), "~/.zshrc", "{kind}");
         }
 

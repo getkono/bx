@@ -301,6 +301,7 @@ pub(super) fn unknown_toggle(toggle: &Toggle, more: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::super::tests::{failure, global, home, local, merge, paths, target_toml};
+    use super::Keyed;
     use crate::config::parse_str;
     use crate::config::toggle::Section;
     use std::path::Path;
@@ -547,5 +548,32 @@ mod tests {
 
         assert_eq!(merged.targets[0].origin.file, Path::new("bx.toml"));
         assert_eq!(merged.targets[1].origin.file, Path::new("local.toml"));
+    }
+
+    #[test]
+    fn the_accessors_merge_never_calls_still_answer_for_their_entry() {
+        // `Target::key`, `ValueDecl::enabled` and `PathEntry::set_enabled` are
+        // unreachable from `merge` (each says why), but `Keyed` is what a list
+        // type states about itself, so each still answers for its own entry.
+        let mut config = parse_str(
+            "[[target]]\npath = \"~/.a\"\ncontent = \"x\"\n\
+             [[value]]\nname = \"v\"\nkind = \"string\"\nenabled = false\n\
+             [path]\nprepend = [\"~/bin\"]\n",
+            Path::new("bx.toml"),
+            &home(),
+        )
+        .unwrap();
+
+        assert_eq!(Keyed::key(&config.targets[0]), "~/.a");
+
+        let value = &mut config.values[0];
+        assert!(!Keyed::enabled(value));
+        value.set_enabled(true);
+        assert!(Keyed::enabled(value));
+
+        let entry = &mut config.path[0];
+        assert!(entry.enabled);
+        entry.set_enabled(false);
+        assert!(!entry.enabled);
     }
 }

@@ -992,6 +992,7 @@ fn link_text_renders_only_a_leading_home() {
         ("../a/~/b", "../a/~/b"),
         ("a//b/./c", "a//b/./c"),
         ("/opt/x/", "/opt/x/"),
+        ("~other/bin", "~other/bin"),
     ] {
         assert_eq!(link_text(text, home), PathBuf::from(rendered), "{text}");
     }

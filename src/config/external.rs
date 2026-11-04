@@ -1029,6 +1029,9 @@ mod tests {
             ("https://u:p@github.com/o/a", "user information"),
             ("ssh://u:p@github.com/o/a", "password"),
             ("u:p@github.com:o/a", "password"),
+            // Either sign alone before the path's first `/` is that shape.
+            ("u:p@github.com/o/a", "password"),
+            ("u:p:github.com/o/a", "password"),
             ("https:///o/a", "no host"),
             ("ssh://git@/o/a", "no host"),
             (":o/a", "no host"),
@@ -1037,6 +1040,9 @@ mod tests {
             ("github.com:", "no repository"),
             ("-oProxyCommand=x:a", "option"),
             ("ssh://-oProxyCommand=x/a", "option"),
+            // A `-` opening the host after a user, or opening the user alone.
+            ("git@-oProxyCommand=x:a", "option"),
+            ("-u@github.com:o/a", "option"),
             ("https://h/{{x}}", "placeholder"),
             ("https://h/o/a\t", "whitespace"),
         ] {

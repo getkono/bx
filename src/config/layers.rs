@@ -891,6 +891,17 @@ mod tests {
         );
     }
 
+    /// A `..` after a regular file names nothing (`ENOTDIR`), so the walk
+    /// steps back to the file and judges it by the directory holding it.
+    #[test]
+    fn a_dotdot_after_a_file_in_the_repo_is_judged_from_the_file() {
+        let home = guarded_home();
+        let (repo, _) = repo_and_state(&home);
+        home.write(".config/bx/bx.toml", "");
+
+        assert!(inside_on_disk(&repo.join("bx.toml/../state"), &repo).unwrap());
+    }
+
     /// The walk up from a state directory near `PATH_MAX` reaches `/` and the
     /// repo alike. Spelled `dir/../..`, each step lengthens the path until the
     /// kernel refuses it with `ENAMETOOLONG`; each step is opened relative to

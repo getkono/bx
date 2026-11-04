@@ -424,6 +424,15 @@ mod tests {
             let message = Glob::parse(raw).expect_err(raw);
             assert!(message.contains(&format!("{raw:?}")), "{raw}: {message}");
         }
+        // A leading or a trailing `/` alone is named as such, not as the empty
+        // component it also leaves.
+        for raw in ["/abs", "dir/"] {
+            let message = Glob::parse(raw).expect_err(raw);
+            assert!(
+                message.contains("starts or ends with `/`"),
+                "{raw}: {message}"
+            );
+        }
         assert_eq!(glob("a/b").to_string(), "a/b");
     }
 
@@ -593,6 +602,17 @@ mod tests {
         symlink("real", linked.path().join("files/x")).expect("a link");
         let message = load(&linked).expect_err("a link").to_string();
         assert!(message.contains("not followed"), "{message}");
+
+        // A root that cannot be examined is an error naming it, not a root
+        // that does not exist: `files` is a link to itself, so reaching
+        // `files/x` answers `ELOOP`.
+        let looped = repo(&[("bx.toml", TREE)]);
+        symlink("files", looped.path().join("files")).expect("a link");
+        let err = load(&looped).expect_err("a loop");
+        assert!(
+            matches!(&err, Error::Io { path, .. } if path.ends_with("files/x")),
+            "{err}"
+        );
     }
 
     #[test]

@@ -580,6 +580,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mode_of_set_id_bits_alone_still_gets_them_after_the_write() {
+        // #344. `stage` creates the file without its set-id bits, so a mode of
+        // nothing *but* setuid and setgid starts at 0000, and only the
+        // `fchmod` after the content puts the bits on. The guard deciding that
+        // `fchmod` has to be true for exactly these bits, not just for a mode
+        // that happens to carry permission bits beside them.
+        let home = guarded_home();
+        let dest = home.child("tool");
+        let mode = Mode::from_bits(0o6000);
+
+        let staged = stage_now(&dest, mode).expect("stage");
+        assert_eq!(mode_of_path(staged.temp_path()).bits(), 0, "created bare");
+        let filled = staged.fill(b"x").expect("both bits are put on and stick");
+        assert_eq!(mode_of_path(filled.temp_path()), mode);
+        filled.publish().expect("publish");
+        assert_eq!(mode_of_path(&dest), mode, "on disk");
+    }
+
+    #[test]
     fn a_set_id_bit_missing_after_its_fchmod_is_a_typed_error() {
         let home = guarded_home();
         let path = home.child("tool");
@@ -690,28 +709,40 @@ mod tests {
             println!("{SET_ID_CHILD_RAN}");
             let dir = PathBuf::from(dir);
             let dest = dir.join("tool");
-            let mode = Mode::from_bits(0o2755);
-            let err = stage_now(&dest, mode)
-                .expect("stage")
-                .fill(b"#!/bin/sh\nexit 0\n")
-                .expect_err("a setgid bit the kernel dropped is not a mode bx may publish");
-            let Error::SetIdNotKept {
-                path,
-                declared,
-                landed,
-            } = &err
-            else {
-                panic!("expected SetIdNotKept, got {err:?}");
-            };
-            assert_eq!(path, &dest);
-            assert_eq!(*declared, mode);
-            assert_eq!(landed.bits() & 0o2000, 0, "the bit really was dropped");
-            assert!(!dest.exists(), "nothing was published");
-            assert_eq!(
-                names_in(&dir),
-                Vec::<OsString>::new(),
-                "no temporary file is left"
-            );
+            // 7000 is every special bit and nothing else (#344): the check
+            // that reads them back has to run for exactly those bits too.
+            for mode in [Mode::from_bits(0o2755), Mode::from_bits(0o7000)] {
+                let err = stage_now(&dest, mode)
+                    .expect("stage")
+                    .fill(b"#!/bin/sh\nexit 0\n")
+                    .expect_err("a setgid bit the kernel dropped is not a mode bx may publish");
+                let Error::SetIdNotKept {
+                    path,
+                    declared,
+                    landed,
+                } = &err
+                else {
+                    panic!("{mode}: expected SetIdNotKept, got {err:?}");
+                };
+                assert_eq!(path, &dest);
+                assert_eq!(*declared, mode);
+                assert_eq!(
+                    landed.bits() & 0o2000,
+                    0,
+                    "{mode}: the bit really was dropped"
+                );
+                assert_eq!(
+                    *landed,
+                    Mode::from_bits(mode.bits() & !0o2000),
+                    "{mode}: setgid alone was dropped; setuid and sticky stuck"
+                );
+                assert!(!dest.exists(), "{mode}: nothing was published");
+                assert_eq!(
+                    names_in(&dir),
+                    Vec::<OsString>::new(),
+                    "{mode}: no temporary file is left"
+                );
+            }
             return;
         }
 

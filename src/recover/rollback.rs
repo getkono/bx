@@ -1665,6 +1665,78 @@ mod tests {
     }
 
     #[test]
+    fn replaying_a_directory_removal_hands_on_the_directory_itself() {
+        // #344. `Step::Forget` releases a removal's own directory, and the
+        // directories its Intent names, only for a removal: an `rm` of a
+        // directory target that something else still holds leaves the
+        // directory standing, and the entry beneath it inherits it. The
+        // dropped entry's own claims cannot stand in for the directory: an
+        // entry never claims its own target.
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        let app = home.child(".config/app");
+        let mut session = apply_session(&state, home.path());
+        session
+            .apply(dir_to(home.path(), ".config/app", Mode::DEFAULT_DIR))
+            .expect("apply the directory");
+        session
+            .apply(write_to(
+                home.path(),
+                ".config/app/heir.conf",
+                "bx\n",
+                Mode::DEFAULT_FILE,
+            ))
+            .expect("apply the file inside it");
+        session.finish().expect("finish");
+        let (dir, _) = target(home.path(), ".config/app");
+        let (heir, _) = target(home.path(), ".config/app/heir.conf");
+        let saved_claims = |what: &Portable| -> Vec<PathBuf> {
+            let ledger = LedgerView::read(&state, home.path()).expect("read the ledger");
+            let mut dirs: Vec<PathBuf> = ledger.value.get(what).map_or_else(Vec::new, |entry| {
+                entry
+                    .created_dirs
+                    .iter()
+                    .map(|d| d.render(home.path()))
+                    .collect()
+            });
+            dirs.sort();
+            dirs
+        };
+        assert_eq!(saved_claims(&dir), vec![home.child(".config")]);
+        assert!(saved_claims(&heir).is_empty(), "heir.conf claims nothing");
+
+        // `rm ~/.config/app` dies between its `End` frame and its save. The
+        // directory still holds heir.conf, so it stands.
+        interrupted(
+            &state,
+            home.path(),
+            vec![Request {
+                target: dir.clone(),
+                dest: app.clone(),
+                content: Content::DirAbsent {
+                    created_dirs: vec![home.child(".config")],
+                    planned: fs::observe(&app).expect("plan's observation"),
+                },
+                mode: Mode::DEFAULT_DIR,
+                ownership: Ownership::Released,
+            }],
+        );
+        seal(&state.journal(), 1);
+
+        assert_eq!(
+            recover(&state).expect("recover"),
+            Outcome::Recorded { entries: 1 },
+        );
+        assert!(app.is_dir(), "a directory something still holds stays");
+        assert!(saved_claims(&dir).is_empty(), "the removal is recorded");
+        assert_eq!(
+            saved_claims(&heir),
+            vec![home.child(".config"), app],
+            "the directory itself reached the entry still beneath it",
+        );
+    }
+
+    #[test]
     fn the_intent_is_durable_before_a_removal_touches_the_destination() {
         let guard = guarded_home();
         let removal = crash_requests(guard.path())

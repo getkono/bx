@@ -375,10 +375,31 @@ jobs:
           mise run mutants-diff-filter full.diff > pr.diff
       # A diff that touches no Rust has no mutants, which cargo-mutants reports
       # and passes; a missed or timed-out mutant fails the job.
+      #
+      # A mutant can turn a loop into one that allocates without end, and it
+      # fills the runner's 16 GB long before the test's timeout fires: the
+      # runner dies, and the shard reports nothing. So cargo-mutants runs in a
+      # transient systemd scope whose memory is capped at 12 GB with no swap,
+      # leaving the rest to the runner itself. Past the cap the kernel kills
+      # the largest process in the scope, which is the runaway test, and
+      # cargo-mutants records its failure as `caught`; OOMPolicy=continue
+      # keeps systemd from stopping the rest of the scope with it. A cgroup
+      # bounds memory actually used, where `ulimit -v` would bound address
+      # space, which bun reserves far more of than it touches.
+      #
+      # Creating the scope needs root, and the run inside it does not: setpriv
+      # drops back to this user and this user's own groups, which systemd-run's
+      # --uid would not, as it leaves root's groups in place. The step's
+      # environment comes through sudo, which sets PATH, HOME, USER and LOGNAME
+      # for root, so those four are passed back.
       - name: Mutants
-        run: >-
-          mise run mutants --in-diff pr.diff
-          --shard ${{ matrix.shard }}/12 --sharding round-robin
+        run: |
+          sudo --preserve-env systemd-run --quiet --scope \
+            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue -- \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            env PATH="$PATH" HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" \
+            mise run mutants --in-diff pr.diff \
+            --shard ${{ matrix.shard }}/12 --sharding round-robin
       - name: Upload mutants.out
         if: always()
         uses: actions/upload-artifact@v4

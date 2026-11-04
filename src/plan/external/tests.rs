@@ -732,6 +732,99 @@ fn missing_dirs_names_every_absent_parent_and_refuses_one_that_cannot_hold_a_clo
 }
 
 #[test]
+fn missing_dirs_names_nothing_at_or_above_the_home() {
+    // #343. Only what lies strictly beneath the home is a directory bx makes
+    // for a clone: not the home when it is missing, and nothing at all for a
+    // path outside it.
+    let guard = guarded_home();
+    let home = guard.child("account/home");
+    assert_eq!(
+        missing_dirs(&home.join("a/b"), &home),
+        Ok(vec![home.join("a")]),
+        "the missing home is not one of them"
+    );
+    assert_eq!(
+        missing_dirs(&guard.child("elsewhere/a/b"), &home),
+        Ok(vec![]),
+        "nor is anything outside it"
+    );
+}
+
+#[test]
+fn an_interrupted_clone_finished_after_plan_is_not_removed() {
+    // #343. Plan saw an interrupted clone and announced its removal; by
+    // apply the ledger records the clone as finished, so the directory is no
+    // longer what an interrupted clone left, and it is left as it is.
+    let home = guarded_home();
+    let up = upstream(&home);
+    let state = StateDir::resolve(home.path());
+    state.ensure().expect("the state directory");
+    let record = |written| {
+        let lock = ExclusiveLock::acquire(&state).expect("the lock");
+        let mut ledger = Ledger::open(&state, &lock, home.path())
+            .expect("open")
+            .value;
+        ledger
+            .record(NewEntry::new(
+                target(&home),
+                written,
+                fs::Mode::DEFAULT_DIR,
+                Mechanism::Clone,
+                PriorBytes::Absent,
+            ))
+            .expect("record");
+        ledger.save().expect("save");
+    };
+    record(clone_written(None));
+    std::fs::create_dir_all(home.child(AT).join(".git")).expect("a partial clone");
+    std::fs::write(home.child(AT).join("half"), "half\n").expect("a partial file");
+    let row = only(&plan(&home, &layer(&up.first))).clone();
+    assert_eq!(row.action, Action::Create);
+    assert!(
+        row.note
+            .as_deref()
+            .is_some_and(|n| n.contains("removes what an interrupted clone left")),
+        "plan announces the replacement: {row:?}"
+    );
+
+    let applied = apply_after(&home, &layer(&up.first), || {
+        record(clone_written(Some(&up.first)));
+    });
+    let note = stopped_note(&applied);
+    assert!(
+        note.contains("is a directory now, which is not what bx planned against"),
+        "{note}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("half")).expect("left"),
+        "half\n"
+    );
+}
+
+#[test]
+fn a_checkout_that_lands_on_another_commit_than_rev_is_refused() {
+    // #343. An annotated tag's object id is a `rev` git can check out, but
+    // what it checks out is the commit the tag points at, whose id is not
+    // `rev`: the checkout is not the clone at `rev` that was asked for.
+    let home = guarded_home();
+    let up = upstream(&home);
+    let dir = home.child("upstream");
+    git_run(
+        home.path(),
+        &dir,
+        &["tag", "--annotate", "-m", "one", "one", &up.first],
+    );
+    let tag = git_run(home.path(), &dir, &["rev-parse", "one"]);
+    assert_ne!(tag, up.first, "the tag is an object of its own");
+    let dest = home.child("checkout");
+    std::fs::create_dir(&dest).expect("the empty directory");
+    assert_eq!(
+        populate(&git(home.path()), &dest, URL, &tag),
+        Err(format!("git checked out {}, not {tag}", up.first))
+    );
+}
+
+#[test]
 fn a_directory_inside_another_checkout_is_not_its_own_checkout() {
     let home = guarded_home();
     let outer = home.child("outer");

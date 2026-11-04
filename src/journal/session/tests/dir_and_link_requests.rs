@@ -347,3 +347,74 @@ fn a_link_is_never_written_over_a_file_and_a_link_removal_takes_only_a_link() {
     drop(session);
     assert_eq!(std::fs::read(&dest).expect("kept"), b"the user's\n");
 }
+
+#[test]
+fn a_directory_an_earlier_write_made_where_plan_saw_nothing_is_still_its_create() {
+    // #343. Plan saw neither directory, so both are creates. Making `.a/b`
+    // first makes `.a` on the way, at the mode `.a`'s own target declares;
+    // `.a` is then the create plan announced, not a directory that changed
+    // since plan, and it invents no parent.
+    let home = guarded_home();
+    let state = StateDir::resolve(home.path());
+    let parent = dir_to(home.path(), ".a", Mode::PRIVATE_DIR);
+    let child = dir_to(home.path(), ".a/b", Mode::PRIVATE_DIR);
+
+    let mut session = apply_session(&state, home.path());
+    session.declare_dir(&home.child(".a"), Mode::PRIVATE_DIR);
+    session.declare_dir(&home.child(".a/b"), Mode::PRIVATE_DIR);
+    session.apply(child).expect("the deeper directory first");
+    assert_eq!(
+        mode_at(&home.child(".a")),
+        Some(Mode::PRIVATE_DIR),
+        "made at the mode its own target declares, not the default"
+    );
+    session
+        .apply(parent)
+        .expect("a directory this session made is still the create plan announced");
+    let intents: Vec<_> = load(&state.journal())
+        .expect("load")
+        .intents()
+        .cloned()
+        .collect();
+    assert_eq!(intents.len(), 2, "{intents:?}");
+    for intent in &intents {
+        assert!(
+            intent.created_dirs.is_empty(),
+            "`.a` is claimed by its own target alone: {intent:?}"
+        );
+    }
+    session.finish().expect("finish");
+
+    let ledger = LedgerView::read(&state, home.path()).expect("ledger").value;
+    let entry = ledger
+        .get(&target(home.path(), ".a").0)
+        .expect("`.a` is recorded");
+    assert_eq!(entry.prior, Prior::Absent, "bx made it; rm removes it");
+    assert!(entry.created_dirs.is_empty(), "{:?}", entry.created_dirs);
+    assert_eq!(mode_at(&home.child(".a")), Some(Mode::PRIVATE_DIR));
+    assert_eq!(mode_at(&home.child(".a/b")), Some(Mode::PRIVATE_DIR));
+}
+
+#[test]
+fn a_directory_somebody_made_where_plan_saw_nothing_is_refused_before_it_is_announced() {
+    // #343. Only a directory this session made where plan saw nothing is
+    // still the create; one the user made since plan is a change, refused
+    // before any Intent names it.
+    let home = guarded_home();
+    let state = StateDir::resolve(home.path());
+    let request = dir_to(home.path(), ".d", Mode::PRIVATE_DIR);
+    std::fs::create_dir(home.child(".d")).expect("the user's, after plan");
+    fs::set_mode(&home.child(".d"), Mode::DEFAULT_DIR).expect("chmod");
+
+    let mut session = apply_session(&state, home.path());
+    let err = session.apply(request).expect_err("plan saw nothing here");
+    assert!(
+        matches!(&err, Error::Write(fs::Error::Changed { detail, .. })
+                if detail == "it is no longer what plan compared"),
+        "{err}"
+    );
+    let journal = session.journal().to_path_buf();
+    drop(session);
+    assert_eq!(load(&journal).expect("load").intents().count(), 0);
+    assert_eq!(mode_at(&home.child(".d")), Some(Mode::DEFAULT_DIR));
+}

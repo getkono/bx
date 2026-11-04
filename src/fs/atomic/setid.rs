@@ -731,6 +731,11 @@ mod tests {
                     0,
                     "{mode}: the bit really was dropped"
                 );
+                assert_eq!(
+                    *landed,
+                    Mode::from_bits(mode.bits() & !0o2000),
+                    "{mode}: setgid alone was dropped; setuid and sticky stuck"
+                );
                 assert!(!dest.exists(), "{mode}: nothing was published");
                 assert_eq!(
                     names_in(&dir),

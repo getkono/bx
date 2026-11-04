@@ -123,9 +123,9 @@ jobs:
           if [ -n "$TIMEOUT" ]; then set -- "$@" --timeout "$TIMEOUT"; fi
           status=0
           sudo --preserve-env systemd-run --quiet --scope \
-            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
-            --uid="$(id -u)" --gid="$(id -g)" -- \
-            env PATH="$PATH" HOME="$HOME" \
+            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue -- \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            env PATH="$PATH" HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" \
             mise run mutants "$@" || status=$?
           case $status in
             0 | 2 | 3) ;;

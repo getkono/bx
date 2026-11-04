@@ -387,15 +387,17 @@ jobs:
       # bounds memory actually used, where `ulimit -v` would bound address
       # space, which bun reserves far more of than it touches.
       #
-      # Creating the scope needs root, and the run inside it does not: it runs
-      # as this user, with this step's environment. sudo keeps the
-      # environment but resets PATH and HOME, so those two are passed back.
+      # Creating the scope needs root, and the run inside it does not: setpriv
+      # drops back to this user and this user's own groups, which systemd-run's
+      # --uid would not, as it leaves root's groups in place. The step's
+      # environment comes through sudo, which sets PATH, HOME, USER and LOGNAME
+      # for root, so those four are passed back.
       - name: Mutants
         run: |
           sudo --preserve-env systemd-run --quiet --scope \
-            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
-            --uid="$(id -u)" --gid="$(id -g)" -- \
-            env PATH="$PATH" HOME="$HOME" \
+            -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue -- \
+            setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
+            env PATH="$PATH" HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" \
             mise run mutants --in-diff pr.diff \
             --shard ${{ matrix.shard }}/12 --sharding round-robin
       - name: Upload mutants.out

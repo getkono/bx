@@ -728,6 +728,18 @@ mod tests {
                 why: Why::TooLarge
             }
         );
+        // #343. A side exactly at the limit is not too large to diff, so the
+        // summary is `Binary`, for the machine's bytes, not `TooLarge`.
+        let at = vec![b'x'; TEXT_LIMIT];
+        let binary_at_the_limit = Diff::diverged("~/.a", &at, &[0xff], b"repo\n");
+        assert_eq!(
+            binary_at_the_limit.kind,
+            DiffKind::Summary {
+                before: Some(5),
+                after: 1,
+                why: Why::Binary
+            }
+        );
     }
 
     /// A home no test touches: rendering is pure.

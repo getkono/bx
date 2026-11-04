@@ -643,6 +643,19 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_write_a_blocked_ordinary_target_claims_by_its_path_is_shown() {
+        // #343. A blocked target is found by its path as written, so an
+        // ordinary one waiting on a value still claims the write and shows
+        // its diff, where a write nothing claims would be concealed.
+        let shown = render_an_interrupted_token_write(&format!(
+            "{WHO}[[target]]\npath = \"~/.token\"\ncontent = \"{{{{who}}}}\\n\"\n"
+        ));
+        assert!(shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("hunter3"), "{shown}");
+        assert!(!shown.contains("secret, not shown"), "{shown}");
+    }
+
+    #[test]
     fn an_interrupted_write_already_put_back_names_only_what_recovery_still_removes() {
         // The mutation run found unpinned whether such a row is a modify or
         // unchanged: only the directories the session created are left to do.

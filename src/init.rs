@@ -840,6 +840,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_repo_path_that_cannot_be_examined_is_reported_as_the_look_failed() {
+        // #343. The error is the one looking at the path met, not one a
+        // create attempted anyway would meet: through a trailing slash a
+        // file is "not a directory" to look at, but "exists" to `mkdir`.
+        let home = guarded_home();
+        home.write("file", "not a directory");
+        // `join("")` appends the trailing separator.
+        let repo = home.child("file").join("");
+        let error = create_repo(&repo).expect_err("ENOTDIR");
+        assert!(
+            matches!(&error, Error::CreateRepo { path, source }
+                    if *path == repo && source.kind() == std::io::ErrorKind::NotADirectory),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.child("file")).expect("the file"),
+            "not a directory"
+        );
+    }
+
+    #[test]
     fn unset_values_are_asked_in_declaration_order_and_later_ones_see_earlier_answers() {
         let home = guarded_home();
         seed(home.path(), VALUES);

@@ -86,6 +86,18 @@ proptest = "1.11.0"
 # A pseudo-terminal to type ahead on, for the confirmation's tests.
 rustix = { version = "1.1.4", features = ["pty"] }
 
+[profile.dev]
+# Dev and test builds give bx line tables only and its dependencies no
+# debuginfo, so target/ stays small under fast iteration. Backtraces keep
+# file:line for bx's own frames; dependency frames keep their symbol names but
+# lose file:line. For full debuginfo when step-debugging:
+#   CARGO_PROFILE_DEV_DEBUG=2 cargo ...                          # bx itself
+#   cargo --config 'profile.dev.package."*".debug=2' ...         # dependencies
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 # bx is a short-lived, frequently-installed binary fetched over the network:
 # size and startup dominate, throughput does not.

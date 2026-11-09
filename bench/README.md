@@ -30,7 +30,8 @@ in `~/.zshrc` or `~/.bashrc`, the interactive file that region sources, and
 for zsh the `~/.zshenv` fragment, with the example's four activations cached
 into the interactive file and the hook that asks about a followed external's
 updates defined and registered in it. What bx's generated files cost.
-**Gated** at `BX_BUDGET_MS` (default 5), for each shell. The bench refuses to
+**Gated** at `BX_BUDGET_MS` (default 5), for each shell; on macOS the gated
+home leaves out the tool's spawn, as `spawn` below says. The bench refuses to
 measure when either interactive file lacks the hook, so the number always
 includes it.
 
@@ -59,8 +60,8 @@ spawn no process, and the bench holds it twice. Its one exception is a tool's
 cached activation output, which bx sources as the tool printed it: the stub
 starship ends its output as the real one does, with
 `PROMPT2="$(starship prompt --continuation)"` (`PS2` for bash), so every start
-spawns the stub once and the overhead above counts it (on Linux; macOS leaves
-it out, as *Stub tools* below says). bx caches each output
+spawns the stub once and the overhead above counts it (on Linux; macOS
+reports it apart, as *Stub tools* below says). bx caches each output
 verbatim as one single-quoted `eval` under a `# bx activation: NAME` line, and
 following that quoting splits bx's own lines from the tools'. Read: bx's own
 lines, comments aside, must hold no command substitution, which covers
@@ -100,6 +101,11 @@ any read is a failure.
 which tools you integrate is your choice, so any threshold here would be
 arbitrary.
 
+**`spawn`** — on macOS only, where the gated `overhead` is bx's own share: the
+bx home against `own`, the same home without the stub starship's continuation
+spawn, so what that spawn costs. **Reported, never gated**, as a blue line: the
+spawn is the tool's, and bx does not control it.
+
 ## Why the result is trustworthy
 
 - **Hermetic.** A scratch home per fixture, and `env -i` for every shell and
@@ -121,11 +127,14 @@ arbitrary.
   cost starting `/bin/sh`, many times a native program's start on macOS. It is
   C, linking only libc, so the budget counts what any native program's spawn
   costs, the part no tool can avoid, and not a language runtime's start-up.
-  On macOS the bench builds no native stub and the shell stub emits no spawn,
-  so the macOS gate measures what it did before the spawn was counted: one
-  fork and exec costs about 3 ms on CI's macOS runner, and with the stub
-  tools' init text that leaves no room for it in 5 ms. Issue #363 holds how it
-  is budgeted there.
+  Every start runs the spawn on macOS too, but there the gate reads bx's own
+  share: one fork and exec costs about 3 ms on CI's macOS runner, and with
+  the stub tools' init text that leaves no room for it in 5 ms, and the spawn
+  is the tool's, which bx does not control. The gated fixture is `own`, a
+  copy of the bx home whose cached starship output sets the continuation
+  prompt to the stub's text instead of starting the stub. The spawn's cost,
+  the bx home against `own`, is printed as a blue `spawn` line (plain under
+  `NO_COLOR`) and never gated.
 - **The stub output is real shell**, not comments, so the shell genuinely
   parses it; and it is shell zsh and bash both run cleanly, since the example
   activates each tool for both.

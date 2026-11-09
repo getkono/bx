@@ -57,8 +57,9 @@ wrong even if it passes CI.
    bx sources exactly as the tool printed it: caching saves running the tool's
    init, never changes what that init does, so whatever the output itself runs
    (starship's `PROMPT2="$(starship prompt --continuation)"`) runs at every
-   start, as it would under `eval "$(tool init)"`, and the budget counts it
-   on Linux (macOS leaves it out of the bench, pending #363). bx never
+   start, as it would under `eval "$(tool init)"`. The bench always runs it:
+   the budget counts it on Linux, and on macOS the bench reports its cost
+   apart and gates bx's own share. bx never
    rewrites the cached text to avoid it. After the first prompt, an
    interactive shell with a terminal and no CI or coding-agent variable set
    may start one detached, time-bounded

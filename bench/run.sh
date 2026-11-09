@@ -108,11 +108,11 @@ WORK="$(mktemp -d)"
 trap "rm -rf '$WORK'" EXIT INT TERM
 # starship is a native program, and its cached output starts it at every start,
 # so the stub that answers that spawn is native too, ahead of `stubs/` on PATH;
-# see stubs/starship.rs. The toolchain that built bx builds it.
+# see stubs/starship.c. The C compiler that links bx builds it.
 mkdir -p "${WORK}/bin"
-BX_BENCH_STARSHIP="${BENCH_DIR}/stubs/starship" rustc --edition 2024 -O \
-	-o "${WORK}/bin/starship" "${BENCH_DIR}/stubs/starship.rs" || {
-	echo "error: rustc could not build the native starship stub." >&2
+cc -O2 -DBX_BENCH_STARSHIP="\"${BENCH_DIR}/stubs/starship\"" \
+	-o "${WORK}/bin/starship" "${BENCH_DIR}/stubs/starship.c" || {
+	echo "error: cc could not build the native starship stub." >&2
 	exit 1
 }
 SEARCH="${WORK}/bin:${BENCH_DIR}/stubs:/usr/local/bin:/usr/bin:/bin"

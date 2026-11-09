@@ -543,17 +543,17 @@ mod tests {
             std::fs::read_to_string(self.dir().join(name)).ok()
         }
 
-        /// `name` under the home once something writes it, as a detached
-        /// call does after the shell that started it is gone; `None` when
-        /// nothing does within ten seconds.
-        fn eventually(&self, name: &str) -> Option<String> {
+        /// Every `bx` call made, once `done` holds of them. The hook starts
+        /// `--background` and `--snooze` detached, where the script's `wait`
+        /// cannot wait for them, so a call can land after the shell exits;
+        /// what was recorded when `done` still fails ten seconds on.
+        fn calls_once(&self, done: impl Fn(&str) -> bool) -> String {
             let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
-                if let Ok(text) = std::fs::read_to_string(self.home.path().join(name)) {
-                    return Some(text);
-                }
-                if std::time::Instant::now() >= until {
-                    return None;
+                let calls =
+                    std::fs::read_to_string(self.home.path().join("calls")).unwrap_or_default();
+                if done(&calls) || std::time::Instant::now() >= until {
+                    return calls;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -609,8 +609,11 @@ mod tests {
             }
         }
 
-        /// Source the hook, call `function`, wait for any detached child, and
-        /// return what was printed and every `bx` call made.
+        /// Source the hook, call `function`, pause briefly so a detached call
+        /// that should not be made has a chance to show, and return what was
+        /// printed and every `bx` call recorded by then. A call expected from
+        /// a detached child is read with [`Rig::calls_once`], since nothing
+        /// bounds when it lands.
         fn run(&self, function: &str, input: &str, env: &[(&str, &str)]) -> (String, String) {
             self.run_after("", function, input, env)
         }
@@ -717,7 +720,8 @@ mod tests {
             );
 
             std::fs::remove_file(rig.dir().join("answered")).expect("answered");
-            let (_, calls) = rig.run("__bx_update_due", "n", &[]);
+            rig.run("__bx_update_due", "n", &[]);
+            let calls = rig.calls_once(|calls| calls == "update\nupdate --snooze\n");
             assert_eq!(
                 calls, "update\nupdate --snooze\n",
                 "{shell:?}: anything but y snoozes"
@@ -744,20 +748,22 @@ mod tests {
             let rig = Rig::new(shell);
             rig.stamp("check-due", "1\n");
             rig.stamp("ask-due", "1\n");
-            let (printed, calls) = rig.run("__bx_update_due\n__bx_update_due", "", &[]);
+            let (printed, _) = rig.run("__bx_update_due\n__bx_update_due", "", &[]);
             assert_eq!(
                 printed, "",
                 "{shell:?}: no question: it waits for what the check finds"
             );
+            let calls = rig.calls_once(|calls| calls == "update --background\n");
             assert_eq!(calls, "update --background\n", "{shell:?}: once per shell");
 
             // Another shell, once the check found something, offers it.
             rig.stamp("available", "~/a: 1 new commit(s) on main\n");
-            let (printed, calls) = rig.run("__bx_update_due", "n", &[]);
+            let (printed, _) = rig.run("__bx_update_due", "n", &[]);
             assert!(
                 printed.contains("~/a: 1 new commit(s) on main"),
                 "{shell:?}: {printed}"
             );
+            let calls = rig.calls_once(|calls| calls.ends_with("update --snooze\n"));
             assert!(calls.ends_with("update --snooze\n"), "{shell:?}: {calls}");
         }
     }
@@ -782,7 +788,7 @@ mod tests {
         for shell in shells() {
             let rig = Rig::new(shell);
             rig.stamp("ask-due", "1\n");
-            let (printed, calls) = rig.run("__bx_update_due", "n", &[]);
+            let (printed, _) = rig.run("__bx_update_due", "n", &[]);
             assert!(
                 printed.contains(
                     "bx: check now whether what this configuration follows has new commits? \
@@ -790,6 +796,7 @@ mod tests {
                 ),
                 "{shell:?}: {printed}"
             );
+            let calls = rig.calls_once(|calls| calls == "update --snooze\n");
             assert_eq!(calls, "update --snooze\n", "{shell:?}");
         }
     }
@@ -870,8 +877,8 @@ mod tests {
                 );
                 assert_eq!(rig.read("answered").as_deref(), Some(answered));
                 assert_eq!(
-                    rig.eventually("calls").as_deref(),
-                    Some("update --snooze\n"),
+                    rig.calls_once(|calls| calls == "update --snooze\n"),
+                    "update --snooze\n",
                     "{shell:?}, {stamp}: one answer, one snooze"
                 );
             }
@@ -1058,11 +1065,12 @@ mod tests {
             let stale = rig.dir().join("waiting").join(gone_pid().to_string());
             std::fs::write(&stale, "g1\n").expect("a stale waiter");
             std::fs::write(rig.dir().join("waiting/notapid"), "g1\n").expect("a stray file");
-            let (printed, calls) = rig.run("__bx_update_due", "n", &[]);
+            let (printed, _) = rig.run("__bx_update_due", "n", &[]);
             assert!(
                 printed.ends_with("bx: update now? [y/N] \n"),
                 "{shell:?}: nothing said about the stale pid: {printed}"
             );
+            let calls = rig.calls_once(|calls| calls == "update --snooze\n");
             assert_eq!(calls, "update --snooze\n", "{shell:?}");
         }
     }
@@ -1150,9 +1158,10 @@ mod tests {
 
     /// The bx calls the hook makes at a prompt of an interactive `shell` whose
     /// standard input and output are a terminal and whose `TERM` is `term`,
-    /// with a background check due; `None` where zsh's `zpty`, which supplies
-    /// the terminal, is not available.
-    fn calls_at_a_terminal(shell: Shell, term: &str) -> Option<String> {
+    /// with a background check due, read once they are `expected`, or ten
+    /// seconds on; `None` where zsh's `zpty`, which supplies the terminal, is
+    /// not available.
+    fn calls_at_a_terminal(shell: Shell, term: &str, expected: &str) -> Option<String> {
         let zsh = crate::shell::testing::installed("zsh")?;
         let rig = Rig::new(shell);
         rig.stamp("check-due", "1\n");
@@ -1196,14 +1205,15 @@ mod tests {
             return None;
         }
         assert!(output.status.success(), "{output:?}");
-        Some(std::fs::read_to_string(rig.home.path().join("calls")).unwrap_or_default())
+        Some(rig.calls_once(|calls| calls == expected))
     }
 
     #[test]
     fn a_dumb_terminal_is_never_asked() {
         for shell in shells() {
             // Per shell: a missing terminal for one must not skip the other.
-            let Some(at_a_terminal) = calls_at_a_terminal(shell, "xterm") else {
+            let Some(at_a_terminal) = calls_at_a_terminal(shell, "xterm", "update --background\n")
+            else {
                 crate::testing::skip_unconstructible(&format!(
                     "{shell:?}: no zsh with its zpty module to supply a terminal"
                 ));
@@ -1214,7 +1224,7 @@ mod tests {
                 "{shell:?}: the terminal is one the hook acts at"
             );
             assert_eq!(
-                calls_at_a_terminal(shell, "dumb").as_deref(),
+                calls_at_a_terminal(shell, "dumb", "").as_deref(),
                 Some(""),
                 "{shell:?}"
             );

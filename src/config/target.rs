@@ -42,8 +42,8 @@
 //! config loads. Where the condition does not hold the target is not declared
 //! on this machine: it replaces no earlier layer's target for the same file,
 //! and a later toggle naming it flips nothing. A file it wrote on this machine
-//! before is reported as no longer declared, exactly as with
-//! `enabled = false`, and `bx rm` puts the prior bytes back. A tree's `when`
+//! before is taken back by the next `apply`, exactly as with
+//! `enabled = false`. A tree's `when`
 //! gates every file it expands to. See [`super::layers::gate`].
 //!
 //! A target under a directory only one OS reads — `~/.config/systemd/user`

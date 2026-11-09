@@ -1476,7 +1476,7 @@ fn a_link_is_pending_until_its_clone_then_each_child_is_linked_and_converges() {
     // A commit fetched but not checked out yet is not read until the
     // checkout moves to it: the link waits for its external, and then a
     // child the commit adds is linked, and one it drops is left as bx
-    // made it, for `bx rm` to release.
+    // made it until the next apply takes it back.
     std::fs::remove_dir_all(home.child("upstream/skills/a")).expect("drop a");
     let next = commit_upstream(&home, &["skills/d/SKILL.md"]);
     git_run(

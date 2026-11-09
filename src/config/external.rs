@@ -95,8 +95,8 @@
 //!
 //! `http://`, `git://`, `file://`, a local path and git's `ext::` transport are
 //! refused: the first two are unauthenticated, and the rest reach the machine
-//! the clone runs on rather than a remote. A host that begins with `-` is
-//! refused too, since `git` and `ssh` would read it as an option.
+//! the clone runs on rather than a remote. A host or user that begins with `-`
+//! is refused too, since `git` and `ssh` would read it as an option.
 //!
 //! # `rev`
 //!
@@ -629,8 +629,14 @@ pub(crate) fn unusable_url(url: &str) -> Option<String> {
     if host.is_empty() || host.starts_with(':') {
         return refuse("names no host");
     }
-    if host.starts_with('-') || authority.starts_with('-') {
+    if host.starts_with('-') {
         return refuse("begins its host with `-`, which git and ssh would read as an option");
+    }
+    // The host does not open with `-`, so an authority that does opens with
+    // its user. git hands ssh the authority as one argument, so it is refused
+    // all the same, naming the part that is wrong.
+    if authority.starts_with('-') {
+        return refuse("begins its user with `-`, which git and ssh would read as an option");
     }
     if rest.trim_matches('/').is_empty() {
         return refuse("names no repository on its host");
@@ -1038,11 +1044,14 @@ mod tests {
             ("https://github.com", "no repository"),
             ("https://github.com/", "no repository"),
             ("github.com:", "no repository"),
-            ("-oProxyCommand=x:a", "option"),
-            ("ssh://-oProxyCommand=x/a", "option"),
-            // A `-` opening the host after a user, or opening the user alone.
-            ("git@-oProxyCommand=x:a", "option"),
-            ("-u@github.com:o/a", "option"),
+            ("-oProxyCommand=x:a", "begins its host with `-`"),
+            ("ssh://-oProxyCommand=x/a", "begins its host with `-`"),
+            // A `-` opening the host after a user names the host; one opening
+            // the user alone names the user, since the host is sound.
+            ("git@-oProxyCommand=x:a", "begins its host with `-`"),
+            ("-u@-h:o/a", "begins its host with `-`"),
+            ("-u@github.com:o/a", "begins its user with `-`"),
+            ("ssh://-u@github.com/o/a", "begins its user with `-`"),
             ("https://h/{{x}}", "placeholder"),
             ("https://h/o/a\t", "whitespace"),
         ] {

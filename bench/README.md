@@ -54,13 +54,23 @@ generated files have read 1.70 ms on one macOS runner and 5.12 ms on another.
 A real regression is over budget in both readings, or beyond the noise in the
 first; one slow spell is rarely either.
 
-**`spawns`** — invariant 6 says the startup path spawns no process, and the
-bench holds it twice. Read: the lines of those files, comments aside, that hold
-a command substitution, which covers branches this home never takes; it counts
-the hand-written rc files' four as well, so a pattern that finds nothing is
-known to work. Traced: the shell runs bx's lines alone — the regions, cut out
-of the rc files, in the bx home — and the processes it started are counted,
-each way 0 exactly when bx's files started nothing, whatever else the machine
+**`spawns`** — invariant 6 says the lines bx generates for the startup path
+spawn no process, and the bench holds it twice. Its one exception is a tool's
+cached activation output, which bx sources as the tool printed it: the stub
+starship ends its output as the real one does, with
+`PROMPT2="$(starship prompt --continuation)"` (`PS2` for bash), so every start
+spawns the stub once and the overhead above counts it. bx caches each output
+verbatim as one single-quoted `eval` under a `# bx activation: NAME` line, and
+following that quoting splits bx's own lines from the tools'. Read: bx's own
+lines, comments aside, must hold no command substitution, which covers
+branches this home never takes, and the cached output must hold exactly as
+many as the stub tools print themselves, so a substitution bx added inside it
+fails too; it counts the hand-written rc files' four as well, so a pattern that
+finds nothing is known to work. Traced: the shell runs bx's lines alone — the
+regions, cut out of the rc files, in the bx home, sourcing copies of bx's
+generated files with the cached output split out — and the processes it
+started are counted,
+each way 0 exactly when bx's own lines started nothing, whatever else the machine
 is doing. On Linux, once they are done and it has waited, the shell reads its
 own `/proc/$$/stat` with builtins: a shell carries the page faults of every
 child it waited for in that file's `cminflt`, and no process runs without
@@ -69,9 +79,11 @@ child page faults, a small Python tracer starts the shell and counts its forks
 through a kqueue `NOTE_FORK` filter it registers before the shell's first
 line runs; every command and subshell a shell starts begins as a fork. The
 hand-written rc files' activation lines, traced the same way, must read
-above 0. **Gated**: any is a failure.
+above 0, and so must bx's regions traced with the cached output left in, so
+the spawn the tools' output makes is known to be measured. **Gated**: any
+spawn from bx's own lines is a failure.
 
-**`reads`** — invariant 6 says the startup path parses no configuration file.
+**`reads`** — invariant 6 says bx's startup lines parse no configuration file.
 Every file under the bx home's `~/.config` and `~/.local/state` — bx's config
 repo, its `local.toml` and state, and the tool configs it delivered — has its
 access time set into the past, and each shell's traced start must leave all
@@ -98,7 +110,9 @@ arbitrary.
 - **Stub tools.** `stubs/` stands in for starship, zoxide, mise and fzf,
   emitting init blocks of representative size. The measurement does not depend
   on which tools happen to be installed, and the fork-and-exec cost that
-  `eval "$(…)"` pays is real.
+  `eval "$(…)"` pays is real. The starship stub also emits the spawn the
+  real starship's output makes at every start, so the cached path pays it
+  too.
 - **The stub output is real shell**, not comments, so the shell genuinely
   parses it; and it is shell zsh and bash both run cleanly, since the example
   activates each tool for both.

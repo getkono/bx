@@ -1,8 +1,10 @@
 # Tool integrations: activations, plugins and optional sources.
 
 # Each activation runs once when `bx plan` does, is trusted when two runs
-# agree, and is cached; a shell start sources the cached text and spawns
-# nothing. `{shell}` gives each shell its own command.
+# agree, and is cached; a shell start sources the cached text instead of
+# running the tool. The text is sourced as the tool printed it, so a process
+# it starts itself, as starship's continuation prompt does, still starts.
+# `{shell}` gives each shell its own command.
 [[activation]]
 name    = "mise"
 command = ["mise", "activate", "{shell}"]

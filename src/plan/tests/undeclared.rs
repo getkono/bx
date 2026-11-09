@@ -65,25 +65,106 @@ fn a_target_switched_off_is_reported_the_same_way() {
 }
 
 #[test]
-fn an_edited_file_is_a_conflict_that_still_names_bx_rm() {
+fn an_edited_file_is_announced_as_released_and_apply_keeps_it_and_forgets_it() {
     let home = guarded_home();
     let inputs = dropped(&home);
     std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    let a = Portable::parse_in("~/.a", home.path()).expect("a path");
+    let b = Portable::parse_in("~/.b", home.path()).expect("a path");
+
+    let report = plan(&inputs);
+    assert_eq!(report.actions(), vec![Action::Unchanged, Action::Release]);
+    assert_eq!(report.changes[1].target, "~/.a");
+    assert_eq!(report.changes[1].diff, None);
+    assert_eq!(
+        report.changes[1].note.as_deref(),
+        Some(
+            "edited since bx last wrote it; the configuration no longer declares it, so the \
+             edits are yours: bx keeps the file as it is and stops managing it"
+        )
+    );
+    // Pending work, announced before `apply` does it.
+    assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
+    assert!(ledger(&home).get(&a).is_some(), "plan forgets nothing");
+
+    // Everything but the state directory, whose ledger is what changes.
+    let before = snapshot(home.path(), &[".local/state/bx"]);
+    let applied = apply(&inputs);
+    assert!(applied.executed);
+    assert_eq!(applied.changes, report.changes, "apply does what plan said");
+    assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+    assert_eq!(
+        snapshot(home.path(), &[".local/state/bx"]),
+        before,
+        "not a byte of the home written"
+    );
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+    assert!(ledger(&home).get(&a).is_none(), "its entry is gone");
+    assert!(ledger(&home).get(&b).is_some(), "the rest stay");
+
+    let again = plan(&inputs);
+    assert_eq!(again.actions(), vec![Action::Unchanged]);
+    assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+}
+
+#[test]
+fn a_declined_apply_forgets_nothing() {
+    let home = guarded_home();
+    let inputs = dropped(&home);
+    std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    let owned = ledger(&home);
+
+    let declined = run(&inputs, Mode::Apply, &mut |_| Ok(false)).expect("apply");
+    assert!(!declined.executed);
+    assert_eq!(declined.actions(), vec![Action::Unchanged, Action::Release]);
+    assert_eq!(ledger(&home), owned);
+}
+
+#[test]
+fn a_release_is_made_beside_the_writes_in_one_session() {
+    let home = guarded_home();
+    dropped(&home);
+    std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    std::fs::write(home.child(".b"), "drift\n").expect("a declared change");
+    // `~/.b` was edited too, but it is still declared: a conflict, never a
+    // release. A new target is written in the same session as `~/.a` goes.
+    let more = format!("{}{}", inline("~/.b", "b\\n"), inline("~/.c", "c\\n"));
+    let inputs = inputs(&home, &more);
+
+    let applied = apply(&inputs);
+    assert_eq!(
+        applied.actions(),
+        vec![Action::Conflict, Action::Create, Action::Release]
+    );
+    assert!(applied.executed);
+    assert_eq!(exit(&applied, Mode::Apply), Exit::Pending, "the conflict");
+    assert_eq!(std::fs::read(home.child(".c")).expect("made"), b"c\n");
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+    assert_eq!(std::fs::read(home.child(".b")).expect("kept"), b"drift\n");
+    let a = Portable::parse_in("~/.a", home.path()).expect("a path");
+    let b = Portable::parse_in("~/.b", home.path()).expect("a path");
+    assert!(ledger(&home).get(&a).is_none());
+    assert!(
+        ledger(&home).get(&b).is_some(),
+        "a conflict forgets nothing"
+    );
+}
+
+#[test]
+fn a_file_whose_mode_alone_changed_is_still_a_conflict_bx_rm_releases() {
+    let home = guarded_home();
+    let inputs = dropped(&home);
+    std::fs::set_permissions(
+        home.child(".a"),
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o600),
+    )
+    .expect("chmod");
 
     let report = plan(&inputs);
     assert_eq!(report.actions(), vec![Action::Unchanged, Action::Conflict]);
     let note = report.changes[1].note.as_deref().expect("a note");
-    // `bx rm` refuses to restore over an edit, so the note does not
-    // promise that it releases the file.
-    assert_eq!(
-        note,
-        "edited since bx last wrote it; the configuration no longer declares it, so bx \
-                 leaves it as it is, and `bx rm ~/.a` will not restore over the change"
-    );
-    assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
-
+    assert!(note.ends_with("`bx rm ~/.a` releases it"), "{note}");
     assert!(!apply(&inputs).executed);
-    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
 }
 
 #[test]

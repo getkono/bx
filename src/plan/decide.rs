@@ -400,7 +400,12 @@ pub(super) fn decide(
         Action::Conflict => observed.kind == Kind::File,
         // Only a tracked target is carried into the repo, and it is decided
         // by `decide_track`.
-        Action::Unchanged | Action::Sync | Action::Undeclared | Action::Blocked => false,
+        // A declared target is never released: only an undeclared one is.
+        Action::Unchanged
+        | Action::Sync
+        | Action::Undeclared
+        | Action::Release
+        | Action::Blocked => false,
     };
     // A secret's plaintext, and whatever is on disk where it goes, are never
     // shown: the plan is printed, piped and pasted.

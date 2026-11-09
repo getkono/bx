@@ -5,11 +5,12 @@
 //! action can *be* a contract rather than a rendering detail, so it lives here
 //! with its symbols and its exit codes.
 //!
-//! Note what is missing: there is no "destroy". bx is additive-only, so nothing
-//! it plans can remove a user's file. The slot a declarative tool would spend on
-//! destruction is spent instead on [`Action::Conflict`] — the case that actually
-//! matters for a non-invasive tool, where something bx does not own is in the
-//! way.
+//! Note what is missing: there is no "destroy". Nothing bx plans can remove or
+//! rewrite a byte the user wrote. [`Action::Undo`] takes back only what the
+//! ledger proves bx left and nobody changed since, exactly as `bx rm` would,
+//! and the case that actually matters for a non-invasive tool — something bx
+//! does not own, or bytes the user changed, in the way — is
+//! [`Action::Conflict`].
 //!
 //! `escape` is here too: `plan`'s rendering, `apply`'s stopped rows and
 //! `doctor`'s findings all spell out the control characters in a path, a note
@@ -26,28 +27,38 @@ use std::fmt;
 pub enum Action {
     /// Already converged. Hidden unless the user asks for detail.
     Unchanged,
-    /// bx wrote this file, the ledger still owns it, and no enabled target
-    /// declares it any more: its `[[target]]` was deleted or switched off, or
-    /// the repo file a `tree` mirrored was removed.
+    /// bx wrote this file, the ledger still owns it, nothing declares it any
+    /// more, and `apply` will not take it back: the configuration declares
+    /// nothing at all, which is what one that was emptied by accident looks
+    /// like; it cannot be looked at; or it is a checkout holding work.
     ///
-    /// Reported and left alone. Nothing is written and nothing is deleted —
-    /// bx is additive-only — so the row names `bx rm` as the way to release
-    /// the file, and it stays until the user runs it. Not pending work and not
-    /// a decision bx is waiting on, so `apply` twice still converges. A file
-    /// that has drifted from what bx wrote is [`Action::Release`] when its
-    /// bytes were edited, and otherwise reported as a [`Action::Conflict`],
-    /// as drift is for a declared target.
+    /// Reported and left alone, naming `bx rm` as the way to release it. Not
+    /// pending work and not a decision bx is waiting on, so `apply` twice
+    /// still converges. An undeclared file still as bx left it is otherwise
+    /// [`Action::Undo`]; one whose bytes were edited is [`Action::Release`];
+    /// and any other drift is a [`Action::Conflict`], as drift is for a
+    /// declared target.
     Undeclared,
     /// The target does not exist and will be created.
     Create,
     /// bx owns the target and its content differs; it will be updated.
     Modify,
-    /// bx wrote this file, nothing declares it any more, and it has been
-    /// edited since: it is the user's now. `apply` keeps it byte for byte and
-    /// drops its ledger entry, so bx stops managing it; nothing is written
-    /// and nothing is deleted. Pending work, since the ledger changes, and
-    /// never a decision bx waits on: with no declaration left, keeping the
-    /// edits is the only outcome that writes over nothing.
+    /// bx wrote this file, nothing declares it any more — its `[[target]]`
+    /// was deleted, switched off or gated off here, or the repo file a `tree`
+    /// mirrored was removed — and what is on disk is still what bx left.
+    /// `apply` takes it back exactly as `bx rm` would: a file bx created is
+    /// removed with the directories it created for it, one it replaced gets
+    /// its earlier bytes and mode back, a link is unlinked, and a checkout
+    /// that holds nothing but what its remote has is removed. Journalled like
+    /// any write, and pending work until it is done.
+    Undo,
+    /// bx wrote this file, nothing declares it any more, and there is nothing
+    /// to take back without writing over something: it has been edited since,
+    /// so it is the user's now, or it already is what bx would put back. `apply`
+    /// keeps it byte for byte and drops its ledger entry, so bx stops managing
+    /// it; nothing is written and nothing is deleted. Pending work, since the
+    /// ledger changes, and never a decision bx waits on: with no declaration
+    /// left, keeping the edits is the only outcome that writes over nothing.
     Release,
     /// A tracked target this machine changed: `bx sync` carries the machine's
     /// copy into the config repo and commits it. Not `apply`'s work, so it is
@@ -96,6 +107,7 @@ impl Action {
             Self::Undeclared => '*',
             Self::Create => '+',
             Self::Modify => '~',
+            Self::Undo => '-',
             Self::Release => '^',
             Self::Sync => '<',
             Self::Conflict => '!',
@@ -111,7 +123,10 @@ impl Action {
     /// "changes waiting" forever.
     #[must_use]
     pub const fn is_pending(self) -> bool {
-        matches!(self, Self::Create | Self::Modify | Self::Release)
+        matches!(
+            self,
+            Self::Create | Self::Modify | Self::Undo | Self::Release
+        )
     }
 
     /// Whether this action needs the user to do something before bx can
@@ -129,6 +144,7 @@ impl fmt::Display for Action {
             Self::Undeclared => "undeclared",
             Self::Create => "create",
             Self::Modify => "modify",
+            Self::Undo => "undo",
             Self::Release => "release",
             Self::Sync => "sync",
             Self::Conflict => "conflict",
@@ -183,16 +199,20 @@ impl Exit {
 
 /// A one-line tally, rendered as the last line of `plan`.
 ///
-/// [`Action::Undeclared`], [`Action::Release`], and tracked targets waiting
-/// for `bx sync`, are each counted only when there is one, so a configuration
-/// with nothing undeclared or edited past its declaration that tracks nothing
-/// prints the line it always printed.
+/// [`Action::Undeclared`], [`Action::Undo`], [`Action::Release`], and tracked
+/// targets waiting for `bx sync`, are each counted only when there is one, so
+/// a configuration that has dropped no declaration and tracks nothing prints
+/// the line it always printed.
 #[must_use]
 pub fn summary(actions: &[Action]) -> String {
     let count = |want: Action| actions.iter().filter(|a| **a == want).count();
     let undeclared = match count(Action::Undeclared) {
         0 => String::new(),
         n => format!(" {n} undeclared,"),
+    };
+    let undo = match count(Action::Undo) {
+        0 => String::new(),
+        n => format!(", {n} to undo"),
     };
     let release = match count(Action::Release) {
         0 => String::new(),
@@ -203,7 +223,7 @@ pub fn summary(actions: &[Action]) -> String {
         n => format!(", {n} to sync"),
     };
     format!(
-        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged{release}{sync}.",
+        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged{undo}{release}{sync}.",
         count(Action::Create),
         count(Action::Modify),
         count(Action::Conflict),
@@ -285,9 +305,9 @@ mod tests {
     /// not converged and someone has to look, which is what a non-zero exit
     /// is for.
     ///
-    /// A file released is pending work: `apply` drops its ledger entry, so
-    /// `plan` exits non-zero until it has.
-    const ACTIONS: [(Action, char, &str, bool, bool, Exit); 8] = [
+    /// A file undone or released is pending work: `apply` removes or restores
+    /// it, or drops its ledger entry, so `plan` exits non-zero until it has.
+    const ACTIONS: [(Action, char, &str, bool, bool, Exit); 9] = [
         (
             Action::Unchanged,
             '=',
@@ -306,6 +326,7 @@ mod tests {
         ),
         (Action::Create, '+', "create", true, false, Exit::Pending),
         (Action::Modify, '~', "modify", true, false, Exit::Pending),
+        (Action::Undo, '-', "undo", true, false, Exit::Pending),
         (Action::Release, '^', "release", true, false, Exit::Pending),
         (Action::Sync, '<', "sync", false, false, Exit::Converged),
         (
@@ -351,6 +372,7 @@ mod tests {
             Action::Conflict,
             Action::Undeclared,
             Action::Release,
+            Action::Undo,
             Action::Modify,
         ];
         actions.sort_unstable();
@@ -414,6 +436,20 @@ mod tests {
             summary(&[Action::Release, Action::Sync, Action::Unchanged]),
             "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 1 to release, \
              1 to sync."
+        );
+    }
+
+    #[test]
+    fn a_file_to_undo_is_counted_only_when_there_is_one() {
+        assert_eq!(
+            summary(&[
+                Action::Undo,
+                Action::Undo,
+                Action::Release,
+                Action::Unchanged
+            ]),
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 2 to undo, \
+             1 to release."
         );
     }
 

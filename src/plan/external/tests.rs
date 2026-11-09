@@ -672,6 +672,45 @@ fn a_path_that_appears_after_plan_is_not_cloned_into() {
 }
 
 #[test]
+fn a_checkout_that_takes_on_work_after_plan_is_stopped_at_its_own_row() {
+    use crate::plan::tests::inline;
+
+    let home = guarded_home();
+    let up = upstream(&home);
+    let kept = inline("~/.b", "b\\n");
+    apply(
+        &home,
+        &format!("{}{kept}{}", inline("~/.a", "a\\n"), layer(&up.first)),
+    );
+    assert!(home.child(AT).join(".git").is_dir(), "cloned");
+    // A declared row first, and an undeclared file before the checkout,
+    // so the checkout's row is neither the first row nor the first undone.
+    assert_eq!(
+        rows(&plan(&home, &kept)),
+        [
+            ("~/.b".to_string(), Action::Unchanged),
+            ("~/.a".to_string(), Action::Undo),
+            (format!("~/{AT}"), Action::Undo),
+        ]
+    );
+
+    let applied = apply_after(&home, &kept, || {
+        std::fs::write(home.child(AT).join("mine"), "mine\n").expect("the user's file");
+    });
+    assert_eq!(stopped(&applied), [format!("~/{AT}").as_str()]);
+    let row = row(&applied, &format!("~/{AT}"));
+    assert_eq!(row.action, Action::Blocked);
+    let note = row.note.as_deref().expect("a note");
+    assert!(note.contains("untracked files"), "{note}");
+    assert!(!home.child(".a").exists(), "the file is still taken back");
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("mine")).expect("the user's file"),
+        "mine\n"
+    );
+    assert!(entry(&home).is_some(), "the checkout is still bx's");
+}
+
+#[test]
 fn a_parent_that_cannot_be_made_at_apply_stops_the_clone_and_records_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1476,7 +1515,7 @@ fn a_link_is_pending_until_its_clone_then_each_child_is_linked_and_converges() {
     // A commit fetched but not checked out yet is not read until the
     // checkout moves to it: the link waits for its external, and then a
     // child the commit adds is linked, and one it drops is left as bx
-    // made it, for `bx rm` to release.
+    // made it until the next apply takes it back.
     std::fs::remove_dir_all(home.child("upstream/skills/a")).expect("drop a");
     let next = commit_upstream(&home, &["skills/d/SKILL.md"]);
     git_run(
@@ -1500,15 +1539,25 @@ fn a_link_is_pending_until_its_clone_then_each_child_is_linked_and_converges() {
     assert!(home.child(".claude/skills/d/SKILL.md").is_file());
     assert!(
         std::fs::symlink_metadata(home.child(".claude/skills/a")).is_ok(),
-        "left as bx made it"
+        "left as bx made it until the next apply"
     );
     assert_eq!(
         rows(&plan(&home, &layer))
             .into_iter()
             .filter(|(_, action)| *action != Action::Unchanged)
             .collect::<Vec<_>>(),
-        [("~/.claude/skills/a".to_string(), Action::Undeclared)],
+        [("~/.claude/skills/a".to_string(), Action::Undo)],
         "what nothing declares any more"
+    );
+    apply(&home, &layer);
+    assert!(
+        std::fs::symlink_metadata(home.child(".claude/skills/a")).is_err(),
+        "the link upstream dropped is removed"
+    );
+    assert!(
+        rows(&plan(&home, &layer))
+            .iter()
+            .all(|(_, action)| *action == Action::Unchanged)
     );
 }
 

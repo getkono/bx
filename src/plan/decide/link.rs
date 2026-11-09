@@ -85,6 +85,7 @@ pub(super) fn decide_link(
         | Action::Unchanged
         | Action::Sync
         | Action::Undeclared
+        | Action::Undo
         | Action::Release
         | Action::Blocked => None,
     };

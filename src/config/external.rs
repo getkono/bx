@@ -28,8 +28,8 @@
 //! (`has:TOOL`, `os:OS`, `arch:ARCH`, `host:NAME`, `user:NAME`,
 //! `distro:ID`; see [`super::when`]). Where it does not hold the external is
 //! not declared on this machine: it is not checked out, its links are not
-//! made, and a checkout bx made here before is reported for `bx rm`, as an
-//! `enabled = false` one is. `bx.lock` is shared by every machine, so a
+//! made, and a checkout bx made here before is taken back by the next
+//! `apply`, as an `enabled = false` one is, unless it holds work. `bx.lock` is shared by every machine, so a
 //! committed follow keeps its commit there even when `bx update` runs on a
 //! machine its `when` leaves it off. A test
 //! only the shell could run is refused when the config loads

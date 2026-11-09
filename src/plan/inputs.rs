@@ -213,6 +213,19 @@ impl Inputs {
         &self.state
     }
 
+    /// Whether the configuration declares anything on this machine: a target,
+    /// an external or an activation, enabled and kept here.
+    ///
+    /// One that declares nothing — an empty or truncated `bx.toml` is what that
+    /// looks like — takes back nothing bx wrote: every file it no longer
+    /// declares is reported for `bx rm` instead.
+    #[must_use]
+    pub fn declares_any(&self) -> bool {
+        !(self.declared.is_empty()
+            && self.resolved.externals.is_empty()
+            && self.activations.is_empty())
+    }
+
     /// Every enabled target, ready or held back, in configuration order — the
     /// list `plan` decides, for a read-only command that looks at the same
     /// targets without deciding them.
@@ -293,7 +306,6 @@ mod tests {
     #[test]
     fn a_gated_target_and_module_come_and_go_with_the_machine_the_inputs_carry() {
         use crate::config::when::Distro;
-        use crate::paths::Portable;
         use crate::plan::tests::{apply, inline, plan};
         use crate::report::Action;
 
@@ -370,23 +382,18 @@ mod tests {
         assert_eq!(std::fs::read(home.child(".boxed")).expect("kept"), written);
 
         // Off macOS the module's target is no longer declared, exactly as an
-        // `enabled = false` one is, and nothing is written for it.
+        // `enabled = false` one is, and apply takes it back as `bx rm`
+        // would: it puts back what was there before, nothing.
         let linux = on("linux", "box");
         assert_eq!(declared(&linux), ["~/.boxed"]);
         assert_eq!(
             rows(&linux),
             [
                 ("~/.boxed".to_string(), Action::Unchanged),
-                ("~/.mac".to_string(), Action::Undeclared),
+                ("~/.mac".to_string(), Action::Undo),
             ]
         );
-        assert!(!apply(&linux).executed);
-        assert!(home.child(".mac").exists());
-
-        // `bx rm` then puts back what was there before: nothing.
-        let state = StateDir::resolve(home.path());
-        let mac = Portable::parse_in("~/.mac", home.path()).expect("a portable path");
-        crate::restore::restore(&state, home.path(), &[mac]).expect("rm");
+        assert!(apply(&linux).executed);
         assert!(!home.child(".mac").exists());
         assert_eq!(rows(&linux), [("~/.boxed".to_string(), Action::Unchanged)]);
         assert_eq!(

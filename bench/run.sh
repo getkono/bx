@@ -2,8 +2,8 @@
 # Measure what bx's generated startup files cost zsh and bash, against their
 # budget, and trace that bx's own startup lines start no process and read no
 # configuration; a tool's cached activation output starts what it would under
-# `eval "$(tool init)"`, and the budget counts it on Linux (macOS leaves it
-# out, pending issue #363).
+# `eval "$(tool init)"`: the budget counts it on Linux, and on macOS the bench
+# runs it, reports its cost apart, and gates bx's own share.
 #
 # bx is on every shell start, so "fast enough to forget" is a product
 # requirement, and a requirement that is not measured is a requirement that
@@ -23,7 +23,11 @@
 #             generated files cost, cached activations included. Gated at
 #             BX_BUDGET_MS (default 5), reported with the noise it is read
 #             through, and measured again before failing when it is over
-#             budget by less than that noise.
+#             budget by less than that noise. On macOS the fixture it gates
+#             answers the stub starship's continuation prompt without its
+#             spawn, so it reads bx's own share.
+#   spawn     on macOS, bx's home with that spawn vs without it. Reported,
+#             never gated: the spawn is the tool's, not bx's.
 #   net       a hand-written `eval "$(tool init)"` rc file vs bx's. Reported,
 #             never gated: it depends on which tools are integrated, so a
 #             threshold would be arbitrary.
@@ -33,7 +37,7 @@
 # under the configuration and state directories they read. A tool's cached
 # activation output is the one exception: what it starts, as starship's
 # continuation prompt does, it starts as it would under `eval "$(tool init)"`,
-# and the overhead counts it, on Linux; macOS leaves it out (issue #363).
+# and the overhead counts it on Linux; on macOS the spawn line reports it.
 #
 # Environment:
 #   BX_BIN        the bx binary to apply with (default: target/release/bx,
@@ -109,24 +113,26 @@ WORK="$(mktemp -d)"
 trap "rm -rf '$WORK'" EXIT INT TERM
 # starship is a native program, and its cached output starts it at every start,
 # so the stub that answers that spawn is native too, ahead of `stubs/` on PATH;
-# see stubs/starship.c. The C compiler that links bx builds it. On macOS one
-# fork and exec of any program costs about 3 ms, which with the stub tools'
-# init text leaves no 5 ms budget to count it in, so there the stub is not
-# built and the shell stub emits no spawn: the macOS gate measures what it
-# did before the spawn was counted, until issue #363 settles how it is budgeted
-# there.
+# see stubs/starship.c. The C compiler that links bx builds it.
+#
+# Every start runs that spawn, on every system. On macOS one fork and exec of
+# any program costs about 3 ms, which with the stub tools' init text leaves no
+# 5 ms budget to count it in, and the spawn is the tool's, not bx's. So there
+# the gate reads bx's own share: `own`, a copy of the bx home whose cached
+# starship output answers the continuation prompt without the spawn. The
+# spawn's cost, `bx` against `own`, is reported apart. Linux counts it in the
+# gate.
 mkdir -p "${WORK}/bin"
-SPAWN=counted
-[ "$(uname -s)" != Darwin ] || SPAWN=uncounted
-case "$SPAWN" in
-counted)
-	cc -O2 -DBX_BENCH_STARSHIP="\"${BENCH_DIR}/stubs/starship\"" \
-		-o "${WORK}/bin/starship" "${BENCH_DIR}/stubs/starship.c" || {
-		echo "error: cc could not build the native starship stub." >&2
-		exit 1
-	}
-	;;
-uncounted) echo "Leaving out the stub starship's continuation spawn on macOS (issue #363)." ;;
+cc -O2 -DBX_BENCH_STARSHIP="\"${BENCH_DIR}/stubs/starship\"" \
+	-o "${WORK}/bin/starship" "${BENCH_DIR}/stubs/starship.c" || {
+	echo "error: cc could not build the native starship stub." >&2
+	exit 1
+}
+GATED=bx # the fixture the overhead gate reads against the baseline
+[ "$(uname -s)" != Darwin ] || GATED=own
+case "$GATED" in
+bx) echo "Counting the stub starship's continuation spawn in the overhead." ;;
+own) echo "Gating bx's own share; the stub starship's continuation spawn is reported apart." ;;
 esac
 SEARCH="${WORK}/bin:${BENCH_DIR}/stubs:/usr/local/bin:/usr/bin:/bin"
 
@@ -221,8 +227,8 @@ startup() { # startup <shell> <fixture>: the command that starts it, as one line
 #
 # The one exception is a tool's cached activation output: bx sources it as the
 # tool printed it, so a substitution the tool emitted runs at every start, as
-# it would under `eval "$(tool init)"`, and the overhead above counts it (on
-# Linux; macOS leaves it out, issue #363). bx caches that output verbatim, as
+# it would under `eval "$(tool init)"`, and the overhead below counts it (on
+# Linux; macOS reports it apart). bx caches that output verbatim, as
 # one single-quoted `eval` under a `# bx activation: NAME` line, so following
 # that quoting splits bx's own lines from the tools'. bx's own must hold no
 # substitution, and the cached output must hold exactly the ones the tools
@@ -285,7 +291,7 @@ for sh in $SHELLS; do
 		echo "error: the spawn count found ${legacy} of the hand-written ${sh}rc's 4." >&2
 		exit 1
 	}
-	[ "$SPAWN" = uncounted ] || [ "$tools" -gt 0 ] || {
+	[ "$tools" -gt 0 ] || {
 		echo "error: no stub's ${sh} output starts a process, as starship's does;" >&2
 		echo "       the bench would not measure what a real start costs." >&2
 		exit 1
@@ -314,8 +320,7 @@ done
 # The tools' cached output is the exception the read check above attributes,
 # and the trace attributes it the same way. `cached` runs the regions as bx
 # wrote them, so it starts what the stub starship's output starts, and must
-# read above 0 wherever the spawn is counted: the bench measures that spawn
-# rather than missing it. `bx`
+# read above 0: the bench measures that spawn rather than missing it. `bx`
 # runs the same regions sourcing copies of bx's generated files with every
 # cached activation split out, so it runs bx's own lines alone, and must read
 # 0.
@@ -414,7 +419,7 @@ for sh in $SHELLS; do
 		exit 1
 	}
 	cached="$(spawned "$sh" cached)"
-	[ "$SPAWN" = uncounted ] || [ "${cached:-0}" -gt 0 ] || {
+	[ "${cached:-0}" -gt 0 ] || {
 		echo "error: the ${sh} trace saw no process start from the cached activations," >&2
 		echo "       as the stub starship's output starts one; the bench would not measure it." >&2
 		exit 1
@@ -487,6 +492,27 @@ run() { # run <name> <shell> <warmup> <count> <fixture>...: one hyperfine, in th
 		--export-json '${RESULTS}/${name}-${sh}.json' ${cmds}" >/dev/null
 }
 
+# bx's own share, which the macOS gate reads: the bx home as bx left it, but
+# with the cached starship output's continuation prompt set to the text the
+# stub would print instead of to a substitution that starts it. Only the
+# bench's copy changes; bx's own files are measured as bx wrote them, and the
+# spawn's cost is the difference between the two homes.
+if [ "$GATED" = own ]; then
+	cp -R "${WORK}/bx" "${WORK}/own"
+	for f in "${WORK}/own/.local/share/bx/"*; do
+		# shellcheck disable=SC2016 # the pattern is literal on purpose.
+		sed 's/\$([^)]*prompt --continuation)/> /' "$f" >"${WORK}/own.tmp"
+		cat "${WORK}/own.tmp" >"$f"
+	done
+	left="$(split cached "${WORK}/own/".zshenv "${WORK}/own/".zshrc "${WORK}/own/".bashrc \
+		"${WORK}/own/.local/share/bx/"* | count)"
+	[ "$left" -eq 0 ] || {
+		echo "error: bx's home without the starship spawn still holds ${left} cached line(s)" >&2
+		echo "       that start a process; the spawn's cost would not be set apart." >&2
+		exit 1
+	}
+fi
+
 # The overhead is a difference of two fixtures, and hyperfine times each
 # fixture's runs as one block, so whatever the machine is doing while one block
 # runs and not the other lands in the difference: a shared CI runner moves the
@@ -502,18 +528,23 @@ measure() { # measure <shell> <name>: the overhead's rounds, as <name>-<round>
 	round=1
 	while [ "$round" -le "$ROUNDS" ]; do
 		case "$((round % 2))" in
-		1) run "${2}-${round}" "$1" 0 "--runs 1" baseline bx bx baseline ;;
-		0) run "${2}-${round}" "$1" 0 "--runs 1" bx baseline baseline bx ;;
+		1) run "${2}-${round}" "$1" 0 "--runs 1" baseline "$GATED" "$GATED" baseline ;;
+		0) run "${2}-${round}" "$1" 0 "--runs 1" "$GATED" baseline baseline "$GATED" ;;
 		esac
 		round=$((round + 1))
 	done
 }
 for sh in $SHELLS; do
 	prime "$sh" baseline legacy bx
+	[ "$GATED" = bx ] || prime "$sh" "$GATED"
 	echo "Measuring bx's generated ${sh} startup files (budget ${BUDGET_MS} ms)..."
 	measure "$sh" overhead
 	echo "Measuring net effect vs a hand-written ${sh}rc..."
 	run net "$sh" 5 "--min-runs ${RUNS}" legacy bx
+	[ "$GATED" = bx ] || {
+		echo "Measuring the stub starship's continuation spawn in ${sh}..."
+		run spawn "$sh" 5 "--min-runs ${RUNS}" "$GATED" bx
+	}
 done
 
 # The gate. A macOS runner's zsh baseline is 35-40 ms, so the same generated
@@ -525,7 +556,7 @@ done
 # fresh rounds, and fails only if the repeat is over budget too. The budget
 # itself never moves: a pass always reads an overhead under it.
 cat >"${WORK}/judge.py" <<'PY'
-import json, math, statistics, sys
+import json, math, os, statistics, sys
 
 results, budget, rounds = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
 name, again, shells = sys.argv[4], sys.argv[5], sys.argv[6:]
@@ -533,9 +564,12 @@ name, again, shells = sys.argv[4], sys.argv[5], sys.argv[6:]
 
 def order(name):
     # The order run.sh gave the fixtures in: odd rounds are baseline bx bx
-    # baseline, even rounds their mirror.
+    # baseline, even rounds their mirror. In the rounds, "bx" is the fixture
+    # the gate reads: on macOS, `own`, bx's home without the tool's spawn.
     if name == "net":
         return ["legacy", "bx"]
+    if name == "spawn":
+        return ["own", "bx"]
     if int(name.split("-")[1]) % 2:
         return ["baseline", "bx", "bx", "baseline"]
     return ["bx", "baseline", "baseline", "bx"]
@@ -583,6 +617,15 @@ def noise(each):
     return 2 * 1.2533 * spread / math.sqrt(2 * len(each))
 
 
+def info(line):
+    # Informative, never a verdict: blue, so it reads apart from the gate's
+    # own lines, and plain where NO_COLOR asks for no colour.
+    print(line if os.environ.get("NO_COLOR") else f"\033[34m{line}\033[0m")
+
+
+# On macOS the gate reads bx's home without the stub starship's continuation
+# spawn, and the spawn's cost, its home with it against without, is reported.
+spawned = os.path.exists(f"{results}/spawn-{shells[0]}.json")
 failed = []
 for shell in shells:
     each = [starts(f"{name}-{r}", shell) for r in range(1, rounds + 1)]
@@ -602,7 +645,8 @@ for shell in shells:
     print()
     print(f"  {shell}" + ("" if again else ", measured again"))
     print(f"  baseline   {baseline:7.2f} ms")
-    print(f"  + bx       {with_bx:7.2f} ms   after `bx apply` of the example")
+    print(f"  + bx       {with_bx:7.2f} ms   after `bx apply` of the example"
+          + (", without the tool's spawn" if spawned else ""))
     print(f"  overhead   {overhead:7.2f} ms   (budget {budget:.2f} ms; median of {rounds} rounds)")
     print(f"  noise      {spread:7.2f} ms   baseline vs baseline, at that median")
     if not again:
@@ -610,6 +654,10 @@ for shell in shells:
     net = medians("net", shell)
     print(f"  spawns     {0:7d}      processes bx's own startup lines started")
     print(f"  reads      {0:7d}      configuration files they read")
+    if spawned:
+        apart = medians("spawn", shell)
+        info(f"  spawn      {apart['bx'] - apart['own']:7.2f} ms   "
+             "the stub starship's continuation prompt; the tool's, not gated")
     print()
     print(f"  legacy     {net['legacy']:7.2f} ms   eval \"$(tool init)\" per tool")
     print(f"  bx         {net['bx']:7.2f} ms   the same tools, cached by bx")

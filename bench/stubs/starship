@@ -9,9 +9,7 @@
 # spawns nothing more of its own. The path is the starship PATH finds: the
 # bench puts the native starship.c there, which hands every other command to
 # this script, so a start pays for a native program as it does with the real
-# one, not for starting /bin/sh. Where the bench built no native stub, as on
-# macOS (issue #363), the line is left out: a spawn of this script would be
-# timing /bin/sh, not starship.
+# one, not for starting /bin/sh.
 set -eu
 case "${1-}" in
 prompt)
@@ -22,7 +20,6 @@ esac
 here="$(cd "$(dirname "$0")" && pwd)"
 self="$(command -v starship)" || self="${here}/starship"
 "${here}/gen.sh" starship 20
-[ "$self" != "${here}/starship" ] || exit 0
 case "${2-}" in
 bash) printf '%s\n' "PS2=\"\$('${self}' prompt --continuation)\"" ;;
 *) printf '%s\n' "PROMPT2=\"\$('${self}' prompt --continuation)\"" ;;

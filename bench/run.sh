@@ -1,6 +1,8 @@
 #!/bin/sh
 # Measure what bx's generated startup files cost zsh and bash, against their
-# budget, and trace that they start no process and read no configuration.
+# budget, and trace that bx's own startup lines start no process and read no
+# configuration; a tool's cached activation output starts what it would under
+# `eval "$(tool init)"`, and the budget counts it.
 #
 # bx is on every shell start, so "fast enough to forget" is a product
 # requirement, and a requirement that is not measured is a requirement that

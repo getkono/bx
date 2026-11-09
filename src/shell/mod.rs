@@ -106,8 +106,13 @@
 //! `starship init {shell}` — is run by [`activation::plan`] rather than at
 //! every shell start, once per shell it has a command for, trusted once two
 //! runs agree, and cached against the content of the tool's binary, so the
-//! `activations` and `completions` phases hold text and start no process.
-//! There is no form that runs a tool at shell start.
+//! `activations` and `completions` phases hold text, and bx's own lines in
+//! them start no process. There is no form that runs a tool's init at shell
+//! start. The cached output is invariant 6's one exception: it is sourced
+//! exactly as the tool printed it, so what it runs still runs at every start,
+//! as it would under `eval "$(tool init)"` (starship's
+//! `PROMPT2="$(starship prompt --continuation)"` starts starship once), and
+//! the 5 ms budget counts it.
 
 pub mod activation;
 pub mod alias;

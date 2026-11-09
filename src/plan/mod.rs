@@ -347,7 +347,7 @@ pub fn run(
                 for (dir, mode) in &decided.declared {
                     session.declare_dir(dir, *mode);
                 }
-                let progress = execute::progress(ops.len() + released.len(), inputs.progress);
+                let progress = execute::progress(execute::steps(&ops, &released), inputs.progress);
                 execute::execute(ops, &released, session, &progress)?;
             }
             if !clones.is_empty() {

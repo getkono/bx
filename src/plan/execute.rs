@@ -48,6 +48,12 @@ pub(super) fn execute(
     Ok(written)
 }
 
+/// How many steps [`execute`] takes over `ops` and `released`: one for each
+/// write and one for each file released, so its bar ends full.
+pub(super) fn steps(ops: &[Op], released: &[Portable]) -> usize {
+    ops.len() + released.len()
+}
+
 /// A progress bar over `len` writes, drawn on standard error only when it is a
 /// terminal.
 pub(super) fn progress(len: usize, visible: bool) -> ProgressBar {
@@ -141,6 +147,15 @@ mod tests {
         fn flush(&self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_file_released_is_a_step_of_its_own() {
+        let home = std::path::Path::new("/h");
+        let released = ["~/.a", "~/.b"].map(|raw| Portable::parse_in(raw, home).expect("portable"));
+        assert_eq!(steps(&[], &released), 2);
+        assert_eq!(steps(&[], &released[..1]), 1);
+        assert_eq!(steps(&[], &[]), 0);
     }
 
     #[test]

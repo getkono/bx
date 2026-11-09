@@ -18,7 +18,9 @@
 #
 #   overhead  baseline vs the same rc file after `bx apply`. This is what bx's
 #             generated files cost, cached activations included. Gated at
-#             BX_BUDGET_MS (default 5).
+#             BX_BUDGET_MS (default 5), reported with the noise it is read
+#             through, and measured again before failing when it is over
+#             budget by less than that noise.
 #   net       a hand-written `eval "$(tool init)"` rc file vs bx's. Reported,
 #             never gated: it depends on which tools are integrated, so a
 #             threshold would be arbitrary.
@@ -385,27 +387,37 @@ run() { # run <name> <shell> <warmup> <count> <fixture>...: one hyperfine, in th
 # differences: a drift that is steady across a round's four starts cancels out
 # of it, every fixture holds every position equally often, and a round a spell
 # broke into is outvoted. The rounds are primed, so none needs a warmup.
-for sh in $SHELLS; do
-	prime "$sh" baseline legacy bx
-	echo "Measuring bx's generated ${sh} startup files (budget ${BUDGET_MS} ms)..."
+measure() { # measure <shell> <name>: the overhead's rounds, as <name>-<round>
 	round=1
 	while [ "$round" -le "$ROUNDS" ]; do
 		case "$((round % 2))" in
-		1) run "overhead-${round}" "$sh" 0 "--runs 1" baseline bx bx baseline ;;
-		0) run "overhead-${round}" "$sh" 0 "--runs 1" bx baseline baseline bx ;;
+		1) run "${2}-${round}" "$1" 0 "--runs 1" baseline bx bx baseline ;;
+		0) run "${2}-${round}" "$1" 0 "--runs 1" bx baseline baseline bx ;;
 		esac
 		round=$((round + 1))
 	done
+}
+for sh in $SHELLS; do
+	prime "$sh" baseline legacy bx
+	echo "Measuring bx's generated ${sh} startup files (budget ${BUDGET_MS} ms)..."
+	measure "$sh" overhead
 	echo "Measuring net effect vs a hand-written ${sh}rc..."
 	run net "$sh" 5 "--min-runs ${RUNS}" legacy bx
 done
 
-# shellcheck disable=SC2086 # one argument per shell.
-python3 - "$RESULTS" "$BUDGET_MS" "$ROUNDS" $SHELLS <<'PY'
-import json, statistics, sys
+# The gate. A macOS runner's zsh baseline is 35-40 ms, so the same generated
+# files can read well under the budget on one runner and just over it on the
+# next. Each shell's report therefore carries the noise its median overhead is
+# read through, estimated from the starts that differ only by chance: each
+# round's two baseline starts. An overhead over budget by more than that noise
+# fails at once. One over budget but within it is measured again, in as many
+# fresh rounds, and fails only if the repeat is over budget too. The budget
+# itself never moves: a pass always reads an overhead under it.
+cat >"${WORK}/judge.py" <<'PY'
+import json, math, statistics, sys
 
-results, budget = sys.argv[1], float(sys.argv[2])
-rounds, shells = int(sys.argv[3]), sys.argv[4:]
+results, budget, rounds = sys.argv[1], float(sys.argv[2]), int(sys.argv[3])
+name, again, shells = sys.argv[4], sys.argv[5], sys.argv[6:]
 
 
 def order(name):
@@ -418,7 +430,7 @@ def order(name):
     return ["bx", "baseline", "baseline", "bx"]
 
 
-def medians(name, shell):
+def starts(name, shell):
     with open(f"{results}/{name}-{shell}.json") as fh:
         data = json.load(fh)["results"]
     # hyperfine 1 does not echo the -n labels back in the JSON, so pair by
@@ -427,12 +439,17 @@ def medians(name, shell):
     # its whole delay and the median not at all, and the gate is about bx, not
     # about the machine's other load. hyperfine 1 puts it at the top of each
     # result, hyperfine 2 under its summary's wall-clock time. A fixture a
-    # round starts twice reads as the mean of its two starts, which is what
-    # cancels a steady drift across the round.
+    # round starts twice keeps both starts, in the order they ran.
     each = {}
     for label, r in zip(order(name), data):
         each.setdefault(label, []).append(median(r) * 1000)
-    return {label: statistics.mean(times) for label, times in each.items()}
+    return each
+
+
+def medians(name, shell):
+    # A fixture a round starts twice reads as the mean of its two starts,
+    # which is what cancels a steady drift across the round.
+    return {label: statistics.mean(t) for label, t in starts(name, shell).items()}
 
 
 def median(result):
@@ -441,34 +458,75 @@ def median(result):
     return result["median"]
 
 
-over_budget = []
+def noise(each):
+    # A round's two baseline starts differ only by chance, so the spread of
+    # their differences is the runner's noise. Its median absolute deviation,
+    # times 1.4826, estimates their standard deviation robustly, and that
+    # deviation is sqrt(2) times a round's, which also differences two pairs
+    # of starts. The median of the rounds deviates about 1.2533 / sqrt(rounds)
+    # times as much again; the noise is twice that, so an overhead beyond it
+    # is not chance.
+    diffs = [b[0] - b[1] for b in (m["baseline"] for m in each)]
+    centre = statistics.median(diffs)
+    spread = 1.4826 * statistics.median(abs(d - centre) for d in diffs)
+    return 2 * 1.2533 * spread / math.sqrt(2 * len(each))
+
+
+failed = []
 for shell in shells:
-    each = [medians(f"overhead-{r}", shell) for r in range(1, rounds + 1)]
-    net = medians("net", shell)
-    baseline = statistics.median(m["baseline"] for m in each)
-    with_bx = statistics.median(m["bx"] for m in each)
-    overhead = statistics.median(m["bx"] - m["baseline"] for m in each)
-    saved = net["legacy"] - net["bx"]
-    if overhead > budget:
-        over_budget.append((shell, overhead))
+    each = [starts(f"{name}-{r}", shell) for r in range(1, rounds + 1)]
+    means = [{k: statistics.mean(t) for k, t in m.items()} for m in each]
+    baseline = statistics.median(m["baseline"] for m in means)
+    with_bx = statistics.median(m["bx"] for m in means)
+    overhead = statistics.median(m["bx"] - m["baseline"] for m in means)
+    spread = noise(each)
+    if overhead > budget and not again:
+        failed.append((shell, overhead, "measured twice"))
+    elif overhead - spread > budget:
+        failed.append((shell, overhead, "beyond the noise"))
+    elif overhead > budget:
+        with open(again, "a") as fh:
+            print(shell, file=fh)
 
     print()
-    print(f"  {shell}")
+    print(f"  {shell}" + ("" if again else ", measured again"))
     print(f"  baseline   {baseline:7.2f} ms")
     print(f"  + bx       {with_bx:7.2f} ms   after `bx apply` of the example")
     print(f"  overhead   {overhead:7.2f} ms   (budget {budget:.2f} ms; median of {rounds} rounds)")
+    print(f"  noise      {spread:7.2f} ms   baseline vs baseline, at that median")
+    if not again:
+        continue
+    net = medians("net", shell)
     print(f"  spawns     {0:7d}      processes bx's startup files started")
     print(f"  reads      {0:7d}      configuration files they read")
     print()
     print(f"  legacy     {net['legacy']:7.2f} ms   eval \"$(tool init)\" per tool")
     print(f"  bx         {net['bx']:7.2f} ms   the same tools, cached by bx")
-    print(f"  saved      {saved:7.2f} ms")
+    print(f"  saved      {net['legacy'] - net['bx']:7.2f} ms")
 
 print()
-for shell, overhead in over_budget:
-    print(f"FAIL: bx adds {overhead:.2f} ms to {shell}, over its {budget:.2f} ms budget.")
-if over_budget:
+for shell, overhead, why in failed:
+    print(f"FAIL: bx adds {overhead:.2f} ms to {shell}, over its {budget:.2f} ms budget, {why}.")
+if failed:
     sys.exit(1)
-print(f"OK: bx adds less than its {budget:.2f} ms budget to {' and '.join(shells)},")
-print("    starts no process and reads no configuration.")
 PY
+judge() { # judge <name> <again> <shell>...: the overhead read from <name>'s rounds
+	python3 "${WORK}/judge.py" "$RESULTS" "$BUDGET_MS" "$ROUNDS" "$@"
+}
+# An empty <again> means this reading is the repeat, so there is no other.
+AGAIN="${WORK}/again"
+: >"$AGAIN"
+# shellcheck disable=SC2086 # one argument per shell.
+judge overhead "$AGAIN" $SHELLS
+retry="$(cat "$AGAIN")"
+if [ -n "$retry" ]; then
+	# shellcheck disable=SC2086 # one word per shell.
+	for sh in $retry; do
+		echo "Measuring bx's ${sh} overhead again: over budget, but within the noise..."
+		measure "$sh" again
+	done
+	# shellcheck disable=SC2086
+	judge again "" $retry
+fi
+printf 'OK: bx adds less than its %.2f ms budget to %s,\n' "$BUDGET_MS" "$(echo "$SHELLS" | sed 's/ / and /')"
+echo "    starts no process and reads no configuration."

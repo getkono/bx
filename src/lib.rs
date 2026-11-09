@@ -13,7 +13,8 @@
 //!
 //! [`detect`] answers whether a tool bx is configuring for is actually usable
 //! on this machine, and [`report`] holds the vocabulary `plan` and `apply`
-//! share, including the fact that an additive-only tool has no destroy action.
+//! share, including the fact that a tool that never touches a byte the user
+//! wrote has no destroy action: it only takes back what it wrote.
 //!
 //! [`config`] is what a config repo says — the layers, the targets, the declared
 //! values, and the file and line each of them came from.

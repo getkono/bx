@@ -7,9 +7,11 @@ one `bx apply` replace setting up mise, sccache, uv, git, ssh, gh, starship and
 the rest one tool at a time. Your configuration lives in a git repo you own;
 your machine converges to it.
 
-It is **additive**: it never deletes or rewrites config you wrote, and it never
-moves another tool's config, data or cache anywhere you did not declare. Remove
-`bx` and every tool you manage with it still works exactly as before.
+It **never touches a byte you wrote**: it never deletes or rewrites config you
+wrote, it takes back only what it wrote itself and can prove is still as it left
+it, and it never moves another tool's config, data or cache anywhere you did
+not declare. Remove `bx` and every tool you manage with it still works exactly
+as before.
 
 ## Install
 
@@ -135,20 +137,31 @@ module, edited by hand, and a secret is encrypted or re-encrypted to them with
 
 ### Reading a plan
 
-Eight symbols, and none of them is "destroy". A tool that only adds never has
-one, so those slots go to the cases that actually matter for a tool that must
-not be invasive: something it does not own is in the way, something a target
-needs is missing, and a file it wrote is no longer declared — or no longer
-declared and edited since, which makes it yours.
+Nine symbols, and none of them is "destroy". Removing a declaration takes back
+what bx wrote for it, and only that: `-` undoes a write exactly as `bx rm`
+would, and only while the file is still byte for byte what bx left. The other
+slots go to the cases that actually matter for a tool that must not be
+invasive: something it does not own is in the way, something a target needs is
+missing, and a file it wrote is no longer declared but edited since, which makes
+it yours.
 
 ```
   +  create     it does not exist yet
   ~  modify     bx owns it and the content differs — or it already holds
                 exactly what bx wants, and bx takes ownership of it
                 without changing a byte, so `bx rm` leaves it in place
+  -  undo       bx wrote it, the configuration no longer declares it, and
+                it is still exactly what bx left: bx takes it back as
+                `bx rm` would. A file bx created is removed with the
+                directories it made for it, one it replaced gets its earlier
+                bytes and mode back, a link is unlinked, and a checkout
+                holding nothing its remote lacks is removed. The diff shows
+                sizes only, since a removed file may have been a secret.
   ^  release    bx wrote it, the configuration no longer declares it, and
-                you edited it since: it is yours now. Kept byte for byte;
-                bx only stops managing it, and `bx rm` does the same.
+                there is nothing to take back: you edited it since, so it is
+                yours now, or it is already gone or already what bx would
+                put back, or it is in the config repo, which is git's to
+                keep. Kept byte for byte; bx only stops managing it.
   <  sync       a tracked file this machine changed; `bx sync` carries
                 this machine's copy into the repo and commits it
   !  conflict   it exists, differs, and bx does not own it — or you edited
@@ -162,9 +175,11 @@ declared and edited since, which makes it yours.
                 tool. Reported and skipped while everything else is
                 applied. A missing tool never blocks its own config file,
                 which is written before the tool is installed.
-  *  undeclared bx wrote it, the configuration no longer declares it, and
-                it is still what bx left, or gone. Left exactly as it is;
-                `bx rm` releases it.
+  *  undeclared bx wrote it and the configuration no longer declares it,
+                but bx will not take it back: the configuration declares
+                nothing at all, which is what an emptied `bx.toml` looks
+                like; it cannot be looked at; or it is a checkout holding
+                work. Left exactly as it is; `bx rm` releases it.
   =  unchanged  already converged (hidden unless you ask)
 ```
 
@@ -189,10 +204,15 @@ path, `bx rm` when a conflict left something as it was, and
 
 ## Requirements
 
-### Additive, always
+### Your bytes, always
 
 - `bx` never deletes or rewrites a byte you wrote. Its writes land in delimited
   managed regions, or in files it owns because you said so.
+- What it wrote, it takes back once nothing declares it: a file still exactly
+  as `bx` left it is removed or restored as `bx rm` would, in the same
+  journalled session as every other write, and one you edited since is kept
+  as it is and stops being managed. A configuration that declares nothing at
+  all takes back nothing.
 - Every integration attaches at the target tool's **own** documented extension
   point — an `[include]` in `.gitconfig`, an `Include` in `.ssh/config`, mise's
   own config directory, one `source` line in `.zshrc`.
@@ -323,7 +343,7 @@ file = "files/hammerspoon.lua"
 `arch:x86_64`/`arch:aarch64`, `host:NAME`, `user:NAME`, `distro:ID` and
 `has:TOOL`. Where it does not hold, the declaration is not declared on that
 machine: it overrides nothing an earlier file said, and a file it wrote there
-before is reported for `bx rm`, as with `enabled = false`. A test only a
+before is taken back, as with `enabled = false`. A test only a
 shell can answer (`interactive`, `login`, `ssh`, `env:…`) is refused there,
 and so is a top-level `when` in `bx.toml` or `local.toml`.
 
@@ -411,8 +431,8 @@ Last, `bx upgrade` says whether a newer bx is released; installing it is
 
 **Links.** Each `[[external.link]]` turns every child directory of `from` in
 the locked commit into a symlink of the same name in `to`, so a new skill
-upstream becomes a new link on the next update and a removed one is reported
-as undeclared, for `bx rm` to release. A link never replaces a file or link
+upstream becomes a new link on the next update and the link to a removed one
+is taken back by the next `apply`. A link never replaces a file or link
 you made; it is reported as a conflict instead. A `to` at, inside or above any
 external's checkout is refused when the configuration loads.
 

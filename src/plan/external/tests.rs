@@ -672,6 +672,45 @@ fn a_path_that_appears_after_plan_is_not_cloned_into() {
 }
 
 #[test]
+fn a_checkout_that_takes_on_work_after_plan_is_stopped_at_its_own_row() {
+    use crate::plan::tests::inline;
+
+    let home = guarded_home();
+    let up = upstream(&home);
+    let kept = inline("~/.b", "b\\n");
+    apply(
+        &home,
+        &format!("{}{kept}{}", inline("~/.a", "a\\n"), layer(&up.first)),
+    );
+    assert!(home.child(AT).join(".git").is_dir(), "cloned");
+    // A declared row first, and an undeclared file before the checkout,
+    // so the checkout's row is neither the first row nor the first undone.
+    assert_eq!(
+        rows(&plan(&home, &kept)),
+        [
+            ("~/.b".to_string(), Action::Unchanged),
+            ("~/.a".to_string(), Action::Undo),
+            (format!("~/{AT}"), Action::Undo),
+        ]
+    );
+
+    let applied = apply_after(&home, &kept, || {
+        std::fs::write(home.child(AT).join("mine"), "mine\n").expect("the user's file");
+    });
+    assert_eq!(stopped(&applied), [format!("~/{AT}").as_str()]);
+    let row = row(&applied, &format!("~/{AT}"));
+    assert_eq!(row.action, Action::Blocked);
+    let note = row.note.as_deref().expect("a note");
+    assert!(note.contains("untracked files"), "{note}");
+    assert!(!home.child(".a").exists(), "the file is still taken back");
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("mine")).expect("the user's file"),
+        "mine\n"
+    );
+    assert!(entry(&home).is_some(), "the checkout is still bx's");
+}
+
+#[test]
 fn a_parent_that_cannot_be_made_at_apply_stops_the_clone_and_records_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
 

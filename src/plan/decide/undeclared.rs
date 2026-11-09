@@ -720,6 +720,27 @@ mod tests {
     }
 
     #[test]
+    fn a_conflict_over_a_file_still_there_is_a_conflict_not_a_kept_checkout() {
+        // `bx rm` can refuse a file `drift` found still bx's, when what is
+        // there changed between the two looks: that is reported as the
+        // conflict it is, never as a checkout kept or a file already gone.
+        let home = guarded_home();
+        home.write(".a", "a\n");
+        let owned = entry(&home, ".a", b"a\n", 0o644, Mechanism::Own);
+        let observed = fs::observe(&home.child(".a")).expect("observed");
+        let refused = Restoration::Conflict {
+            note: "refused".to_string(),
+            dest: home.child(".a"),
+        };
+        let state = StateDir::resolve(home.path());
+        let (action, why, _, then, undo) = take_back(&owned, &observed, refused, &state);
+        assert_eq!(action, Action::Conflict);
+        assert_eq!(why.as_deref(), Some("refused"));
+        assert_eq!(then, format!("{UNDECLARED}, so bx leaves it as it is"));
+        assert!(matches!(undo, Undo::Nothing));
+    }
+
+    #[test]
     fn a_destination_bx_cannot_look_at_is_reported_with_the_reason() {
         let home = guarded_home();
         home.write(".f", "a file\n");

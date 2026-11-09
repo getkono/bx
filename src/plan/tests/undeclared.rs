@@ -168,6 +168,36 @@ fn a_file_bx_replaced_gets_its_earlier_bytes_and_mode_back() {
 }
 
 #[test]
+fn a_file_bx_changed_only_the_mode_of_shows_the_mode_it_gets_back() {
+    let home = guarded_home();
+    // Claimed as it was found at 0600, then widened by the repo.
+    home.write(".a", "bx\n");
+    fs::set_mode(&home.child(".a"), FileMode::PRIVATE_FILE).expect("chmod");
+    let claim = "[[target]]\npath = \"~/.a\"\ncontent = \"bx\\n\"\nmode = \"0600\"\n";
+    apply(&inputs(&home, claim));
+    let widened = "[[target]]\npath = \"~/.a\"\ncontent = \"bx\\n\"\nmode = \"0644\"\n";
+    apply(&inputs(&home, widened));
+    assert_eq!(mode_of(&home.child(".a")), 0o644);
+    let inputs = inputs(&home, &inline("~/.b", "b\\n"));
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Create, Action::Undo]);
+    assert_eq!(
+        planned.changes[1].diff.as_ref().map(|diff| &diff.kind),
+        Some(&DiffKind::Mode {
+            from: crate::fs::Mode::from_bits(0o644),
+            to: crate::fs::Mode::from_bits(0o600),
+        })
+    );
+
+    let applied = apply(&inputs);
+    assert_eq!(applied.changes, planned.changes);
+    assert_eq!(std::fs::read(home.child(".a")).expect("restored"), b"bx\n");
+    assert_eq!(mode_of(&home.child(".a")), 0o600);
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+}
+
+#[test]
 fn a_file_claimed_as_it_was_found_stays_and_is_only_forgotten() {
     let home = guarded_home();
     home.write(".a", "bx\n");

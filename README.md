@@ -135,16 +135,20 @@ module, edited by hand, and a secret is encrypted or re-encrypted to them with
 
 ### Reading a plan
 
-Seven symbols, and none of them is "destroy". A tool that only adds never has
+Eight symbols, and none of them is "destroy". A tool that only adds never has
 one, so those slots go to the cases that actually matter for a tool that must
 not be invasive: something it does not own is in the way, something a target
-needs is missing, and a file it wrote is no longer declared.
+needs is missing, and a file it wrote is no longer declared — or no longer
+declared and edited since, which makes it yours.
 
 ```
   +  create     it does not exist yet
   ~  modify     bx owns it and the content differs — or it already holds
                 exactly what bx wants, and bx takes ownership of it
                 without changing a byte, so `bx rm` leaves it in place
+  ^  release    bx wrote it, the configuration no longer declares it, and
+                you edited it since: it is yours now. Kept byte for byte;
+                bx only stops managing it, and `bx rm` does the same.
   <  sync       a tracked file this machine changed; `bx sync` carries
                 this machine's copy into the repo and commits it
   !  conflict   it exists, differs, and bx does not own it — or you edited
@@ -158,8 +162,9 @@ needs is missing, and a file it wrote is no longer declared.
                 tool. Reported and skipped while everything else is
                 applied. A missing tool never blocks its own config file,
                 which is written before the tool is installed.
-  *  undeclared bx wrote it, and the configuration no longer declares it.
-                Left exactly as it is; `bx rm` releases it.
+  *  undeclared bx wrote it, the configuration no longer declares it, and
+                it is still what bx left, or gone. Left exactly as it is;
+                `bx rm` releases it.
   =  unchanged  already converged (hidden unless you ask)
 ```
 

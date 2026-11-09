@@ -28,7 +28,9 @@
 //!   differ, the user has edited it since, and restoring the whole prior body
 //!   over it would destroy bytes the user wrote. bx reports it and writes
 //!   nothing. This is Invariant 1, and it does not lapse because the command is
-//!   called `rm`.
+//!   called `rm`. Where nothing declares the file any more, refusing would
+//!   leave it managed until the edits were undone, so the file is kept
+//!   exactly as it is and only its ledger entry goes, as `apply` releases it.
 //!
 //! A directory target is held to the same rules with a mode in place of bytes:
 //! only the directory is bx's, never what is inside it. One bx created is
@@ -49,6 +51,7 @@
 //! applied to the removal path: `rm` cannot do work its own preview did not
 //! announce.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use crate::fs::{self, Kind, Mode};
@@ -173,6 +176,14 @@ pub enum Restoration {
         /// The file that is not there.
         dest: PathBuf,
     },
+    /// Nothing declares the file any more, and it was edited since bx last
+    /// wrote it: the edits are the user's, and putting back what bx replaced
+    /// would destroy them. The file stays exactly as it is, and only the
+    /// ledger entry goes — what `apply` does to the same file.
+    Keep {
+        /// The file, left as it is.
+        dest: PathBuf,
+    },
     /// Something bx does not account for is at the destination. Reported and
     /// skipped, never overwritten.
     Conflict {
@@ -207,6 +218,14 @@ pub enum Restored {
         /// Where it was.
         dest: PathBuf,
     },
+    /// Nothing declares the file, and it was edited since bx wrote it; bx
+    /// left it exactly as it is and stopped managing it.
+    Kept {
+        /// The target.
+        target: Portable,
+        /// Where it is.
+        dest: PathBuf,
+    },
     /// bx has never written this target, so there is nothing to put back.
     Unmanaged {
         /// The target.
@@ -237,6 +256,7 @@ impl Restored {
             Self::Reverted { target, .. }
             | Self::Removed { target, .. }
             | Self::AlreadyGone { target, .. }
+            | Self::Kept { target, .. }
             | Self::Unmanaged { target }
             | Self::Conflict { target, .. } => target,
         }
@@ -274,6 +294,44 @@ pub fn plan_restore_with(
     entry: &LedgerEntry,
     home: &Path,
     git: &Git,
+) -> Result<Restoration, Error> {
+    plan(entry, home, git, Declared::Yes)
+}
+
+/// [`plan_restore_with`] for a target nothing declares any more.
+///
+/// The one difference is a file edited since bx last wrote it: rather than a
+/// [`Restoration::Conflict`], which would leave a file nothing declares
+/// managed until its edits were undone, it is [`Restoration::Keep`] — left
+/// byte for byte, and forgotten — as `apply` releases the same file.
+///
+/// # Errors
+///
+/// As [`plan_restore`].
+pub fn plan_restore_undeclared(
+    entry: &LedgerEntry,
+    home: &Path,
+    git: &Git,
+) -> Result<Restoration, Error> {
+    plan(entry, home, git, Declared::No)
+}
+
+/// Whether the configuration still declares the target being restored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Declared {
+    /// It does, or `rm` cannot say it does not.
+    Yes,
+    /// Nothing declares it.
+    No,
+}
+
+/// [`plan_restore_with`], or [`plan_restore_undeclared`] where `declared`
+/// says nothing declares the target.
+fn plan(
+    entry: &LedgerEntry,
+    home: &Path,
+    git: &Git,
+    declared: Declared,
 ) -> Result<Restoration, Error> {
     let dest = entry.path.render(home);
     let observed = match fs::observe(&dest) {
@@ -349,6 +407,8 @@ pub fn plan_restore_with(
                 planned: Box::new(observed.clone()),
             },
         }),
+        // Edited, and nothing declares it: the file is the user's now.
+        (Kind::File, _) if declared == Declared::No => Ok(Restoration::Keep { dest }),
         (Kind::File, _) => Ok(Restoration::Conflict {
             note: format!(
                 "has been edited since bx wrote it (bx left {}); \
@@ -581,6 +641,24 @@ pub fn restore_with(
     targets: &[Portable],
     git: &Git,
 ) -> Result<Vec<Restored>, Error> {
+    restore_undeclared_with(state, home, targets, &BTreeSet::new(), git)
+}
+
+/// [`restore_with`], deciding each of `targets` that `undeclared` names as
+/// [`plan_restore_undeclared`] does: a file nothing declares that was edited
+/// since bx wrote it is [`Restored::Kept`] — left exactly as it is and
+/// forgotten — rather than a conflict.
+///
+/// # Errors
+///
+/// As [`restore_with`].
+pub fn restore_undeclared_with(
+    state: &StateDir,
+    home: &Path,
+    targets: &[Portable],
+    undeclared: &BTreeSet<Portable>,
+    git: &Git,
+) -> Result<Vec<Restored>, Error> {
     // One lock across the recovery, the clones and the session: see
     // `recover::lock_for_writing`.
     let lock = recover::lock_for_writing(state)?;
@@ -604,7 +682,12 @@ pub fn restore_with(
     let scope = rest.iter().map(|at| targets[*at].clone()).collect();
     let mut session = Session::open_locked(state, SessionKind::Restore, home, scope, lock)?;
     for at in rest {
-        done[at] = Some(restore_one(&mut session, &targets[at])?);
+        let declared = if undeclared.contains(&targets[at]) {
+            Declared::No
+        } else {
+            Declared::Yes
+        };
+        done[at] = Some(restore_one(&mut session, &targets[at], declared)?);
     }
     session.finish()?;
     Ok(done.into_iter().flatten().collect())
@@ -677,18 +760,31 @@ fn remove_clone(
     }
 }
 
-/// Restore one target inside an open session.
-fn restore_one(session: &mut Session, target: &Portable) -> Result<Restored, Error> {
+/// Restore one target inside an open session, as [`plan`] decides it for
+/// `declared`.
+fn restore_one(
+    session: &mut Session,
+    target: &Portable,
+    declared: Declared,
+) -> Result<Restored, Error> {
     let Some(entry) = session.ledger().get(target).cloned() else {
         return Ok(Restored::Unmanaged {
             target: target.clone(),
         });
     };
 
-    match plan_restore(&entry, session.home())? {
+    let home = session.home().to_path_buf();
+    match plan(&entry, &home, &Git::at_home(&home), declared)? {
         Restoration::AlreadyGone { dest } => {
             session.forget(target);
             Ok(Restored::AlreadyGone {
+                target: target.clone(),
+                dest,
+            })
+        }
+        Restoration::Keep { dest } => {
+            session.forget(target);
+            Ok(Restored::Kept {
                 target: target.clone(),
                 dest,
             })

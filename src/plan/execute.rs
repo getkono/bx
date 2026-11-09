@@ -1,16 +1,23 @@
 //! The writing half: every write a decision produced, through one session.
 //!
-//! [`execute`] is handed the writes and the session and nothing else — no
-//! target, no configuration, no inputs — and it reads nothing. It cannot
-//! decide anything, so it cannot do work `plan` did not announce.
+//! [`execute`] is handed the writes, the files released, and the session and
+//! nothing else — no target, no configuration, no inputs — and it reads
+//! nothing. It cannot decide anything, so it cannot do work `plan` did not
+//! announce.
 
 use indicatif::{ProgressBar, ProgressDrawTarget};
 
 use super::Error;
 use super::decide::Op;
 use crate::journal::Session;
+use crate::paths::Portable;
 
-/// Make every write through `session`, in order, then finish it.
+/// Make every write through `session`, in order, then drop each of `released`
+/// from the ledger, then finish it.
+///
+/// A file released is the user's now: its bytes are left exactly as they are,
+/// and only its ledger entry goes, through [`Session::forget`], so nothing is
+/// written or deleted for it.
 ///
 /// The first failure is returned as it is. The session is then poisoned and
 /// its journal stays, so the next writing run rolls back whatever this one
@@ -22,6 +29,7 @@ use crate::journal::Session;
 /// destination that changed since it was observed.
 pub(super) fn execute(
     ops: Vec<Op>,
+    released: &[Portable],
     mut session: Session,
     progress: &ProgressBar,
 ) -> Result<usize, Error> {
@@ -30,9 +38,20 @@ pub(super) fn execute(
         session.apply(op.into_request())?;
         progress.inc(1);
     }
+    for target in released {
+        progress.set_message(target.to_string());
+        session.forget(target);
+        progress.inc(1);
+    }
     let written = session.finish()?;
     progress.finish_and_clear();
     Ok(written)
+}
+
+/// How many steps [`execute`] takes over `ops` and `released`: one for each
+/// write and one for each file released, so its bar ends full.
+pub(super) fn steps(ops: &[Op], released: &[Portable]) -> usize {
+    ops.len() + released.len()
 }
 
 /// A progress bar over `len` writes, drawn on standard error only when it is a
@@ -128,6 +147,15 @@ mod tests {
         fn flush(&self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_file_released_is_a_step_of_its_own() {
+        let home = std::path::Path::new("/h");
+        let released = ["~/.a", "~/.b"].map(|raw| Portable::parse_in(raw, home).expect("portable"));
+        assert_eq!(steps(&[], &released), 2);
+        assert_eq!(steps(&[], &released[..1]), 1);
+        assert_eq!(steps(&[], &[]), 0);
     }
 
     #[test]

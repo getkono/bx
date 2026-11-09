@@ -396,6 +396,40 @@ impl Context {
         }
     }
 
+    /// Whether nothing the configuration holds declares `target`, as `plan`
+    /// reads an undeclared ledger entry: no ready or held-back target names
+    /// it — one switched off, or kept off this machine, does not declare it —
+    /// and it is no external's checkout.
+    ///
+    /// Read conservatively where `plan` declares a file without a table
+    /// naming it: a generated shell file, which `plan` declares whenever bx
+    /// holds it, and anything in the config repo, where a tracked target's
+    /// repo copy lies. Each counts as declared, so `rm` never releases one
+    /// that `plan` would still decide.
+    fn undeclared(&self, target: &Portable) -> bool {
+        let generated = config::env::Place::ALL
+            .into_iter()
+            .flat_map(|place| [Some(place.fragment()), place.startup_file()])
+            .flatten()
+            .chain([
+                crate::shell::bash::FILE,
+                crate::shell::bash::STARTUP_FILE,
+                crate::shell::bash::PROFILE,
+            ])
+            .any(|path| path == target.as_str());
+        let in_repo =
+            paths::normalize(&target.render(&self.home)).starts_with(paths::normalize(&self.repo));
+        let checkout = self
+            .resolved
+            .externals
+            .iter()
+            .any(|external| external.path == *target);
+        matches!(self.declared(target), Declared::No | Declared::Disabled(_))
+            && !generated
+            && !in_repo
+            && !checkout
+    }
+
     /// Every path the configuration declares, whether ready, held back, or
     /// switched off, each read as [`Context::declared`] reads it.
     fn declared_paths(&self) -> Vec<Portable> {
@@ -1377,8 +1411,11 @@ fn undeclare(
 /// deleted by hand is still handed back. [`restore::restore_with`] decides and
 /// restores each; each one it released is then removed from every layer
 /// declaring it. A conflict is left declared and untouched, and a tree is
-/// handed back whole or not at all ([`hold_trees`]). Nothing to do is an
-/// empty result, which is what makes a second `rm` a no-op.
+/// handed back whole or not at all ([`hold_trees`]). A file nothing declares
+/// ([`Context::undeclared`]) that was edited since bx wrote it is not a
+/// conflict: it is kept exactly as it is and forgotten, as `apply` releases
+/// it. Nothing to do is an empty result, which is what makes a second `rm` a
+/// no-op.
 ///
 /// # Errors
 ///
@@ -1416,7 +1453,14 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         return Ok(Vec::new());
     }
     let targets: Vec<Portable> = targets.into_iter().collect();
-    let restored = restore_tracking(ctx, &ledger, &targets)?;
+    // A file nothing declares that was edited since bx wrote it is kept as
+    // it is and forgotten, as `apply` releases it, rather than a conflict.
+    let undeclared: BTreeSet<Portable> = targets
+        .iter()
+        .filter(|path| ctx.undeclared(path))
+        .cloned()
+        .collect();
+    let restored = restore_tracking(ctx, &ledger, &targets, &undeclared)?;
 
     let conflicts: BTreeSet<&Portable> = restored
         .iter()
@@ -1503,6 +1547,7 @@ fn restore_tracking(
     ctx: &Context,
     ledger: &LedgerView,
     targets: &[Portable],
+    undeclared: &BTreeSet<Portable>,
 ) -> Result<Vec<Restored>, Error> {
     let copies: Vec<Option<Portable>> = targets.iter().map(|t| ctx.tracked_copy(t)).collect();
     let mut held: Vec<Option<String>> = Vec::with_capacity(targets.len());
@@ -1535,7 +1580,7 @@ fn restore_tracking(
     let done = if restoring.is_empty() {
         Vec::new()
     } else {
-        restore::restore_with(&ctx.state, &ctx.home, &restoring, &ctx.git)?
+        restore::restore_undeclared_with(&ctx.state, &ctx.home, &restoring, undeclared, &ctx.git)?
     };
     let result = |path: &Portable| {
         restoring

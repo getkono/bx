@@ -1,5 +1,6 @@
 //! The row for a file bx wrote that nothing declares any more: reported, and
-//! never acted on.
+//! never written. One edited since is released: its ledger entry goes, and
+//! its bytes stay.
 
 use std::path::Path;
 
@@ -11,18 +12,26 @@ use crate::report::Action;
 use crate::state::{LedgerEntry, Mechanism};
 
 /// The row for a ledger entry no enabled target or external declares: a file
-/// bx wrote whose declaration is gone, reported and never acted on.
+/// bx wrote whose declaration is gone, reported and never written.
 ///
 /// The row is [`Action::Undeclared`] while what is on disk is still what bx
-/// left, or nothing at all, and names `bx rm` as the way to release it. When
-/// the destination has drifted since — edited, retargeted, its mode changed,
-/// or something of another kind in its place — it is an [`Action::Conflict`]
-/// saying why, as drift is for a declared target, and nothing is overwritten
-/// either way. `bx rm` refuses to restore over the same drift, so such a note
-/// says so rather than promising a release; a file whose mode alone changed
-/// is still one `bx rm` hands back. A checkout's commit is git's to read, so a
-/// clone is judged by whether its directory is there alone, and `bx rm` says
-/// itself when a checkout holds work it will not remove.
+/// left, or nothing at all, and names `bx rm` as the way to release it.
+///
+/// A file whose bytes were edited since bx last wrote them is
+/// [`Action::Release`]: the edits are the user's, and with no declaration
+/// left there is nothing to choose between, so `apply` keeps the file byte
+/// for byte and drops its ledger entry, and `bx rm` does the same. Nothing is
+/// written or deleted, so the release never touches a file bx has not
+/// confirmed unchanged.
+///
+/// Any other drift — retargeted, its mode changed, or something of another
+/// kind in its place — is an [`Action::Conflict`] saying why, as drift is for
+/// a declared target, and nothing is overwritten. `bx rm` refuses to restore
+/// over the same drift, so such a note says so rather than promising a
+/// release; a file whose mode alone changed is still one `bx rm` hands back.
+/// A checkout's commit is git's to read, so a clone is judged by whether its
+/// directory is there alone, and `bx rm` says itself when a checkout holds
+/// work it will not remove.
 ///
 /// No diff: bx no longer knows what it would write, and it writes nothing.
 /// A destination that cannot be observed is reported as undeclared with the
@@ -43,14 +52,18 @@ pub(in crate::plan) fn decide_undeclared(
             release,
         ),
         Ok(observed) => match drift(entry, &observed) {
-            Some(Drift { why, released }) => (
+            Some(Drift::Edited) => (
+                Action::Release,
+                Some(EDITED.to_string()),
+                "the configuration no longer declares it, so the edits are yours: bx keeps \
+                 the file as it is and stops managing it"
+                    .to_string(),
+            ),
+            Some(Drift::Mode(why)) => (Action::Conflict, Some(why), release),
+            Some(Drift::Refused(why)) => (
                 Action::Conflict,
                 Some(why),
-                if released {
-                    release
-                } else {
-                    format!("{undeclared}, and `bx rm {rm}` will not restore over the change")
-                },
+                format!("{undeclared}, and `bx rm {rm}` will not restore over the change"),
             ),
             None if observed.kind == Kind::Absent => (
                 Action::Undeclared,
@@ -69,24 +82,25 @@ pub(in crate::plan) fn decide_undeclared(
     }
 }
 
+/// Why a file bx wrote is released rather than reported.
+const EDITED: &str = "edited since bx last wrote it";
+
 /// How a destination differs from what its ledger entry says bx left there.
-struct Drift {
-    /// Why it is not what bx left, as a row says it.
-    why: String,
-    /// Whether `bx rm` still hands it back: only when a file bx owns whole
-    /// still holds bx's bytes, and its mode alone changed.
-    released: bool,
+#[derive(Debug, PartialEq, Eq)]
+enum Drift {
+    /// A file whose bytes are no longer the ones bx left: released.
+    Edited,
+    /// A file bx owns whole that still holds bx's bytes, and whose mode alone
+    /// changed: a conflict `bx rm` still hands back.
+    Mode(String),
+    /// Anything else, said as a row says it: a conflict `bx rm` refuses.
+    Refused(String),
 }
 
 /// How `observed` differs from what `entry` says bx left there, or `None`
 /// when it is still bx's, or gone.
 fn drift(entry: &LedgerEntry, observed: &Observed) -> Option<Drift> {
-    let refused = |why: String| {
-        Some(Drift {
-            why,
-            released: false,
-        })
-    };
+    let refused = |why: String| Some(Drift::Refused(why));
     let expected = match entry.mechanism {
         Mechanism::Dir | Mechanism::Clone => Kind::Dir,
         Mechanism::Link => Kind::Symlink,
@@ -106,12 +120,11 @@ fn drift(entry: &LedgerEntry, observed: &Observed) -> Option<Drift> {
         Mechanism::Own | Mechanism::Region { .. } | Mechanism::Include { .. }
             if observed.digest() != Some(entry.written) =>
         {
-            refused("edited since bx last wrote it".to_string())
+            Some(Drift::Edited)
         }
-        Mechanism::Own if observed.mode != Some(entry.mode) => Some(Drift {
-            why: "its mode changed since bx wrote it".to_string(),
-            released: true,
-        }),
+        Mechanism::Own if observed.mode != Some(entry.mode) => Some(Drift::Mode(
+            "its mode changed since bx wrote it".to_string(),
+        )),
         Mechanism::Dir if observed.mode != Some(entry.mode) => refused(format!(
             "its mode changed since bx set it to {}",
             entry.mode
@@ -193,11 +206,31 @@ mod tests {
         let edited = entry(&home, ".r", b"other\n", 0o600, region);
         assert_eq!(
             why(&home, &edited),
-            (
-                Action::Conflict,
-                "edited since bx last wrote it".to_string()
-            )
+            (Action::Release, "edited since bx last wrote it".to_string())
         );
+    }
+
+    #[test]
+    fn an_edited_file_is_released_whatever_attached_it() {
+        let home = guarded_home();
+        home.write(".e", "yours\n");
+        for mechanism in [
+            Mechanism::Own,
+            Mechanism::Region { comment: '#' },
+            Mechanism::Include {
+                line: "[include]".to_string(),
+            },
+        ] {
+            let edited = entry(&home, ".e", b"bx's\n", 0o644, mechanism.clone());
+            let (action, note) = decided(&home, &edited);
+            assert_eq!(action, Action::Release, "{mechanism:?}");
+            assert_eq!(
+                note,
+                "edited since bx last wrote it; the configuration no longer declares it, so \
+                 the edits are yours: bx keeps the file as it is and stops managing it",
+                "{mechanism:?}"
+            );
+        }
     }
 
     #[test]

@@ -376,6 +376,101 @@ fn a_file_edited_since_bx_wrote_it_is_a_conflict_not_an_overwrite() {
 }
 
 #[test]
+fn an_edited_file_nothing_declares_is_kept_byte_for_byte_and_forgotten() {
+    let home = guarded_home();
+    let state = StateDir::resolve(home.path());
+    let dest = home.child(".conf");
+    plant_file(&dest, "theirs\n", Mode::DEFAULT_FILE);
+    let portable = managed(&state, home.path(), ".conf", "bx's\n", Mode::DEFAULT_FILE);
+    let created = managed(&state, home.path(), ".new", "bx's\n", Mode::DEFAULT_FILE);
+    plant_file(&dest, "bx's\nand a line of mine\n", Mode::PRIVATE_FILE);
+    plant_file(&home.child(".new"), "mine now\n", Mode::DEFAULT_FILE);
+    let entry = entry_for(&state, home.path(), &portable).expect("managed");
+    let git = Git::at_home(home.path());
+
+    // Declared, `rm` would refuse; undeclared, it plans to keep the file.
+    assert!(matches!(
+        plan_restore_with(&entry, home.path(), &git).expect("plan"),
+        Restoration::Conflict { .. }
+    ));
+    assert_eq!(
+        plan_restore_undeclared(&entry, home.path(), &git).expect("plan"),
+        Restoration::Keep { dest: dest.clone() }
+    );
+
+    let both = [portable.clone(), created.clone()];
+    let undeclared: BTreeSet<Portable> = both.iter().cloned().collect();
+    let done =
+        restore_undeclared_with(&state, home.path(), &both, &undeclared, &git).expect("restore");
+    assert_eq!(
+        done,
+        [
+            Restored::Kept {
+                target: portable.clone(),
+                dest: dest.clone(),
+            },
+            Restored::Kept {
+                target: created.clone(),
+                dest: home.child(".new"),
+            },
+        ]
+    );
+    assert!(done.iter().all(|done| !done.is_conflict()));
+    assert_eq!(
+        peek(&dest),
+        Some((b"bx's\nand a line of mine\n".to_vec(), Mode::PRIVATE_FILE)),
+        "not a byte or a mode bit changed",
+    );
+    assert_eq!(
+        peek(&home.child(".new")).expect("not removed").0,
+        b"mine now\n",
+        "a file bx created and the user edited is not unlinked",
+    );
+    assert!(entry_for(&state, home.path(), &portable).is_none());
+    assert!(entry_for(&state, home.path(), &created).is_none());
+
+    // Forgotten, so a second `rm` has nothing to do.
+    let again =
+        restore_undeclared_with(&state, home.path(), &both, &undeclared, &git).expect("again");
+    assert!(
+        again
+            .iter()
+            .all(|done| matches!(done, Restored::Unmanaged { .. })),
+        "{again:?}"
+    );
+}
+
+#[test]
+fn an_undeclared_file_still_bxs_is_restored_and_other_drift_still_conflicts() {
+    let home = guarded_home();
+    let state = StateDir::resolve(home.path());
+    let kept = managed(&state, home.path(), ".kept", "bx's\n", Mode::DEFAULT_FILE);
+    let dir = home.child(".dir");
+    let replaced = managed(&state, home.path(), ".dir", "bx's\n", Mode::DEFAULT_FILE);
+    std::fs::remove_file(&dir).expect("rm");
+    std::fs::create_dir(&dir).expect("a directory in its place");
+    let targets = [kept.clone(), replaced.clone()];
+    let undeclared: BTreeSet<Portable> = targets.iter().cloned().collect();
+
+    let done = restore_undeclared_with(
+        &state,
+        home.path(),
+        &targets,
+        &undeclared,
+        &Git::at_home(home.path()),
+    )
+    .expect("restore");
+    assert!(
+        matches!(done[0], Restored::Removed { .. }),
+        "undeclared and unedited is undone as ever: {done:?}"
+    );
+    assert!(done[1].is_conflict(), "only an edit is released: {done:?}");
+    assert!(!home.child(".kept").exists());
+    assert!(dir.is_dir());
+    assert!(entry_for(&state, home.path(), &replaced).is_some());
+}
+
+#[test]
 fn a_destination_that_is_no_longer_a_file_is_a_conflict() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());

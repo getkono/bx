@@ -854,6 +854,109 @@ fn rm_over_an_edit_is_a_conflict_that_changes_nothing() {
 }
 
 #[test]
+fn rm_over_an_edit_nothing_declares_keeps_the_file_and_forgets_it() {
+    let home = repo(&inline("~/.edited", "bx\\n"));
+    apply_yes(&home);
+    std::fs::write(home.child(".config/bx/bx.toml"), "").expect("the declaration gone");
+    std::fs::write(home.child(".edited"), b"hand edit\n").expect("edit");
+
+    let (exit, text) = rm_text(&home, "~/.edited");
+    assert_eq!(exit, Exit::Converged, "{text}");
+    assert_eq!(
+        text,
+        "  - ~/.edited  left as you edited it; nothing declares it, so bx stops managing it\n"
+    );
+    assert_eq!(
+        std::fs::read(home.child(".edited")).expect("kept"),
+        b"hand edit\n"
+    );
+    assert!(ledger(&home).get(&target(&home, ".edited")).is_none());
+    let (exit, text) = rm_text(&home, "~/.edited");
+    assert_eq!(
+        (exit, text.as_str()),
+        (
+            Exit::Converged,
+            "~/.edited is not managed by bx; nothing to do.\n"
+        ),
+        "a no-op now"
+    );
+}
+
+#[test]
+fn rm_over_an_edit_beside_an_external_elsewhere_still_releases_it() {
+    // An external's checkout is declared, but only at its own path.
+    let home = repo(&inline("~/.edited", "bx\\n"));
+    apply_yes(&home);
+    let external = "[[external]]\npath = \"~/.x\"\nurl = \"https://example.invalid/x\"\n\
+                    rev = \"0123456789abcdef0123456789abcdef01234567\"\n";
+    std::fs::write(home.child(".config/bx/bx.toml"), external).expect("the declaration gone");
+    std::fs::write(home.child(".edited"), b"hand edit\n").expect("edit");
+
+    let (exit, text) = rm_text(&home, "~/.edited");
+    assert_eq!(exit, Exit::Converged, "{text}");
+    assert!(
+        text.starts_with("  - ~/.edited  left as you edited it"),
+        "{text}"
+    );
+    assert!(ledger(&home).get(&target(&home, ".edited")).is_none());
+}
+
+#[test]
+fn rm_over_an_edit_switched_off_keeps_the_file_and_undeclares_it() {
+    let home = repo(&inline("~/.edited", "bx\\n"));
+    apply_yes(&home);
+    let off = format!("{}enabled = false\n", inline("~/.edited", "bx\\n"));
+    std::fs::write(home.child(".config/bx/bx.toml"), &off).expect("switched off");
+    std::fs::write(home.child(".edited"), b"hand edit\n").expect("edit");
+
+    let (exit, text) = rm_text(&home, "~/.edited");
+    assert_eq!(exit, Exit::Converged, "{text}");
+    assert!(
+        text.starts_with("  - ~/.edited  left as you edited it"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read(home.child(".edited")).expect("kept"),
+        b"hand edit\n"
+    );
+    assert!(ledger(&home).get(&target(&home, ".edited")).is_none());
+    assert_eq!(
+        layer(&home),
+        "",
+        "its switched-off declaration goes with it"
+    );
+}
+
+#[test]
+fn rm_over_an_edited_generated_shell_file_stays_a_conflict() {
+    // `plan` declares a generated shell file whenever bx holds it, so `rm`
+    // must not release one even once no `[[env]]` names it.
+    let home = repo("[[env]]\nname = \"EDITOR\"\nvalue = \"nvim\"\nkind = \"interactive\"\n");
+    apply_yes(&home);
+    let fragment = crate::config::env::Place::Zshrc.fragment();
+    let rel = fragment.trim_start_matches("~/");
+    assert!(
+        ledger(&home).get(&target(&home, rel)).is_some(),
+        "the fragment is bx's"
+    );
+    std::fs::write(home.child(".config/bx/bx.toml"), "").expect("the declaration gone");
+    std::fs::write(home.child(rel), b"hand edit\n").expect("edit");
+
+    let (exit, text) = rm_text(&home, fragment);
+    assert_eq!(exit, Exit::Pending, "{text}");
+    assert!(text.starts_with(&format!("  ! {fragment}  ")), "{text}");
+    assert!(text.ends_with("; still managed\n"), "{text}");
+    assert_eq!(
+        std::fs::read(home.child(rel)).expect("kept"),
+        b"hand edit\n"
+    );
+    assert!(
+        ledger(&home).get(&target(&home, rel)).is_some(),
+        "still bx's"
+    );
+}
+
+#[test]
 fn rm_of_something_bx_does_not_manage_is_a_no_op() {
     let home = repo(MINE);
     plant(&home, ".untouched", b"u\n", 0o644);

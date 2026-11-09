@@ -344,14 +344,16 @@ impl Session {
 
     /// Drop a target from the ledger without touching the filesystem.
     ///
-    /// For the one case `bx rm` has where there is nothing to write: bx created
-    /// the file, and the file is already gone.
+    /// For the cases where there is nothing to write: `bx rm` over a file bx
+    /// created that is already gone, and `apply` or `bx rm` releasing a file
+    /// nothing declares that was edited since bx wrote it, which stays as it
+    /// is.
     ///
     /// Not journalled, because there is no write to undo. The cost is that a
     /// session interrupted between its [`End`] frame and its save leaves the
     /// entry standing, since recovery rebuilds the ledger from the journal's
-    /// intents and this made none. That self-heals: the next `rm` finds the
-    /// file still absent, reaches this same call, and finishes.
+    /// intents and this made none. That self-heals: the next run finds the
+    /// file as it was, reaches this same call, and finishes.
     ///
     /// The directories the entry claimed are handed to a surviving entry
     /// beneath them when the session finishes, and never removed here: plan

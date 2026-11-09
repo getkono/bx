@@ -34,13 +34,21 @@ pub enum Action {
     /// bx is additive-only — so the row names `bx rm` as the way to release
     /// the file, and it stays until the user runs it. Not pending work and not
     /// a decision bx is waiting on, so `apply` twice still converges. A file
-    /// that has drifted from what bx wrote is reported as a
-    /// [`Action::Conflict`] instead, as drift is for a declared target.
+    /// that has drifted from what bx wrote is [`Action::Release`] when its
+    /// bytes were edited, and otherwise reported as a [`Action::Conflict`],
+    /// as drift is for a declared target.
     Undeclared,
     /// The target does not exist and will be created.
     Create,
     /// bx owns the target and its content differs; it will be updated.
     Modify,
+    /// bx wrote this file, nothing declares it any more, and it has been
+    /// edited since: it is the user's now. `apply` keeps it byte for byte and
+    /// drops its ledger entry, so bx stops managing it; nothing is written
+    /// and nothing is deleted. Pending work, since the ledger changes, and
+    /// never a decision bx waits on: with no declaration left, keeping the
+    /// edits is the only outcome that writes over nothing.
+    Release,
     /// A tracked target this machine changed: `bx sync` carries the machine's
     /// copy into the config repo and commits it. Not `apply`'s work, so it is
     /// neither pending nor in need of attention, and a bare `apply` over it
@@ -88,6 +96,7 @@ impl Action {
             Self::Undeclared => '*',
             Self::Create => '+',
             Self::Modify => '~',
+            Self::Release => '^',
             Self::Sync => '<',
             Self::Conflict => '!',
             Self::Blocked => '?',
@@ -102,7 +111,7 @@ impl Action {
     /// "changes waiting" forever.
     #[must_use]
     pub const fn is_pending(self) -> bool {
-        matches!(self, Self::Create | Self::Modify)
+        matches!(self, Self::Create | Self::Modify | Self::Release)
     }
 
     /// Whether this action needs the user to do something before bx can
@@ -120,6 +129,7 @@ impl fmt::Display for Action {
             Self::Undeclared => "undeclared",
             Self::Create => "create",
             Self::Modify => "modify",
+            Self::Release => "release",
             Self::Sync => "sync",
             Self::Conflict => "conflict",
             Self::Blocked => "blocked",
@@ -173,9 +183,10 @@ impl Exit {
 
 /// A one-line tally, rendered as the last line of `plan`.
 ///
-/// [`Action::Undeclared`], and tracked targets waiting for `bx sync`, are each
-/// counted only when there is one, so a configuration with nothing undeclared
-/// that tracks nothing prints the line it always printed.
+/// [`Action::Undeclared`], [`Action::Release`], and tracked targets waiting
+/// for `bx sync`, are each counted only when there is one, so a configuration
+/// with nothing undeclared or edited past its declaration that tracks nothing
+/// prints the line it always printed.
 #[must_use]
 pub fn summary(actions: &[Action]) -> String {
     let count = |want: Action| actions.iter().filter(|a| **a == want).count();
@@ -183,12 +194,16 @@ pub fn summary(actions: &[Action]) -> String {
         0 => String::new(),
         n => format!(" {n} undeclared,"),
     };
+    let release = match count(Action::Release) {
+        0 => String::new(),
+        n => format!(", {n} to release"),
+    };
     let sync = match count(Action::Sync) {
         0 => String::new(),
         n => format!(", {n} to sync"),
     };
     format!(
-        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged{sync}.",
+        "Plan: {} to create, {} to modify, {} conflict, {} blocked,{undeclared} {} unchanged{release}{sync}.",
         count(Action::Create),
         count(Action::Modify),
         count(Action::Conflict),
@@ -269,7 +284,10 @@ mod tests {
     /// conflict and a blocked target are not pending work, but the machine is
     /// not converged and someone has to look, which is what a non-zero exit
     /// is for.
-    const ACTIONS: [(Action, char, &str, bool, bool, Exit); 7] = [
+    ///
+    /// A file released is pending work: `apply` drops its ledger entry, so
+    /// `plan` exits non-zero until it has.
+    const ACTIONS: [(Action, char, &str, bool, bool, Exit); 8] = [
         (
             Action::Unchanged,
             '=',
@@ -288,6 +306,7 @@ mod tests {
         ),
         (Action::Create, '+', "create", true, false, Exit::Pending),
         (Action::Modify, '~', "modify", true, false, Exit::Pending),
+        (Action::Release, '^', "release", true, false, Exit::Pending),
         (Action::Sync, '<', "sync", false, false, Exit::Converged),
         (
             Action::Conflict,
@@ -331,6 +350,7 @@ mod tests {
             Action::Unchanged,
             Action::Conflict,
             Action::Undeclared,
+            Action::Release,
             Action::Modify,
         ];
         actions.sort_unstable();
@@ -385,6 +405,15 @@ mod tests {
         assert_eq!(
             summary(&[Action::Sync, Action::Unchanged]),
             "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 1 to sync."
+        );
+    }
+
+    #[test]
+    fn a_file_to_release_is_counted_only_when_there_is_one() {
+        assert_eq!(
+            summary(&[Action::Release, Action::Sync, Action::Unchanged]),
+            "Plan: 0 to create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 1 to release, \
+             1 to sync."
         );
     }
 

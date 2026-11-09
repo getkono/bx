@@ -305,9 +305,8 @@ pub fn run(
     report.changes.append(&mut expansion.rows);
     // Last, after every external, so the indices `stopped` is built from are
     // not moved: every file bx wrote that nothing declares any more.
-    report
-        .changes
-        .extend(undeclared_rows(inputs, &ledger, &targets, &expansion.held));
+    let (undeclared, released) = undeclared_rows(inputs, &ledger, &targets, &expansion.held);
+    report.changes.extend(undeclared);
 
     match mode {
         Mode::Plan => Ok(report),
@@ -320,7 +319,12 @@ pub fn run(
                 .steps()
                 .iter()
                 .any(|step| step.action().is_pending());
-            if ops.is_empty() && clones.is_empty() && expansion.pending.is_empty() && !captured {
+            if ops.is_empty()
+                && released.is_empty()
+                && clones.is_empty()
+                && expansion.pending.is_empty()
+                && !captured
+            {
                 track::agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
@@ -328,9 +332,14 @@ pub fn run(
                 return Ok(report);
             }
             // Every target first, so a clone beneath a directory a target
-            // creates is made inside it rather than before it.
-            if !ops.is_empty() {
-                let scope = ops.iter().map(|op| op.target().clone()).collect();
+            // creates is made inside it rather than before it. A file
+            // released is forgotten in the same session, after every write.
+            if !ops.is_empty() || !released.is_empty() {
+                let scope = ops
+                    .iter()
+                    .map(|op| op.target().clone())
+                    .chain(released.iter().cloned())
+                    .collect();
                 let mut session =
                     Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
                 // Before the first write, so a file staged beneath a declared
@@ -338,8 +347,8 @@ pub fn run(
                 for (dir, mode) in &decided.declared {
                     session.declare_dir(dir, *mode);
                 }
-                let progress = execute::progress(ops.len(), inputs.progress);
-                execute::execute(ops, session, &progress)?;
+                let progress = execute::progress(execute::steps(&ops, &released), inputs.progress);
+                execute::execute(ops, &released, session, &progress)?;
             }
             if !clones.is_empty() {
                 inputs.state.ensure()?;
@@ -481,7 +490,7 @@ fn link_pending(
         let scope = decided.ops.iter().map(|op| op.target().clone()).collect();
         let session = Session::open(&inputs.state, SessionKind::Apply, &inputs.home, scope)?;
         let progress = execute::progress(decided.ops.len(), inputs.progress);
-        execute::execute(decided.ops, session, &progress)?;
+        execute::execute(decided.ops, &[], session, &progress)?;
     }
     Ok(())
 }
@@ -510,14 +519,16 @@ fn link_pending(
 /// children this run cannot list — counts as declared too, by the same rule.
 ///
 /// The rows are [`decide::decide_undeclared`]'s, which writes nothing, so they
-/// produce no op: `apply` leaves the file and its ledger entry as they are,
-/// and the next `plan` shows the same row.
+/// produce no op: `apply` leaves each file as it is. Returned beside them is
+/// every path a row releases — [`Action::Release`], a file edited since bx
+/// wrote it — whose ledger entry `apply` drops. Every other row's entry
+/// stays, and the next `plan` shows the same row.
 fn undeclared_rows(
     inputs: &Inputs,
     ledger: &LedgerView,
     targets: &[Resolution<Target>],
     held: &[Portable],
-) -> Vec<Change> {
+) -> (Vec<Change>, Vec<Portable>) {
     let blocked = inputs
         .declared_targets()
         .filter(|(_, resolution)| matches!(resolution, Resolution::Blocked(_)))
@@ -564,7 +575,8 @@ fn undeclared_rows(
         held.iter()
             .any(|dir| path.as_str().starts_with(&format!("{dir}/")))
     };
-    ledger
+    let mut released = Vec::new();
+    let rows = ledger
         .iter()
         .filter(|(path, _)| !declared.contains(path.as_str()))
         .filter(|(path, _)| !held_beneath(path))
@@ -572,8 +584,15 @@ fn undeclared_rows(
         .filter(|(path, _)| {
             !(tracking_held_back && paths::normalize(&path.render(&inputs.home)).starts_with(&repo))
         })
-        .map(|(_, entry)| decide::decide_undeclared(entry, &origin, &inputs.home))
-        .collect()
+        .map(|(path, entry)| {
+            let row = decide::decide_undeclared(entry, &origin, &inputs.home);
+            if row.action == Action::Release {
+                released.push(path.clone());
+            }
+            row
+        })
+        .collect();
+    (rows, released)
 }
 
 /// Declare, for each generated file `declared` names, the startup files whose

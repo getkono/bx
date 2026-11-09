@@ -1525,6 +1525,9 @@ fn removal_row(removal: &Removal, home: &Path) -> String {
         Restored::Reverted { .. } => "put back the file bx replaced".to_string(),
         Restored::Removed { .. } => "removed the file bx created".to_string(),
         Restored::AlreadyGone { .. } => "was already gone".to_string(),
+        Restored::Kept { .. } => {
+            "left as you edited it; nothing declares it, so bx stops managing it".to_string()
+        }
         Restored::Unmanaged { .. } => "left as it is; bx never wrote it".to_string(),
         Restored::Conflict { note, .. } => {
             return format!("  ! {target}  {note}; still managed\n");

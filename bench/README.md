@@ -34,6 +34,26 @@ updates defined and registered in it. What bx's generated files cost.
 measure when either interactive file lacks the hook, so the number always
 includes it.
 
+**`noise`** — printed under each `overhead`: how far that median moves by
+chance on this machine, estimated from the starts that differ only by chance,
+each round's two `baseline` starts. The median absolute deviation of their
+differences, times 1.4826, is a robust estimate of their standard deviation;
+that is √2 times a round's, and the median of `BX_BENCH_ROUNDS` rounds
+deviates about 1.2533 / √rounds times as much again. The noise is twice that.
+It decides how an `overhead` over budget fails, never whether one passes:
+
+- over budget by more than the noise, it fails at once;
+- over budget within the noise, that shell is measured again in as many fresh
+  rounds, and fails only if the repeat is over budget too, whatever its noise;
+- under budget, it passes. The budget never moves, so a pass always reads an
+  overhead under it.
+
+A macOS runner's zsh `baseline` is 35-40 ms, against about 15 ms on Linux, so
+the 5 ms budget is a much smaller share of what is measured there: the same
+generated files have read 1.70 ms on one macOS runner and 5.12 ms on another.
+A real regression is over budget in both readings, or beyond the noise in the
+first; one slow spell is rarely either.
+
 **`spawns`** — invariant 6 says the startup path spawns no process, and the
 bench holds it twice. Read: the lines of those files, comments aside, that hold
 a command substitution, which covers branches this home never takes; it counts
@@ -136,4 +156,6 @@ results/                  hyperfine JSON per measurement, round and shell (gitig
 
 `BX_BENCH_RUNS` (default 50) sets the minimum runs per fixture of the `net`
 measurement, and the runs per fixture of the `overhead` measurement, two in
-each of its rounds.
+each of its rounds. `BX_BENCH_ROUNDS` sets the rounds directly; the macOS job
+sets it to 50, since its noisier runner needs more rounds for the same noise,
+and a round there is only four zsh or bash starts.

@@ -459,9 +459,13 @@ jobs:
     # and a change that starts a process only there, or slows startup only
     # there, would otherwise merge green. See bench/README.md.
     #
-    # MISE_AUTO_INSTALL is off for the reason written out in `bench`.
+    # MISE_AUTO_INSTALL is off for the reason written out in `bench`. A macOS
+    # runner's zsh baseline is two to three times Linux's and noisier with it,
+    # so the overhead is read from twice the default rounds: the median moves
+    # less by chance, and the noise bench/run.sh reports beside it is smaller.
     env:
       MISE_AUTO_INSTALL: "false"
+      BX_BENCH_ROUNDS: "50"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

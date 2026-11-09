@@ -64,7 +64,11 @@ pub(in crate::plan) enum Undo {
 /// edits are the user's; one already gone; one already holding what bx would
 /// put back, as a file bx claimed because it already matched does; and a
 /// copy in the config repo, whose history is git's to keep and which `apply`
-/// never changes.
+/// never changes. A region or include line is judged by the whole file it is
+/// in, as `bx rm` judges it: once the user has edited anything in that file,
+/// it is released with bx's region or include line still in it, because
+/// cutting the span out would rewrite a file whose bytes are no longer
+/// all bx's.
 ///
 /// Any other drift — retargeted, its mode changed, or something of another
 /// kind in its place — is an [`Action::Conflict`] saying why, as drift is for

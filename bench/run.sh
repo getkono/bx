@@ -26,8 +26,11 @@
 #             threshold would be arbitrary.
 #
 # And, gated, invariant 6 traced on the running shells: any process started
-# while bx's startup files ran alone, which must be none, and the files under
-# the configuration and state directories they read.
+# while bx's own startup lines ran alone, which must be none, and the files
+# under the configuration and state directories they read. A tool's cached
+# activation output is the one exception: what it starts, as starship's
+# continuation prompt does, it starts as it would under `eval "$(tool init)"`,
+# and the overhead counts it.
 #
 # Environment:
 #   BX_BIN        the bx binary to apply with (default: target/release/bx,
@@ -191,10 +194,54 @@ startup() { # startup <shell> <fixture>: the command that starts it, as one line
 # searched for a command substitution, including branches a start in this home
 # never takes. The hand-written rc files are searched too, so a pattern that
 # finds nothing is known to work.
+#
+# The one exception is a tool's cached activation output: bx sources it as the
+# tool printed it, so a substitution the tool emitted runs at every start, as
+# it would under `eval "$(tool init)"`, and the overhead above counts it. bx
+# caches that output verbatim, as one single-quoted `eval` under a
+# `# bx activation: NAME` line, so following that quoting splits bx's own lines
+# from the tools'. bx's own must hold no substitution, and the cached output
+# must hold exactly the ones the tools print themselves: one bx added inside
+# it, or dropped from it, changes that count.
 # shellcheck disable=SC2016 # the patterns are literal on purpose.
 SUBST='\$(' TICK='`'
+count() { # count: lines on stdin, not comments, holding a command substitution
+	grep -v '^[[:space:]]*#' | grep -c -e "$SUBST" -e "$TICK" || true
+}
 spawns() { # spawns <file>...: lines, not comments, holding a command substitution
-	cat "$@" | grep -v '^[[:space:]]*#' | grep -c -e "$SUBST" -e "$TICK" || true
+	cat "$@" | count
+}
+split() { # split <own|cached> <file>...: bx's own lines, or the tools' cached output
+	want="$1"
+	shift
+	awk -v want="$want" '
+		!block && /^# bx activation: / { block = 1; head = 1 }
+		{
+			cached = block
+			# Inside single quotes only a quote means anything; outside, a
+			# backslash escapes the next character. The block ends with the
+			# line that closes the eval quote it opened.
+			for (i = 1; block && !head && i <= length($0); i++) {
+				c = substr($0, i, 1)
+				if (open) {
+					if (c == "\047") open = 0
+				} else if (c == "\\") {
+					i++
+				} else if (c == "\047") {
+					open = 1
+				}
+			}
+			if (block && !head && !open) block = 0
+			head = 0
+			if ((want == "cached") == cached) print
+		}' "$@"
+}
+emitted() { # emitted <shell>: what the tools the hand-written rc activates print for it
+	# shellcheck disable=SC2016 # the pattern is literal on purpose.
+	sed -n 's/^eval "\$(\(.*\))"$/\1/p' "${WORK}/legacy/.${1}rc" | while read -r tool; do
+		# shellcheck disable=SC2086 # a command line, split into its words on purpose.
+		env -i PATH="$SEARCH" $tool
+	done
 }
 generated() { # generated <shell>: the startup files bx wrote or attached to
 	case "$1" in
@@ -204,17 +251,30 @@ generated() { # generated <shell>: the startup files bx wrote or attached to
 }
 for sh in $SHELLS; do
 	# shellcheck disable=SC2046 # the scratch paths hold no whitespace.
-	found="$(spawns $(generated "$sh"))"
+	found="$(split own $(generated "$sh") | count)"
+	# shellcheck disable=SC2046
+	cached="$(split cached $(generated "$sh") | count)"
+	tools="$(emitted "$sh" | count)"
 	legacy="$(spawns "${WORK}/legacy/.${sh}rc")"
 	[ "$legacy" -eq 4 ] || {
 		echo "error: the spawn count found ${legacy} of the hand-written ${sh}rc's 4." >&2
 		exit 1
 	}
+	[ "$tools" -gt 0 ] || {
+		echo "error: no stub's ${sh} output starts a process, as starship's does;" >&2
+		echo "       the bench would not measure what a real start costs." >&2
+		exit 1
+	}
 	[ "$found" -eq 0 ] || {
-		echo "FAIL: bx's ${sh} startup files hold ${found} line(s) that start a process:" >&2
+		echo "FAIL: bx's ${sh} startup files hold ${found} line(s) of their own that start a process:" >&2
 		# shellcheck disable=SC2046
-		grep -n -e "$SUBST" -e "$TICK" $(generated "$sh") |
-			grep -v ':[0-9]*:[[:space:]]*#' >&2 || true
+		split own $(generated "$sh") | grep -n -e "$SUBST" -e "$TICK" |
+			grep -v '^[0-9]*:[[:space:]]*#' >&2 || true
+		exit 1
+	}
+	[ "$cached" -eq "$tools" ] || {
+		echo "FAIL: bx's cached ${sh} activations hold ${cached} line(s) that start a process;" >&2
+		echo "      the tools themselves print ${tools}." >&2
 		exit 1
 	}
 done
@@ -225,10 +285,27 @@ done
 # The account's own lines are not bx's to answer for (the baseline zshrc's
 # compinit starts a process of its own). The hand-written rc files' activation
 # lines are traced the same way, so a trace that sees nothing is known to work.
+#
+# The tools' cached output is the exception the read check above attributes,
+# and the trace attributes it the same way. `cached` runs the regions as bx
+# wrote them, so it starts what the stub starship's output starts, and must
+# read above 0: the bench measures that spawn rather than missing it. `bx`
+# runs the same regions sourcing copies of bx's generated files with every
+# cached activation split out, so it runs bx's own lines alone, and must read
+# 0.
 TRACE="${WORK}/trace"
-mkdir -p "${TRACE}/bx" "${TRACE}/legacy"
+SHARE="${WORK}/bx/.local/share/bx"
+mkdir -p "${TRACE}/bx" "${TRACE}/cached" "${TRACE}/legacy" "${TRACE}/own"
+for f in "$SHARE"/*; do
+	split own "$f" >"${TRACE}/own/${f##*/}"
+done
 for rc in .zshenv .zshrc .bashrc; do
-	sed -n '/^# >>> bx >>>$/,/^# <<< bx <<<$/p' "${WORK}/bx/${rc}" >"${TRACE}/bx/${rc}"
+	sed -n '/^# >>> bx >>>$/,/^# <<< bx <<<$/p' "${WORK}/bx/${rc}" >"${TRACE}/cached/${rc}"
+	sed "s|~/.local/share/bx/|${TRACE}/own/|g" "${TRACE}/cached/${rc}" >"${TRACE}/bx/${rc}"
+	grep -qF "${TRACE}/own/" "${TRACE}/bx/${rc}" || {
+		echo "error: bx's ${rc} region sources nothing from ~/.local/share/bx to trace." >&2
+		exit 1
+	}
 done
 for rc in .zshrc .bashrc; do
 	grep '^eval ' "${WORK}/legacy/${rc}" >"${TRACE}/legacy/${rc}"
@@ -241,8 +318,10 @@ traced() { # traced <shell> <fixture> [command]: start it with only its traced l
 	esac
 	fixture="$1" command="$2"
 	shift 2
+	home="${WORK}/bx" # every trace fixture but the hand-written one starts the bx home
+	[ "$fixture" != legacy ] || home="${WORK}/legacy"
 	# shellcheck disable=SC2086 # WATCH is a command line; the scratch paths hold no whitespace.
-	$WATCH env -i HOME="${WORK}/${fixture}" ZDOTDIR="${TRACE}/${fixture}" PATH="$SEARCH" \
+	$WATCH env -i HOME="$home" ZDOTDIR="${TRACE}/${fixture}" PATH="$SEARCH" \
 		"$@" -c "$command" 2>/dev/null
 }
 
@@ -308,13 +387,19 @@ for sh in $SHELLS; do
 		echo "error: the ${sh} trace saw no process start from the hand-written ${sh}rc." >&2
 		exit 1
 	}
+	cached="$(spawned "$sh" cached)"
+	[ "${cached:-0}" -gt 0 ] || {
+		echo "error: the ${sh} trace saw no process start from the cached activations," >&2
+		echo "       as the stub starship's output starts one; the bench would not measure it." >&2
+		exit 1
+	}
 	spawns="$(spawned "$sh" bx)"
 	[ -n "$spawns" ] || {
 		echo "error: the ${sh} trace of bx's startup files read nothing back." >&2
 		exit 1
 	}
 	[ "$spawns" -eq 0 ] || {
-		echo "FAIL: bx's ${sh} startup files started a process (${spawns} $(unit))." >&2
+		echo "FAIL: bx's own ${sh} startup lines started a process (${spawns} $(unit))." >&2
 		exit 1
 	}
 done
@@ -497,7 +582,7 @@ for shell in shells:
     if not again:
         continue
     net = medians("net", shell)
-    print(f"  spawns     {0:7d}      processes bx's startup files started")
+    print(f"  spawns     {0:7d}      processes bx's own startup lines started")
     print(f"  reads      {0:7d}      configuration files they read")
     print()
     print(f"  legacy     {net['legacy']:7.2f} ms   eval \"$(tool init)\" per tool")
@@ -529,4 +614,4 @@ if [ -n "$retry" ]; then
 	judge again "" $retry
 fi
 printf 'OK: bx adds less than its %.2f ms budget to %s,\n' "$BUDGET_MS" "$(echo "$SHELLS" | sed 's/ / and /')"
-echo "    starts no process and reads no configuration."
+echo "    and its own startup lines start no process and read no configuration."

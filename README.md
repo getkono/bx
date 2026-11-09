@@ -142,7 +142,9 @@ needs is missing, and a file it wrote is no longer declared.
 
 ```
   +  create     it does not exist yet
-  ~  modify     bx owns it and the content differs
+  ~  modify     bx owns it and the content differs — or it already holds
+                exactly what bx wants, and bx takes ownership of it
+                without changing a byte, so `bx rm` leaves it in place
   <  sync       a tracked file this machine changed; `bx sync` carries
                 this machine's copy into the repo and commits it
   !  conflict   it exists, differs, and bx does not own it — or you edited

@@ -249,6 +249,92 @@ fn an_owned_file_already_holding_the_body_is_unchanged() {
     assert_eq!(exit(&report, Mode::Plan), Exit::Converged);
 }
 
+/// A file bx does not own at `~/.a`, already holding `bx\n` at `mode`, under
+/// a target that wants exactly that.
+fn an_unowned_match(home: &GuardedHome, mode: u32) -> Inputs {
+    home.write(".a", "bx\n");
+    fs::set_mode(&home.child(".a"), FileMode::from_bits(mode)).expect("chmod");
+    let layer =
+        format!("[[target]]\npath = \"~/.a\"\ncontent = \"bx\\n\"\nmode = \"{mode:04o}\"\n");
+    inputs(home, &layer)
+}
+
+#[test]
+fn a_file_bx_does_not_own_that_already_matches_is_claimed_with_no_diff() {
+    let home = guarded_home();
+    // Not the default mode, and no narrower than the home it sits in.
+    let inputs = an_unowned_match(&home, 0o755);
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Modify]);
+    assert_eq!(planned.changes[0].diff, None);
+    assert_eq!(planned.changes[0].note.as_deref(), Some(decide::CLAIM));
+    assert_eq!(exit(&planned, Mode::Plan), Exit::Pending);
+
+    // Invariant 7: apply announces the row plan did, and writes nothing else.
+    let applied = apply(&inputs);
+    assert!(applied.executed);
+    assert_eq!(applied.changes, planned.changes);
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"bx\n");
+    assert_eq!(mode_of(&home.child(".a")), 0o755);
+
+    let state = StateDir::resolve(home.path());
+    let ledger = LedgerView::read(&state, home.path())
+        .expect("the ledger")
+        .value;
+    let target = Portable::parse_in("~/.a", home.path()).expect("a portable target");
+    let entry = ledger.get(&target).expect("claimed");
+    let observed = fs::observe(&home.child(".a")).expect("observe");
+    assert_eq!(Some(entry.written), observed.digest());
+    assert_eq!(entry.mode, FileMode::from_bits(0o755));
+    assert_eq!(entry.mechanism, Mechanism::Own);
+    assert!(
+        matches!(entry.prior, crate::state::Prior::Existed(_)),
+        "{entry:?}"
+    );
+
+    // Invariant 3: the claim is recorded, so the next plan is empty.
+    let again = plan(&inputs);
+    assert_eq!(again.actions(), vec![Action::Unchanged]);
+    assert_eq!(again.changes[0].note, None);
+    assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+}
+
+#[test]
+fn a_claimed_file_takes_the_repo_s_next_change_as_a_modify() {
+    let home = guarded_home();
+    apply(&an_unowned_match(&home, 0o644));
+
+    let changed = inputs(&home, &inline("~/.a", "v2\\n"));
+    let planned = plan(&changed);
+    assert_eq!(planned.actions(), vec![Action::Modify]);
+    assert_eq!(planned.changes[0].note, None);
+    assert_eq!(
+        text(&planned.changes[0]),
+        "--- ~/.a (on disk)\n+++ ~/.a (bx)\n@@ -1 +1 @@\n-bx\n+v2\n"
+    );
+
+    apply(&changed);
+    assert_eq!(std::fs::read(home.child(".a")).expect("updated"), b"v2\n");
+    assert_eq!(plan(&changed).actions(), vec![Action::Unchanged]);
+}
+
+#[test]
+fn rm_hands_a_claimed_file_back_exactly_as_it_was_found() {
+    let home = guarded_home();
+    let inputs = an_unowned_match(&home, 0o600);
+    let before = snapshot(home.path(), &OUTSIDE);
+
+    apply(&inputs);
+    let state = StateDir::resolve(home.path());
+    let targets = ledger_targets(&state, home.path());
+    assert_eq!(targets.len(), 1);
+    crate::restore::restore(&state, home.path(), &targets).expect("restore");
+
+    assert_eq!(snapshot(home.path(), &OUTSIDE), before);
+    assert!(ledger_targets(&state, home.path()).is_empty());
+}
+
 #[test]
 fn a_file_bx_attached_to_another_way_is_a_conflict() {
     let home = guarded_home();

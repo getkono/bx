@@ -371,20 +371,24 @@ pub(super) fn decide(
         parent_note(&observed, mode, ctx).unwrap_or(outcome.parent_note),
     ]);
     let entry = ctx.ledger.get(&target.path);
+    let found: Action = outcome.drift.into();
+    let unclaimed = note.clone();
     let (action, note) = match target.attach {
-        Attach::Region { comment } => {
-            region_ownership(outcome.drift.into(), &observed, entry, comment, note)
-        }
-        _ => ownership(outcome.drift.into(), &observed, entry, note),
+        Attach::Region { comment } => region_ownership(found, &observed, entry, comment, note),
+        _ => ownership(found, &observed, entry, note),
     };
+    let claim = found == Action::Unchanged && action == Action::Modify;
 
     // A write into a directory its owner cannot write or search is refused
     // here, so `apply` never reaches `stage` for it. A row with no write is
-    // left as it is: there is nothing to refuse.
+    // left as it is: there is nothing to refuse. A claim is a write only so
+    // the ledger can record it, and a file already right is no conflict: it
+    // stays unchanged and unclaimed until its directory takes a write.
     let (action, note) = match (
         action.is_pending(),
         locked_parent(&observed, ctx.home, ctx.declared, Write::File),
     ) {
+        (true, Some(_)) if claim => (Action::Unchanged, unclaimed),
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
         _ => (action, note),
     };
@@ -937,6 +941,14 @@ fn track_into_repo(
 /// Only a file bx wrote whole, and that still holds exactly what bx last left,
 /// may be modified. Everything else in the way is a conflict: reported and
 /// skipped.
+///
+/// The one exception is a file bx does not own that already holds exactly
+/// the bytes and mode the target wants. Declaring the target says bx may own
+/// it, and nothing the user wrote is at risk, so it is claimed: a modify with
+/// no diff, whose write leaves the same bytes and records them as the prior,
+/// so the ledger owns the file from then on and `rm` leaves it where it is.
+/// Without the claim the file stays unowned, and the repo's next change to it
+/// is a conflict nobody caused.
 fn ownership(
     action: Action,
     observed: &Observed,
@@ -951,6 +963,7 @@ fn ownership(
                 attached_as(&entry.mechanism)
             ))
         }
+        (Action::Unchanged, None) => (Action::Modify, join([Some(CLAIM.to_string()), note])),
         (Action::Modify, None) => conflict("exists and bx does not own it".to_string()),
         (Action::Modify, Some(entry)) if observed.digest() != Some(entry.written) => {
             conflict("edited since bx last wrote it".to_string())
@@ -964,6 +977,11 @@ fn ownership(
         _ => (action, note),
     }
 }
+
+/// The note a claim's row carries: what `apply` does to a file bx does not own
+/// that already holds what the target wants.
+pub(super) const CLAIM: &str =
+    "already holds what bx wants; bx takes ownership of it and leaves its bytes as they are";
 
 /// How a ledger mechanism reads in a note.
 pub(super) const fn attached_as(mechanism: &Mechanism) -> &'static str {
@@ -1318,6 +1336,36 @@ mod tests {
     fn the_supported_shape_is_not_unsupported() {
         let home = guarded_home();
         assert_eq!(unsupported(&a_target(home.path(), "~/.a")), None);
+    }
+
+    #[test]
+    fn a_match_bx_cannot_claim_for_its_locked_parent_stays_unchanged() {
+        // A claim is a write, and a directory that denies its owner write
+        // cannot take one. The file is already right, so it is no conflict:
+        // it stays as it was before claims, unchanged and unowned.
+        let home = guarded_home();
+        let layer = [
+            crate::plan::tests::inline("~/locked/conf", "x\\n"),
+            crate::plan::tests::inline("~/locked/owned", "v2\\n"),
+        ]
+        .concat();
+        let inputs = crate::plan::tests::inputs(&home, &layer);
+        home.write("locked/conf", "x\n");
+        crate::plan::tests::own(home.path(), "locked/owned", b"v1\n", Mechanism::Own);
+        let _unlock = locked_dir_at(home.path(), "locked", 0o500);
+
+        let planned = plan_of(&inputs);
+        let file = row_for(&planned, "~/locked/conf");
+        assert_eq!(file.action, Action::Unchanged, "{file:?}");
+        assert_eq!(file.note, None, "{file:?}");
+        // A file bx owns whose content differs is a real write there, and is
+        // refused as one.
+        let owned = row_for(&planned, "~/locked/owned");
+        assert_eq!(owned.action, Action::Conflict, "{owned:?}");
+
+        let applied = apply_of(&inputs);
+        assert!(!applied.executed, "apply wrote: {applied:?}");
+        assert_eq!(applied.changes, planned.changes);
     }
 
     #[test]

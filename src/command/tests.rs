@@ -1,5 +1,6 @@
 use super::*;
-use crate::plan::tests::{env, inline, seed};
+use crate::plan::tests::{env, inline, own, seed};
+use crate::state::Mechanism;
 use crate::testing::{guarded_home, ignored_child, run_ignored_child};
 
 fn text(out: &[u8]) -> &str {
@@ -120,7 +121,7 @@ fn plan_exits_zero_when_converged_and_two_when_pending() {
 #[test]
 fn status_shows_what_plan_hides() {
     let home = guarded_home();
-    home.write(".a", "a\n");
+    own(home.path(), ".a", b"a\n", Mechanism::Own);
     seed(home.path(), &inline("~/.a", "a\\n"));
 
     let mut shown = Vec::new();

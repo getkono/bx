@@ -267,13 +267,19 @@ impl Layer {
 
 /// An upstream at `~/upstream` holding one commit, reachable as [`URL`];
 /// returns that commit.
+///
+/// Automatic maintenance is off in `~/.gitconfig`, which bx's git reads too:
+/// after bx fetches into the clone, git starts maintenance detached, and it
+/// can still hold `objects/maintenance.lock` when the property snapshots the
+/// home.
 fn upstream(home: &GuardedHome) -> String {
     let dir = home.child("upstream");
     std::fs::create_dir_all(&dir).expect("the upstream");
     home.write(
         ".gitconfig",
         &format!(
-            "[url \"file://{}/\"]\n\tinsteadOf = https://example.invalid/\n",
+            "[url \"file://{}/\"]\n\tinsteadOf = https://example.invalid/\n\
+             [maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n",
             home.path().display()
         ),
     );

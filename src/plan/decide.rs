@@ -19,7 +19,7 @@
 //! can write inside the directory a destination is in, [`dir`] and [`link`]
 //! the decisions for directory and symlink targets, [`guard`] Invariant 2's
 //! judgement of a generated body, and [`undeclared`] the row for a file bx
-//! wrote that nothing declares any more.
+//! wrote that nothing declares any more, with the write that takes it back.
 
 mod dir;
 mod guard;
@@ -36,7 +36,7 @@ use self::guard::guard_generated;
 pub(super) use self::guard::{guard_environment_d, guard_fragment};
 use self::link::decide_link;
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
-pub(super) use self::undeclared::decide_undeclared;
+pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
 use crate::config::resolve::Resolution;
@@ -227,6 +227,15 @@ enum Made {
     Dir,
     /// A symlink holding this text, made or retargeted.
     Link(PathBuf),
+    /// No file: one bx created and nothing declares any more, removed with
+    /// these directories bx created for it, deepest first.
+    Absent(Vec<PathBuf>),
+    /// No directory: one bx created and nothing declares any more, removed
+    /// while empty, with these directories bx created for it.
+    DirAbsent(Vec<PathBuf>),
+    /// No symlink: one bx made and nothing declares any more, unlinked, with
+    /// these directories bx created for it.
+    LinkAbsent(Vec<PathBuf>),
 }
 
 impl Op {
@@ -236,10 +245,13 @@ impl Op {
     }
 
     /// The journal request that makes this write: bx owning the whole file,
-    /// a region of it, or the directory.
+    /// a region of it, or the directory — or, for a write taking back what
+    /// nothing declares any more, handing it back as `bx rm` does.
     ///
     /// A region is written as the whole file it sits in, so the journal holds
     /// the bytes it displaces whole and a roll back restores every one of them.
+    /// A removal is never claimed, so the mechanism paired with it is never
+    /// recorded.
     pub(super) fn into_request(self) -> Request {
         let (content, mechanism) = match self.made {
             Made::Bytes(bytes) => (
@@ -265,6 +277,27 @@ impl Op {
             Made::Link(text) => (
                 Content::Link {
                     text,
+                    planned: self.planned,
+                },
+                Mechanism::Link,
+            ),
+            Made::Absent(created_dirs) => (
+                Content::Absent {
+                    created_dirs,
+                    planned: self.planned,
+                },
+                Mechanism::Own,
+            ),
+            Made::DirAbsent(created_dirs) => (
+                Content::DirAbsent {
+                    created_dirs,
+                    planned: self.planned,
+                },
+                Mechanism::Dir,
+            ),
+            Made::LinkAbsent(created_dirs) => (
+                Content::LinkAbsent {
+                    created_dirs,
                     planned: self.planned,
                 },
                 Mechanism::Link,
@@ -400,10 +433,12 @@ pub(super) fn decide(
         Action::Conflict => observed.kind == Kind::File,
         // Only a tracked target is carried into the repo, and it is decided
         // by `decide_track`.
-        // A declared target is never released: only an undeclared one is.
+        // A declared target is never undone or released: only an undeclared
+        // one is.
         Action::Unchanged
         | Action::Sync
         | Action::Undeclared
+        | Action::Undo
         | Action::Release
         | Action::Blocked => false,
     };

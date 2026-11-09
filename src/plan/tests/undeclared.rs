@@ -15,53 +15,276 @@ fn ledger(home: &GuardedHome) -> LedgerView {
 }
 
 #[test]
-fn a_file_whose_target_was_deleted_is_reported_naming_bx_rm() {
+fn a_file_whose_target_was_deleted_is_announced_as_undone() {
     let home = guarded_home();
     let inputs = dropped(&home);
 
     let report = plan(&inputs);
-    assert_eq!(
-        report.actions(),
-        vec![Action::Unchanged, Action::Undeclared]
-    );
+    assert_eq!(report.actions(), vec![Action::Unchanged, Action::Undo]);
     let row = &report.changes[1];
     assert_eq!(row.target, "~/.a");
-    assert_eq!(row.diff, None);
+    // Concealed: nothing says any more whether it was a secret.
+    assert_eq!(
+        row.diff.as_ref().map(|diff| &diff.kind),
+        Some(&DiffKind::Summary {
+            before: Some(2),
+            after: 0,
+            why: crate::plan::diff::Why::Secret,
+        })
+    );
     assert_eq!(
         row.note.as_deref(),
-        Some(
-            "the configuration no longer declares it, so bx leaves it as it is; \
-                     `bx rm ~/.a` releases it"
-        )
+        Some("bx created it; the configuration no longer declares it, so apply removes it")
     );
     assert_eq!(row.origin, Origin::unknown(&inputs.state().ledger()));
-    assert_eq!(exit(&report, Mode::Plan), Exit::Converged);
+    assert_eq!(exit(&report, Mode::Plan), Exit::Pending);
 }
 
 #[test]
-fn apply_writes_nothing_for_it_and_the_next_plan_shows_it_again() {
+fn apply_removes_it_as_rm_would_and_the_next_plan_is_empty() {
+    let home = guarded_home();
+    // The home before `~/.a` was ever declared, but for bx's own records.
+    let before = snapshot(home.path(), &[]);
+    let inputs = dropped(&home);
+    let a = Portable::parse_in("~/.a", home.path()).expect("a path");
+
+    let planned = plan(&inputs);
+    let applied = apply(&inputs);
+    assert!(applied.executed);
+    assert_eq!(
+        applied.changes, planned.changes,
+        "apply does what plan said"
+    );
+    assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+    assert!(!home.child(".a").exists(), "removed");
+    assert_eq!(std::fs::read(home.child(".b")).expect("kept"), b"b\n");
+    assert!(ledger(&home).get(&a).is_none(), "its entry is gone");
+    assert!(!StateDir::resolve(home.path()).journal().exists());
+
+    let again = plan(&inputs);
+    assert_eq!(again.actions(), vec![Action::Unchanged]);
+    assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+    // Nothing but `~/.b`, bx's records and the repo, with the directory
+    // the repo sits in, changed.
+    let skip = [".local", ".config", ".b"];
+    assert_eq!(
+        snapshot(home.path(), &skip),
+        before
+            .into_iter()
+            .filter(|(rel, ..)| !skip.iter().any(|prefix| rel.starts_with(prefix)))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn sync_takes_it_back_as_apply_does() {
     let home = guarded_home();
     let inputs = dropped(&home);
-    let before = snapshot(home.path(), &[]);
-    let owned = ledger(&home);
 
-    let applied = apply(&inputs);
-    assert!(!applied.executed, "nothing to write, so no session");
-    assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
-    assert_eq!(snapshot(home.path(), &[]), before);
-    assert_eq!(ledger(&home), owned);
-    assert_eq!(plan(&inputs).changes, applied.changes);
+    let synced = run(&inputs, Mode::Sync, &mut |_| Ok(true)).expect("sync");
+    assert!(synced.executed);
+    assert_eq!(synced.actions(), vec![Action::Unchanged, Action::Undo]);
+    assert!(!home.child(".a").exists());
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
 }
 
 #[test]
-fn a_target_switched_off_is_reported_the_same_way() {
+fn a_target_switched_off_is_taken_back_the_same_way() {
     let home = guarded_home();
-    apply(&inputs(&home, &inline("~/.a", "a\\n")));
-    let off = format!("{}enabled = false\n", inline("~/.a", "a\\n"));
+    let both = format!("{}{}", inline("~/.a", "a\\n"), inline("~/.b", "b\\n"));
+    apply(&inputs(&home, &both));
+    let off = format!(
+        "{}enabled = false\n{}",
+        inline("~/.a", "a\\n"),
+        inline("~/.b", "b\\n")
+    );
 
     let report = plan(&inputs(&home, &off));
-    assert_eq!(report.actions(), vec![Action::Undeclared]);
-    assert_eq!(report.changes[0].target, "~/.a");
+    assert_eq!(report.actions(), vec![Action::Unchanged, Action::Undo]);
+    assert_eq!(report.changes[1].target, "~/.a");
+}
+
+#[test]
+fn a_configuration_declaring_nothing_takes_back_nothing() {
+    let home = guarded_home();
+    apply(&inputs(&home, &inline("~/.a", "a\\n")));
+    let owned = ledger(&home);
+    // Switched off, it is all the configuration says: nothing is declared.
+    let off = format!("{}enabled = false\n", inline("~/.a", "a\\n"));
+
+    for layer in ["", off.as_str()] {
+        let inputs = inputs(&home, layer);
+        let report = plan(&inputs);
+        assert_eq!(report.actions(), vec![Action::Undeclared], "{layer:?}");
+        let note = report.changes[0].note.as_deref().expect("a note");
+        assert!(
+            note.starts_with("the configuration declares nothing at all"),
+            "{note}"
+        );
+        assert!(note.ends_with("`bx rm ~/.a` releases it"), "{note}");
+        assert_eq!(exit(&report, Mode::Plan), Exit::Converged);
+        assert!(!apply(&inputs).executed, "{layer:?}");
+        assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"a\n");
+        assert_eq!(ledger(&home), owned);
+    }
+}
+
+#[test]
+fn a_file_bx_replaced_gets_its_earlier_bytes_and_mode_back() {
+    let home = guarded_home();
+    // Claimed as it was found at 0600, then changed by the repo.
+    home.write(".a", "bx\n");
+    fs::set_mode(&home.child(".a"), FileMode::PRIVATE_FILE).expect("chmod");
+    let claim = "[[target]]\npath = \"~/.a\"\ncontent = \"bx\\n\"\nmode = \"0600\"\n";
+    apply(&inputs(&home, claim));
+    let changed = "[[target]]\npath = \"~/.a\"\ncontent = \"v2\\n\"\nmode = \"0644\"\n";
+    apply(&inputs(&home, changed));
+    assert_eq!(std::fs::read(home.child(".a")).expect("changed"), b"v2\n");
+    let inputs = inputs(&home, &inline("~/.b", "b\\n"));
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Create, Action::Undo]);
+    assert_eq!(
+        planned.changes[1].note.as_deref(),
+        Some(
+            "bx replaced the file that was here; the configuration no longer declares it, so \
+             apply puts that file back"
+        )
+    );
+    assert_eq!(
+        planned.changes[1].diff.as_ref().map(|diff| &diff.kind),
+        Some(&DiffKind::Summary {
+            before: Some(3),
+            after: 3,
+            why: crate::plan::diff::Why::Secret,
+        })
+    );
+
+    let applied = apply(&inputs);
+    assert_eq!(applied.changes, planned.changes);
+    assert_eq!(std::fs::read(home.child(".a")).expect("restored"), b"bx\n");
+    assert_eq!(mode_of(&home.child(".a")), 0o600);
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+}
+
+#[test]
+fn a_file_claimed_as_it_was_found_stays_and_is_only_forgotten() {
+    let home = guarded_home();
+    home.write(".a", "bx\n");
+    apply(&inputs(&home, &inline("~/.a", "bx\\n")));
+    let inputs = inputs(&home, &inline("~/.b", "b\\n"));
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Create, Action::Release]);
+    assert_eq!(planned.changes[1].diff, None);
+    assert_eq!(
+        planned.changes[1].note.as_deref(),
+        Some(
+            "it already holds what was here before bx wrote it; the configuration no longer \
+             declares it, so bx leaves it as it is and stops managing it"
+        )
+    );
+    apply(&inputs);
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"bx\n");
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+}
+
+#[test]
+fn a_file_dropped_from_a_tree_is_taken_back_alone_with_the_directories_bx_made() {
+    let home = guarded_home();
+    home.write(".config/bx/files/t/keep", "k\n");
+    home.write(".config/bx/files/t/deep/gone", "g\n");
+    let tree = "[[target]]\npath = \"~/.t\"\ntree = \"files/t\"\n";
+    apply(&inputs(&home, tree));
+    assert!(home.child(".t/deep/gone").exists());
+    std::fs::remove_dir_all(home.child(".config/bx/files/t/deep")).expect("the removal");
+    let inputs = inputs(&home, tree);
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Unchanged, Action::Undo]);
+    assert_eq!(planned.changes[1].target, "~/.t/deep/gone");
+    apply(&inputs);
+    assert!(
+        !home.child(".t/deep").exists(),
+        "the directory bx made goes"
+    );
+    assert_eq!(std::fs::read(home.child(".t/keep")).expect("kept"), b"k\n");
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+}
+
+#[test]
+fn a_directory_and_a_link_bx_made_are_taken_back() {
+    let home = guarded_home();
+    let made = format!(
+        "[[target]]\npath = \"~/.d\"\ndir = true\n{}{}",
+        super::symlink("~/.l", "there"),
+        inline("~/.b", "b\\n")
+    );
+    apply(&inputs(&home, &made));
+    assert!(home.child(".d").is_dir());
+    let inputs = inputs(&home, &inline("~/.b", "b\\n"));
+
+    let planned = plan(&inputs);
+    assert_eq!(
+        planned.actions(),
+        vec![Action::Unchanged, Action::Undo, Action::Undo]
+    );
+    assert_eq!(
+        super::link(&planned.changes[2]),
+        (Some("there"), None),
+        "{:?}",
+        planned.changes
+    );
+    apply(&inputs);
+    assert!(!home.child(".d").exists());
+    assert!(std::fs::symlink_metadata(home.child(".l")).is_err());
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+}
+
+/// Seed `home` so its apply takes `~/.a` back: one write.
+fn seed_undo(home: &Path) {
+    std::fs::create_dir_all(home).expect("the home");
+    seed(home, &inline("~/.a", "a\\n"));
+    assert!(apply(&load(home)).executed);
+    seed(home, &inline("~/.b", "b\\n"));
+    own(home, ".b", b"b\n", Mechanism::Own);
+}
+
+#[test]
+fn an_undo_killed_at_any_journal_phase_recovers_to_the_clean_apply() {
+    let guard = guarded_home();
+    let clean = guard.child("clean");
+    seed_undo(&clean);
+    assert!(apply(&load(&clean)).executed);
+    let want = snapshot(&clean, &[".local", ".config/bx"]);
+    assert!(!clean.join(".a").exists());
+
+    let boundaries = crate::journal::tests::crash_phases()
+        .map(|phase| (0, phase))
+        .into_iter()
+        .chain(crate::journal::tests::finish_crash_phases().map(|phase| (1, phase)));
+    let mut crossed = 0;
+    for (index, phase) in boundaries {
+        let at = format!("{index}:{phase}");
+        let home = guard.child(format!("crash-{index}-{phase}"));
+        seed_undo(&home);
+        let output = super::spawn_crash_child(&home, index, phase);
+        let inputs = load(&home);
+        // A removal stages nothing, so the phases between staging and
+        // publishing are never reached: the child finishes.
+        if output.status.success() {
+            assert_eq!(snapshot(&home, &[".local", ".config/bx"]), want, "{at}");
+            continue;
+        }
+        crossed += 1;
+        assert!(plan(&inputs).interrupted.is_some(), "{at}");
+        let recovering = apply(&inputs);
+        assert!(recovering.recovered.is_some(), "{at}");
+        apply(&inputs);
+        assert_eq!(snapshot(&home, &[".local", ".config/bx"]), want, "{at}");
+        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged], "{at}");
+    }
+    assert!(crossed >= 4, "only {crossed} phases were crossed");
 }
 
 #[test]
@@ -168,20 +391,18 @@ fn a_file_whose_mode_alone_changed_is_still_a_conflict_bx_rm_releases() {
 }
 
 #[test]
-fn a_file_the_user_removed_is_reported_as_gone() {
+fn a_file_the_user_removed_is_only_forgotten() {
     let home = guarded_home();
     let inputs = dropped(&home);
     std::fs::remove_file(home.child(".a")).expect("the removal");
 
     let report = plan(&inputs);
-    assert_eq!(
-        report.actions(),
-        vec![Action::Unchanged, Action::Undeclared]
-    );
+    assert_eq!(report.actions(), vec![Action::Unchanged, Action::Release]);
     let note = report.changes[1].note.as_deref().expect("a note");
     assert!(note.starts_with("it is no longer on disk; "), "{note}");
-    assert!(!apply(&inputs).executed);
+    assert!(apply(&inputs).executed);
     assert!(!home.child(".a").exists(), "nothing is written back");
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
 }
 
 #[test]
@@ -240,11 +461,13 @@ fn a_tracked_target_held_back_keeps_its_synced_repo_copy_declared() {
 }
 
 #[test]
-fn a_synced_repo_copy_is_undeclared_once_no_tracked_target_is_held_back() {
+fn a_synced_repo_copy_is_released_once_no_tracked_target_is_held_back() {
     let home = guarded_home();
     synced_repo_copy(&home);
     let report = plan(&inputs(&home, &inline("~/.b", "b\\n")));
-    assert_eq!(report.actions(), vec![Action::Create, Action::Undeclared]);
+    // The machine's copy was there before bx, so only the repo's is bx's;
+    // the repo is git's to keep, and apply never changes it.
+    assert_eq!(report.actions(), vec![Action::Create, Action::Release]);
     assert_eq!(report.changes[1].target, "~/.config/bx/files/lock");
 
     // A held-back target that is not tracked declares no repo copy.
@@ -253,7 +476,7 @@ fn a_synced_repo_copy_is_undeclared_once_no_tracked_target_is_held_back() {
         inline("~/.b", "{{who}}\\n")
     );
     let report = plan(&inputs(&home, &blocked));
-    assert_eq!(report.actions(), vec![Action::Blocked, Action::Undeclared]);
+    assert_eq!(report.actions(), vec![Action::Blocked, Action::Release]);
     assert_eq!(report.changes[1].target, "~/.config/bx/files/lock");
 }
 
@@ -315,9 +538,9 @@ fn the_plan_view_shows_the_row() {
     assert_eq!(
         shown,
         format!(
-            "  * ~/.a  ({ledger}:0) the configuration no longer declares it, so bx \
-                     leaves it as it is; `bx rm ~/.a` releases it\nPlan: 0 to create, 0 to \
-                     modify, 0 conflict, 0 blocked, 1 undeclared, 1 unchanged.\n"
+            "  - ~/.a  ({ledger}:0) bx created it; the configuration no longer declares it, \
+             so apply removes it\n    secret, not shown: 2 bytes -> 0 bytes\nPlan: 0 to \
+             create, 0 to modify, 0 conflict, 0 blocked, 1 unchanged, 1 to undo.\n"
         )
     );
 }

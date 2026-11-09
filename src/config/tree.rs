@@ -758,13 +758,17 @@ mod tests {
                 .iter()
                 .filter(|(target, _)| target.ends_with("init.lua"))
                 .collect::<Vec<_>>(),
-            [&("~/.config/x/init.lua".to_string(), Action::Undeclared)],
-            "reported, as a file bx wrote that nothing declares any more"
+            [&("~/.config/x/init.lua".to_string(), Action::Undo)],
+            "taken back, as a file bx wrote that nothing declares any more"
+        );
+        assert!(
+            !dest.join("init.lua").exists(),
+            "a file the repo no longer holds is removed, as bx left it"
         );
         assert_eq!(
-            std::fs::read_to_string(dest.join("init.lua")).expect("still there"),
-            "init\n",
-            "a file the repo no longer holds is not deleted"
+            std::fs::read_to_string(dest.join("lua/run")).expect("still there"),
+            "run\n",
+            "only the file the repo dropped"
         );
     }
 

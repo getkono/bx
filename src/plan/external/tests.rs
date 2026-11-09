@@ -1500,15 +1500,25 @@ fn a_link_is_pending_until_its_clone_then_each_child_is_linked_and_converges() {
     assert!(home.child(".claude/skills/d/SKILL.md").is_file());
     assert!(
         std::fs::symlink_metadata(home.child(".claude/skills/a")).is_ok(),
-        "left as bx made it"
+        "left as bx made it until the next apply"
     );
     assert_eq!(
         rows(&plan(&home, &layer))
             .into_iter()
             .filter(|(_, action)| *action != Action::Unchanged)
             .collect::<Vec<_>>(),
-        [("~/.claude/skills/a".to_string(), Action::Undeclared)],
+        [("~/.claude/skills/a".to_string(), Action::Undo)],
         "what nothing declares any more"
+    );
+    apply(&home, &layer);
+    assert!(
+        std::fs::symlink_metadata(home.child(".claude/skills/a")).is_err(),
+        "the link upstream dropped is removed"
+    );
+    assert!(
+        rows(&plan(&home, &layer))
+            .iter()
+            .all(|(_, action)| *action == Action::Unchanged)
     );
 }
 

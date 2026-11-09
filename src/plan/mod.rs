@@ -304,9 +304,14 @@ pub fn run(
     let first_link = report.changes.len();
     report.changes.append(&mut expansion.rows);
     // Last, after every external, so the indices `stopped` is built from are
-    // not moved: every file bx wrote that nothing declares any more.
-    let (undeclared, released) = undeclared_rows(inputs, &ledger, &targets, &expansion.held);
-    report.changes.extend(undeclared);
+    // not moved: every file bx wrote that nothing declares any more. Taken
+    // back after every other write, in the same session.
+    let undeclared = undeclared_rows(inputs, &ledger, &targets, &expansion.held);
+    let first_undeclared = report.changes.len();
+    report.changes.extend(undeclared.rows);
+    ops.extend(undeclared.ops);
+    let released = undeclared.released;
+    let undone_clones = undeclared.clones;
 
     match mode {
         Mode::Plan => Ok(report),
@@ -322,6 +327,7 @@ pub fn run(
             if ops.is_empty()
                 && released.is_empty()
                 && clones.is_empty()
+                && undone_clones.is_empty()
                 && expansion.pending.is_empty()
                 && !captured
             {
@@ -330,6 +336,11 @@ pub fn run(
             }
             if !approve(&report)? {
                 return Ok(report);
+            }
+            // Before the session, as `bx rm` removes one: a checkout's bytes
+            // are git's, and no journal can roll its removal back.
+            if !undone_clones.is_empty() {
+                remove_clones(inputs, &undone_clones, first_undeclared, &mut report)?;
             }
             // Every target first, so a clone beneath a directory a target
             // creates is made inside it rather than before it. A file
@@ -395,6 +406,48 @@ pub fn run(
             Ok(report)
         }
     }
+}
+
+/// Remove each checkout nothing declares any more that `plan` announced as
+/// [`Action::Undo`], through [`crate::restore::remove_clone`], as `bx rm`
+/// removes one: crash-safe by the ledger alone, under the exclusive lock.
+///
+/// Each is decided again as it is removed, by the same function `plan` asked,
+/// so a checkout that took on work since is left, never removed: its row, at
+/// `first_row` plus its index, is stopped with why, as an external's is.
+///
+/// # Errors
+///
+/// Whatever the state directory, the ledger or the removal returns.
+fn remove_clones(
+    inputs: &Inputs,
+    clones: &[(usize, state::LedgerEntry)],
+    first_row: usize,
+    report: &mut Report,
+) -> Result<(), Error> {
+    use crate::restore::{self, Restored};
+
+    let error = |error: restore::Error| match error {
+        restore::Error::Journal(error) => Error::Journal(error),
+        restore::Error::Recover(error) => Error::Recover(error),
+        restore::Error::State(error) => Error::State(error),
+        restore::Error::Read(error) => Error::Fs(error),
+    };
+    inputs.state.ensure()?;
+    let lock = ExclusiveLock::acquire(&inputs.state)?;
+    let mut ledger = state::Ledger::open(&inputs.state, &lock, &inputs.home)?.value;
+    for (at, entry) in clones {
+        let removed =
+            restore::remove_clone(&mut ledger, entry, &inputs.home, &inputs.git).map_err(error)?;
+        if let Restored::Conflict { note, .. } = removed {
+            let at = first_row + at;
+            report.changes[at].action = Action::Blocked;
+            report.changes[at].diff = None;
+            report.changes[at].note = Some(note);
+            report.stopped.push(at);
+        }
+    }
+    Ok(())
 }
 
 /// The path a target declares: its own, or a held-back one's key.
@@ -518,17 +571,15 @@ fn link_pending(
 /// Every entry beneath a directory in `held` — an external link's `to` whose
 /// children this run cannot list — counts as declared too, by the same rule.
 ///
-/// The rows are [`decide::decide_undeclared`]'s, which writes nothing, so they
-/// produce no op: `apply` leaves each file as it is. Returned beside them is
-/// every path a row releases — [`Action::Release`], a file edited since bx
-/// wrote it — whose ledger entry `apply` drops. Every other row's entry
-/// stays, and the next `plan` shows the same row.
+/// The rows are [`decide::decide_undeclared`]'s, and so is what `apply` does
+/// about each: see [`Undeclared`]. A row that undoes nothing and releases
+/// nothing keeps its entry, and the next `plan` shows the same row.
 fn undeclared_rows(
     inputs: &Inputs,
     ledger: &LedgerView,
     targets: &[Resolution<Target>],
     held: &[Portable],
-) -> (Vec<Change>, Vec<Portable>) {
+) -> Undeclared {
     let blocked = inputs
         .declared_targets()
         .filter(|(_, resolution)| matches!(resolution, Resolution::Blocked(_)))
@@ -575,8 +626,15 @@ fn undeclared_rows(
         held.iter()
             .any(|dir| path.as_str().starts_with(&format!("{dir}/")))
     };
-    let mut released = Vec::new();
-    let rows = ledger
+    let look = decide::Look {
+        home: &inputs.home,
+        state: &inputs.state,
+        git: &inputs.git,
+        repo: &repo,
+        declares_any: inputs.declares_any(),
+    };
+    let mut undeclared = Undeclared::default();
+    for (path, entry) in ledger
         .iter()
         .filter(|(path, _)| !declared.contains(path.as_str()))
         .filter(|(path, _)| !held_beneath(path))
@@ -584,15 +642,38 @@ fn undeclared_rows(
         .filter(|(path, _)| {
             !(tracking_held_back && paths::normalize(&path.render(&inputs.home)).starts_with(&repo))
         })
-        .map(|(path, entry)| {
-            let row = decide::decide_undeclared(entry, &origin, &inputs.home);
-            if row.action == Action::Release {
-                released.push(path.clone());
-            }
-            row
-        })
-        .collect();
-    (rows, released)
+    {
+        let (row, undo) = decide::decide_undeclared(entry, &origin, &look);
+        match undo {
+            decide::Undo::Nothing => {}
+            decide::Undo::Forget => undeclared.released.push(path.clone()),
+            decide::Undo::Write(op) => undeclared.ops.push(*op),
+            decide::Undo::Clone => undeclared
+                .clones
+                .push((undeclared.rows.len(), entry.clone())),
+        }
+        undeclared.rows.push(row);
+    }
+    // Deepest first, so a file goes before the directory bx made for it.
+    undeclared.ops.reverse();
+    undeclared
+}
+
+/// Every file bx wrote that nothing declares any more: its row, and what
+/// `apply` does about it.
+#[derive(Debug, Default)]
+struct Undeclared {
+    /// One row per entry, in ascending path order.
+    rows: Vec<Change>,
+    /// Every path whose ledger entry `apply` drops and whose file it leaves
+    /// as it is: [`Action::Release`].
+    released: Vec<Portable>,
+    /// The writes that take a file back, deepest path first: each
+    /// [`Action::Undo`] but a checkout's.
+    ops: Vec<decide::Op>,
+    /// Each checkout `apply` removes, outside the session as `bx rm` removes
+    /// one, by index into [`Undeclared::rows`].
+    clones: Vec<(usize, state::LedgerEntry)>,
 }
 
 /// Declare, for each generated file `declared` names, the startup files whose

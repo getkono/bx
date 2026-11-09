@@ -704,7 +704,10 @@ pub fn restore_undeclared_with(
 /// directory is gone; the directories bx created for it are then removed
 /// where empty, and a claim on one that still stands is handed to an entry
 /// beneath it, as a session hands a removed file's claims.
-fn remove_clone(
+///
+/// `apply` removes a checkout nothing declares any more through this too, so
+/// the two decide and remove one the same way.
+pub(crate) fn remove_clone(
     ledger: &mut Ledger,
     entry: &LedgerEntry,
     home: &Path,

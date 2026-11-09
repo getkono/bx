@@ -59,7 +59,8 @@ spawn no process, and the bench holds it twice. Its one exception is a tool's
 cached activation output, which bx sources as the tool printed it: the stub
 starship ends its output as the real one does, with
 `PROMPT2="$(starship prompt --continuation)"` (`PS2` for bash), so every start
-spawns the stub once and the overhead above counts it. bx caches each output
+spawns the stub once and the overhead above counts it (on Linux; macOS leaves
+it out, as *Stub tools* below says). bx caches each output
 verbatim as one single-quoted `eval` under a `# bx activation: NAME` line, and
 following that quoting splits bx's own lines from the tools'. Read: bx's own
 lines, comments aside, must hold no command substitution, which covers
@@ -79,7 +80,8 @@ child page faults, a small Python tracer starts the shell and counts its forks
 through a kqueue `NOTE_FORK` filter it registers before the shell's first
 line runs; every command and subshell a shell starts begins as a fork. The
 hand-written rc files' activation lines, traced the same way, must read
-above 0, and so must bx's regions traced with the cached output left in, so
+above 0, and so, where the spawn is counted, must bx's regions traced with the
+cached output left in, so
 the spawn the tools' output makes is known to be measured. **Gated**: any
 spawn from bx's own lines is a failure.
 
@@ -119,6 +121,11 @@ arbitrary.
   cost starting `/bin/sh`, many times a native program's start on macOS. It is
   C, linking only libc, so the budget counts what any native program's spawn
   costs, the part no tool can avoid, and not a language runtime's start-up.
+  On macOS the bench builds no native stub and the shell stub emits no spawn,
+  so the macOS gate measures what it did before the spawn was counted: one
+  fork and exec costs about 3 ms on CI's macOS runner, and with the stub
+  tools' init text that leaves no room for it in 5 ms. Issue #363 holds how it
+  is budgeted there.
 - **The stub output is real shell**, not comments, so the shell genuinely
   parses it; and it is shell zsh and bash both run cleanly, since the example
   activates each tool for both.

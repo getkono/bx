@@ -241,6 +241,34 @@ fn a_directory_and_a_link_bx_made_are_taken_back() {
     assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
 }
 
+#[test]
+fn a_directory_bx_narrowed_gets_its_earlier_mode_back() {
+    let home = guarded_home();
+    std::fs::create_dir(home.child(".d")).expect("the user's directory");
+    fs::set_mode(&home.child(".d"), FileMode::DEFAULT_DIR).expect("chmod");
+    let narrowed = format!(
+        "[[target]]\npath = \"~/.d\"\ndir = true\nmode = \"0700\"\n{}",
+        inline("~/.b", "b\\n")
+    );
+    apply(&inputs(&home, &narrowed));
+    assert_eq!(mode_of(&home.child(".d")), 0o700);
+    let inputs = inputs(&home, &inline("~/.b", "b\\n"));
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Unchanged, Action::Undo]);
+    assert_eq!(
+        planned.changes[1].diff.as_ref().map(|diff| &diff.kind),
+        Some(&DiffKind::Mode {
+            from: FileMode::PRIVATE_DIR,
+            to: FileMode::DEFAULT_DIR,
+        })
+    );
+    apply(&inputs);
+    assert!(home.child(".d").is_dir(), "the user's directory stays");
+    assert_eq!(mode_of(&home.child(".d")), 0o755);
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+}
+
 /// Seed `home` so its apply takes `~/.a` back: one write.
 fn seed_undo(home: &Path) {
     std::fs::create_dir_all(home).expect("the home");

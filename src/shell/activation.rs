@@ -45,7 +45,7 @@
 //! `PROMPT2="$(starship prompt --continuation)"`, which starts starship once.
 //! Caching saves running the tool's init and never changes what that init
 //! does, so the text is not rewritten to avoid it, and the 5 ms budget counts
-//! the spawn.
+//! the spawn on Linux (macOS leaves it out of the bench, pending #363).
 //!
 //! `phase` is the load-order phase the output lands in: `activations` for a
 //! tool that puts itself on `PATH` or `fpath` (brew, mise), `completions` for

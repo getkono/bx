@@ -2,7 +2,8 @@
 # Measure what bx's generated startup files cost zsh and bash, against their
 # budget, and trace that bx's own startup lines start no process and read no
 # configuration; a tool's cached activation output starts what it would under
-# `eval "$(tool init)"`, and the budget counts it.
+# `eval "$(tool init)"`, and the budget counts it on Linux (macOS leaves it
+# out, pending issue #363).
 #
 # bx is on every shell start, so "fast enough to forget" is a product
 # requirement, and a requirement that is not measured is a requirement that
@@ -220,12 +221,13 @@ startup() { # startup <shell> <fixture>: the command that starts it, as one line
 #
 # The one exception is a tool's cached activation output: bx sources it as the
 # tool printed it, so a substitution the tool emitted runs at every start, as
-# it would under `eval "$(tool init)"`, and the overhead above counts it. bx
-# caches that output verbatim, as one single-quoted `eval` under a
-# `# bx activation: NAME` line, so following that quoting splits bx's own lines
-# from the tools'. bx's own must hold no substitution, and the cached output
-# must hold exactly the ones the tools print themselves: one bx added inside
-# it, or dropped from it, changes that count.
+# it would under `eval "$(tool init)"`, and the overhead above counts it (on
+# Linux; macOS leaves it out, issue #363). bx caches that output verbatim, as
+# one single-quoted `eval` under a `# bx activation: NAME` line, so following
+# that quoting splits bx's own lines from the tools'. bx's own must hold no
+# substitution, and the cached output must hold exactly the ones the tools
+# print themselves: one bx added inside it, or dropped from it, changes that
+# count.
 # shellcheck disable=SC2016 # the patterns are literal on purpose.
 SUBST='\$(' TICK='`'
 count() { # count: lines on stdin, not comments, holding a command substitution

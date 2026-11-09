@@ -112,7 +112,8 @@
 //! exactly as the tool printed it, so what it runs still runs at every start,
 //! as it would under `eval "$(tool init)"` (starship's
 //! `PROMPT2="$(starship prompt --continuation)"` starts starship once), and
-//! the 5 ms budget counts it.
+//! the 5 ms budget counts it on Linux (macOS leaves it out of the bench,
+//! pending #363).
 
 pub mod activation;
 pub mod alias;

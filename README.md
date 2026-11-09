@@ -278,7 +278,8 @@ path, `bx rm` when a conflict left something as it was, and
   configuration file. A tool's cached activation output is sourced exactly as
   the tool printed it, so what that output runs still runs: starship's prints
   `PROMPT2="$(starship prompt --continuation)"`, which starts starship once at
-  every shell start, as it would without `bx`, and the budget counts it.
+  every shell start, as it would without `bx`, and the budget counts it on
+  Linux (macOS leaves it out of the benchmark for now, pending #363).
   Caching saves running the tool's init; it never changes what the init does.
 - Beyond what your tools' output runs, the one process a shell ever starts on
   its own is an external's background

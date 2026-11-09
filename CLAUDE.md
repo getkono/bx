@@ -52,9 +52,17 @@ wrong even if it passes CI.
    restores exactly. An interrupted `apply` must be detectable and recoverable.
 5. **Nothing user-specific and no cleartext secret in the repo.** Ever.
 6. **Shell startup is budgeted at 5 ms**, enforced by `mise run bench`. The
-   shell-start path spawns no process and parses no config file. After the
-   first prompt, an interactive shell with a terminal and no CI or coding-agent
-   variable set may start one detached, time-bounded
+   lines bx generates for the shell-start path spawn no process and parse no
+   config file. The one exception is a tool's cached activation output, which
+   bx sources exactly as the tool printed it: caching saves running the tool's
+   init, never changes what that init does, so whatever the output itself runs
+   (starship's `PROMPT2="$(starship prompt --continuation)"`) runs at every
+   start, as it would under `eval "$(tool init)"`. The bench always runs it:
+   the budget counts it on Linux, and on macOS the bench reports its cost
+   apart and gates bx's own share. bx never
+   rewrites the cached text to avoid it. After the first prompt, an
+   interactive shell with a terminal and no CI or coding-agent variable set
+   may start one detached, time-bounded
    `bx update --background`, and only once a followed `[[external]]` set to
    `check = "auto"` is due; it starts nothing else unless someone answers a
    question.

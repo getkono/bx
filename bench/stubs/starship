@@ -1,4 +1,26 @@
 #!/bin/sh
 # Stand-in for starship: emits an init block of representative size, then exits.
 # The process spawn is the point — it is what `eval "\$(starship init zsh)"` costs.
-exec "$(dirname "$0")/gen.sh" starship 20
+#
+# Like the real tool, the block ends by setting the continuation prompt through
+# a command substitution that runs starship again, at its absolute path, so
+# every start that sources the cached block spawns one process, as a start with
+# the real starship does. `starship prompt --continuation` answers it, and
+# spawns nothing more of its own. The path is the starship PATH finds: the
+# bench puts the native starship.c there, which hands every other command to
+# this script, so a start pays for a native program as it does with the real
+# one, not for starting /bin/sh.
+set -eu
+case "${1-}" in
+prompt)
+	printf '%s' '> '
+	exit 0
+	;;
+esac
+here="$(cd "$(dirname "$0")" && pwd)"
+self="$(command -v starship)" || self="${here}/starship"
+"${here}/gen.sh" starship 20
+case "${2-}" in
+bash) printf '%s\n' "PS2=\"\$('${self}' prompt --continuation)\"" ;;
+*) printf '%s\n' "PROMPT2=\"\$('${self}' prompt --continuation)\"" ;;
+esac

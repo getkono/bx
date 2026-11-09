@@ -33,10 +33,20 @@
 //! shells it lists, and a per-shell key for a shell it leaves out fails the
 //! load. At least one of `command`, `zsh` and `bash` is required.
 //!
-//! There is no never-cacheable form. A shell start spawns no process
-//! (invariant 6), so an activation that must be fresh in every shell is not an
-//! `eval "$(tool …)"` at all: it is a guarded, optional source of a file the
-//! tool maintains itself, such as keychain's `~/.keychain/<host>-sh`.
+//! There is no never-cacheable form. bx's own lines spawn no process at a
+//! shell start (invariant 6), so an activation that must be fresh in every
+//! shell is not an `eval "$(tool …)"` at all: it is a guarded, optional source
+//! of a file the tool maintains itself, such as keychain's
+//! `~/.keychain/<host>-sh`.
+//!
+//! The cached output itself is the invariant's one exception. It is sourced
+//! exactly as the tool printed it, so what the output runs still runs at every
+//! start, as it would under `eval "$(tool init)"`: starship's ends with
+//! `PROMPT2="$(starship prompt --continuation)"`, which starts starship once.
+//! Caching saves running the tool's init and never changes what that init
+//! does, so the text is not rewritten to avoid it. The bench always runs the
+//! spawn: the 5 ms budget counts it on Linux, and on macOS the bench reports
+//! its cost apart and gates bx's own share.
 //!
 //! `phase` is the load-order phase the output lands in: `activations` for a
 //! tool that puts itself on `PATH` or `fpath` (brew, mise), `completions` for

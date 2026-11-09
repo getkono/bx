@@ -883,6 +883,25 @@ fn rm_over_an_edit_nothing_declares_keeps_the_file_and_forgets_it() {
 }
 
 #[test]
+fn rm_over_an_edit_beside_an_external_elsewhere_still_releases_it() {
+    // An external's checkout is declared, but only at its own path.
+    let home = repo(&inline("~/.edited", "bx\\n"));
+    apply_yes(&home);
+    let external = "[[external]]\npath = \"~/.x\"\nurl = \"https://example.invalid/x\"\n\
+                    rev = \"0123456789abcdef0123456789abcdef01234567\"\n";
+    std::fs::write(home.child(".config/bx/bx.toml"), external).expect("the declaration gone");
+    std::fs::write(home.child(".edited"), b"hand edit\n").expect("edit");
+
+    let (exit, text) = rm_text(&home, "~/.edited");
+    assert_eq!(exit, Exit::Converged, "{text}");
+    assert!(
+        text.starts_with("  - ~/.edited  left as you edited it"),
+        "{text}"
+    );
+    assert!(ledger(&home).get(&target(&home, ".edited")).is_none());
+}
+
+#[test]
 fn rm_over_an_edit_switched_off_keeps_the_file_and_undeclares_it() {
     let home = repo(&inline("~/.edited", "bx\\n"));
     apply_yes(&home);

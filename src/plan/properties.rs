@@ -1,8 +1,9 @@
 //! The product invariants stated as properties over generated
 //! configurations, rather than pinned by one example each: plan and apply
 //! agree and converge (invariants 3 and 7), `rm` puts back every byte apply
-//! displaced (invariant 4), and no fragment bx writes assigns a variable the
-//! guard cannot judge (invariant 2).
+//! displaced (invariant 4), so does an `apply` once nothing declares what it
+//! wrote, and no fragment bx writes assigns a variable the guard cannot judge
+//! (invariant 2).
 //!
 //! A generated configuration is a [`Layer`]: inline targets over whatever the
 //! user or an earlier bx left at their paths, `[[env]]` variables of every
@@ -514,6 +515,62 @@ proptest::proptest! {
         .expect("rm");
 
         prop_assert_eq!(tree(home.path()), want);
+    }
+
+    /// Removing every declaration takes back what bx wrote for it: declare,
+    /// apply, undeclare and apply again leaves the home byte for byte, and
+    /// mode for mode, as the user had it before bx first wrote — except a
+    /// file the user rewrote after bx wrote it, which stays exactly as the
+    /// user left it. What plan announced is what apply did, and the plan
+    /// after it is empty with no ledger entry left.
+    ///
+    /// Targets and the external only: a variable's or an alias's generated
+    /// file is planned empty once nothing lands in it, never undeclared.
+    #[test]
+    fn undeclaring_everything_and_applying_returns_the_home_to_its_prior_bytes(
+        layer in layers()
+    ) {
+        let layer = Layer {
+            variables: Vec::new(),
+            aliases: Vec::new(),
+            ..layer
+        };
+        let home = guarded_home();
+        let toml = layer.lay_down_users(&home);
+        seed(home.path(), &toml);
+        let mut want = tree(home.path());
+        layer.lay_down_owned(&home);
+        let laid = tree(home.path());
+        for (index, target) in layer.targets.iter().enumerate() {
+            if matches!(target.before, Before::Edited(_)) {
+                let rel = PathBuf::from(target.rel(index));
+                for path in rel.ancestors().filter(|path| !path.as_os_str().is_empty()) {
+                    let entry = laid.get(path).expect("laid down").clone();
+                    want.insert(path.to_path_buf(), entry);
+                }
+            }
+        }
+        run(&load(home.path()).with_git(git(home.path())), Mode::Apply, &mut |_| Ok(true))
+            .expect("apply runs");
+
+        // Something stays declared, so the configuration is not an empty one.
+        seed(home.path(), &format!("{ROOT}{}", inline("~/.kept", "k\\n")));
+        let undeclared = load(home.path()).with_git(git(home.path()));
+        let planned = run(&undeclared, Mode::Plan, &mut |_| panic!("plan never asks"))
+            .expect("plan runs");
+        let applied = run(&undeclared, Mode::Apply, &mut |_| Ok(true)).expect("apply runs");
+        prop_assert_eq!(rows(&applied), rows(&planned));
+
+        let mut after = tree(home.path());
+        prop_assert!(after.remove(Path::new(".kept")).is_some());
+        prop_assert_eq!(after, want);
+        let second = run(&undeclared, Mode::Plan, &mut |_| panic!("plan never asks"))
+            .expect("the second plan");
+        prop_assert_eq!(second.actions(), vec![Action::Unchanged]);
+        prop_assert_eq!(
+            ledger(home.path()),
+            vec![Portable::parse_in("~/.kept", home.path()).expect("a path")]
+        );
     }
 
     /// Invariant 2 over generated `[[env]]` declarations: every environment

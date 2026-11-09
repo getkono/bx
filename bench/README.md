@@ -112,7 +112,11 @@ arbitrary.
   on which tools happen to be installed, and the fork-and-exec cost that
   `eval "$(…)"` pays is real. The starship stub also emits the spawn the
   real starship's output makes at every start, so the cached path pays it
-  too.
+  too. What that spawn starts is native, as the real starship is:
+  `stubs/starship.rs`, which the bench compiles with `rustc` onto the front
+  of its scratch `PATH`, answers `starship prompt` itself and hands every
+  other command to the shell stub. Answered by the shell stub, the spawn would
+  cost starting `/bin/sh`, many times a native program's start on macOS.
 - **The stub output is real shell**, not comments, so the shell genuinely
   parses it; and it is shell zsh and bash both run cleanly, since the example
   activates each tool for both.

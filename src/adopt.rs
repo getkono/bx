@@ -567,8 +567,10 @@ pub enum Adoption {
     /// Passed over inside a directory, with the reason. Not an error: a
     /// directory holds things bx does not adopt.
     Skipped {
-        /// The target.
-        target: Portable,
+        /// What was passed over, as a person reads it: its target, or, for a
+        /// child no target can name (a name that is not UTF-8), the
+        /// directory's target joined with the name rendered lossily.
+        subject: String,
         /// Why.
         note: String,
     },
@@ -582,15 +584,16 @@ pub enum Adoption {
 }
 
 impl Adoption {
-    /// The target this is about.
+    /// What this row is about, as a person reads it: the target's own string,
+    /// or a skipped row's subject, which no target may be able to name.
     #[must_use]
-    pub const fn target(&self) -> &Portable {
+    pub fn subject(&self) -> &str {
         match self {
             Self::Adopt { target, .. }
             | Self::Own { target, .. }
             | Self::Unchanged { target }
-            | Self::Skipped { target, .. }
-            | Self::Refused { target, .. } => target,
+            | Self::Refused { target, .. } => target.as_str(),
+            Self::Skipped { subject, .. } => subject,
         }
     }
 
@@ -645,7 +648,7 @@ fn visit(
             }
         } else {
             Adoption::Skipped {
-                target: target.clone(),
+                subject: target.to_string(),
                 note,
             }
         }
@@ -680,9 +683,12 @@ fn visit(
                 let child = dest.join(&name);
                 let child_target = match Portable::from_path(&child, &ctx.home) {
                     Ok(child_target) => child_target,
+                    // The child has no target to carry, so the row names it
+                    // by the directory's target and its name, never by the
+                    // directory alone.
                     Err(e) => {
                         rows.push(Adoption::Skipped {
-                            target: target.clone(),
+                            subject: format!("{target}/{}", name.to_string_lossy()),
                             note: e.to_string(),
                         });
                         continue;

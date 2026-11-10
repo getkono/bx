@@ -59,7 +59,8 @@ fn format_version(
 }
 
 /// `epoch` seconds as a UTC `YYYY-MM-DDTHH:MM:SSZ`, or `unknown` when it is not
-/// a count of seconds or falls past the end of year 9999.
+/// a count of seconds or falls past 9999-12-30T22:00:00Z, the last instant jiff
+/// represents.
 fn built(epoch: &str) -> String {
     epoch
         .parse::<u64>()
@@ -69,7 +70,7 @@ fn built(epoch: &str) -> String {
 }
 
 /// `seconds` after the Unix epoch as a UTC `YYYY-MM-DDTHH:MM:SSZ`, or `None`
-/// past the last instant jiff represents, in the year 9999.
+/// past 9999-12-30T22:00:00Z, the last instant jiff represents.
 ///
 /// A whole-second `Timestamp` displays as RFC 3339 in UTC, with `Z` and no
 /// fractional part, which is exactly this layout.

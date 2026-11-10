@@ -942,7 +942,10 @@ mod tests {
                      __bx_update_due\nprintf '@\\n'\n{list}",
                     rig.dir().join("available").display()
                 ),
-                &[("BX_UPDATE_PROMPT_TIMEOUT", "1")],
+                // The wait is timed on a whole-second clock, so a second
+                // boundary crossed before the read takes a second off it:
+                // two seconds still wait at least one.
+                &[("BX_UPDATE_PROMPT_TIMEOUT", "2")],
             ) else {
                 return;
             };
@@ -966,7 +969,7 @@ mod tests {
             );
             assert!(
                 took >= std::time::Duration::from_secs(2),
-                "{shell:?}: each waited its second: {took:?}"
+                "{shell:?}: each waited at least a second: {took:?}"
             );
             assert_eq!(rig.read("answered"), None, "{shell:?}: no answer written");
             assert_eq!(

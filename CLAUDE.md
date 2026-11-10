@@ -1,11 +1,11 @@
 # bx
 
 An idempotent developer-environment manager for Linux and macOS that never
-touches a byte the user wrote. A command-line application written in Rust (edition 2024). **Linux and macOS 13+,
-on x86_64 and aarch64.** On macOS bx keeps the same XDG directories for its own
-files (`~/.config/bx`, `~/.local/state/bx`, `~/.local/share/bx`), never a
-`~/Library` layout. **No Windows** — do not add Windows code paths, targets, or
-documentation.
+touches a byte the user wrote. A command-line application written in Rust
+(edition 2024). **Linux and macOS 13+, on x86_64 and aarch64.** On macOS bx
+keeps the same XDG directories for its own files (`~/.config/bx`,
+`~/.local/state/bx`, `~/.local/share/bx`), never a `~/Library` layout. **No
+Windows** — do not add Windows code paths, targets, or documentation.
 
 ## Layout
 
@@ -37,7 +37,8 @@ wrong even if it passes CI.
    wrote. Writes land in delimited managed regions, or in files bx owns because
    the user said so. What bx wrote it takes back once nothing declares it, and
    only while the ledger proves the bytes are still exactly the ones it left; a
-   file edited since is kept as it is and stops being managed.
+   file edited since is kept as it is and stops being managed. A configuration
+   that declares nothing at all takes back nothing.
 2. **Native locations unless the configuration declares otherwise.** Never point
    a tool at a bx-owned directory. Never move a tool's config, data, or cache
    outside a root the configuration declares. Declare no root and nothing

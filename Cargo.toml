@@ -74,6 +74,9 @@ tempfile = "3.27.0"
 # File modes, fsync, the advisory lock on the state directory, and discarding
 # what was typed ahead of a confirmation.
 rustix = { version = "1.1.4", features = ["fs", "process", "system", "termios"] }
+# UTC timestamps for `bx --version` and `bx doctor`; no tz database, so default
+# features off.
+jiff = { version = "0.2.42", default-features = false }
 thiserror = "2.0.20"
 eyre = "0.6.14"
 color-eyre = "0.6.5"

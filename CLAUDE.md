@@ -93,6 +93,8 @@ wrong even if it passes CI.
 - **tempfile + rustix** — atomic writes (temp in destination dir, fsync,
   rename), file modes, the advisory state-dir lock, and discarding what was
   typed ahead of a confirmation.
+- **jiff** — UTC timestamps for `bx --version` and `bx doctor`. Default
+  features off: no tz database and no system time zone lookup.
 - **eyre + color-eyre** — application error reporting; `main` installs
   color-eyre at startup with its location and backtrace-hint sections off, so
   an error reads as its message chain alone.

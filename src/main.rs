@@ -1,6 +1,6 @@
 //! The `bx` binary.
 //!
-//! Thirteen commands, no manual. Everything the user needs to discover is reachable
+//! Fourteen commands, no manual. Everything the user needs to discover is reachable
 //! from `--help` and the prompts in `bx init`.
 
 use std::io::Write as _;
@@ -95,6 +95,9 @@ enum Command {
     /// Missing tools, unanswered values, damaged state, and what else needs a
     /// look; changes nothing
     Doctor,
+    /// Set aside an interrupted session that recovery cannot finish, touching
+    /// no other file
+    Abandon,
     /// Print the one line for your shell rc (not built yet)
     ShellInit { shell: String },
     /// Install the latest release over this one, as a fresh install would
@@ -162,6 +165,7 @@ fn main() -> Result<()> {
             bx::command::upgrade(&env, &paths, yes, check, &mut out)?
         }
         Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
+        Some(Command::Abandon) => bx::command::abandon(&env, &mut out)?,
         Some(Command::Secret {
             action: SecretAction::List,
         }) => bx::command::secret_list(&env, &mut out)?,

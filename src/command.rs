@@ -1,7 +1,7 @@
 //! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
 //! `bx update`, `bx upgrade`, `bx doctor`, `bx add`, `bx rm`,
-//! `bx secret list` and `bx self-upgrade`, and the refusal of `bx shell-init`
-//! and `bx __complete`, which have none yet.
+//! `bx secret list`, `bx abandon` and `bx self-upgrade`, and the refusal of
+//! `bx shell-init` and `bx __complete`, which have none yet.
 //!
 //! Each loads the configuration, runs the one traversal in [`crate::plan`] —
 //! or, for `doctor`, the read-only checks in [`crate::doctor`], for `add` and
@@ -11,7 +11,9 @@
 //! that — writes the rendering
 //! to the output it is
 //! handed, and returns the exit status. `self-upgrade` reads no configuration:
-//! it is [`crate::upgrade`] run for the binary that is running. `main` does
+//! it is [`crate::upgrade`] run for the binary that is running. Nor does
+//! `abandon`: it is [`crate::recover::abandon`] run for this home's state
+//! directory. `main` does
 //! nothing but call one of them.
 
 use std::io::Write;
@@ -1545,6 +1547,36 @@ fn removal_row(removal: &Removal, home: &Path) -> String {
     }
     line.push('\n');
     line
+}
+
+/// `bx abandon`: set aside an interrupted session's journal, touching no
+/// other file, so a recovery that cannot account for a destination stops
+/// refusing every writing command.
+///
+/// Reads no configuration: it is [`crate::recover::abandon`] run for this
+/// home's state directory. What the session left behind is then the next
+/// `plan`'s to judge, which reports a file bx cannot account for as a
+/// conflict and never overwrites it. Exits 0 whether a journal was set aside
+/// or there was none.
+///
+/// # Errors
+///
+/// Whatever [`crate::recover::abandon`] returns — the lock held by another
+/// bx, a journal a newer bx wrote, a journal that cannot be moved — and
+/// [`Error::Output`] when `out` cannot be written.
+pub fn abandon(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
+    let state = crate::state::StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
+    let text = match crate::recover::abandon(&state)? {
+        None => "No interrupted session to abandon.\n".to_string(),
+        Some(aside) => format!(
+            "Set the interrupted session aside in {}, touching no other file.\n\
+             `bx plan` shows what it left; a file bx cannot account for is a conflict, \
+             never overwritten.\n",
+            paths::to_portable(aside.as_path(), &env.home),
+        ),
+    };
+    out.write_all(text.as_bytes()).map_err(Error::Output)?;
+    Ok(Exit::Converged)
 }
 
 /// Load, decide read-only, and show.

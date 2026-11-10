@@ -473,7 +473,9 @@ impl ValueKind {
                 if is_recipient(answer) {
                     Ok(answer.to_string())
                 } else {
-                    Err(malformed("be an `age1…` recipient or an ssh public key"))
+                    Err(malformed(
+                        "be an `age1…` recipient, or an `ssh-ed25519` or `ssh-rsa` public key",
+                    ))
                 }
             }
         }
@@ -522,22 +524,16 @@ fn is_ssh_public_key(text: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
-/// Whether `text` is something age can encrypt to: an `age1…` recipient or an
-/// ssh public key. The rule an `age-recipient` value is held to, and the one a
-/// `[secrets]` recipient list is.
+/// Whether `text` is something age can encrypt to: an X25519 `age1…` recipient,
+/// or an `ssh-ed25519` or `ssh-rsa` public key. The rule an `age-recipient`
+/// value is held to, and the one a `[secrets]` recipient list is.
+///
+/// Judged by age's own parsers, so a recipient bx accepts is one encryption
+/// accepts: the bech32 checksum and key length of an `age1…` string, and an
+/// ssh key type age supports, which leaves out the `ecdsa-*` and `sk-*` keys an
+/// `ssh-key` value admits.
 pub(crate) fn is_recipient(text: &str) -> bool {
-    is_age_recipient(text) || is_ssh_public_key(text)
-}
-
-/// The bech32 data charset an `age1…` recipient is spelled in.
-const BECH32: &str = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
-
-/// Whether `text` is syntactically an age recipient.
-fn is_age_recipient(text: &str) -> bool {
-    let Some(data) = text.strip_prefix("age1") else {
-        return false;
-    };
-    !data.is_empty() && data.chars().all(|c| BECH32.contains(c))
+    text.parse::<age::x25519::Recipient>().is_ok() || text.parse::<age::ssh::Recipient>().is_ok()
 }
 
 // ---------------------------------------------------------------------------

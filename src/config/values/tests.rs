@@ -492,13 +492,32 @@ fn an_ssh_key_must_carry_a_known_algorithm_prefix() {
     }
 }
 
+/// Public halves of throwaway keys generated for these tests; no private half
+/// exists anywhere. Both blobs carry `+` and `/`, which base64 spells real key
+/// material with.
+const GENERATED_ED25519: &str = "ssh-ed25519 \
+    AAAAC3NzaC1lZDI1NTE5AAAAILpRtvOx0zOm/XKZJrN+JuCEL+zeQk5RimfOXq9BeNTr bx-test";
+const GENERATED_RSA: &str = "ssh-rsa \
+    AAAAB3NzaC1yc2EAAAADAQABAAABAQDemE6Kt2pq/2TX21BhbiLH2SFVcNDBNhTpRWjPAmZZg6p7K300EYURedcAuz/RC1YEq\
+    X6rvyISeHBbCjZKBDWyp3W2ZW4wO1lwXsqjtJ7b4puVlZtKJGyA22Lukqyz+ylpToKTSb7IAiTTE1YB6bIR/OlgXa6VLSH4nQ\
+    WMdH+W27toFBiQ1ETnXa3XpwHhYy5IdW/IsvthwhehmBXLt5PEjSdYgUsLucolpk7zOT896bURksZwsHdZSwg+deouIbJwYC0q\
+    /WBS29taWZrk9sJlnxfJIoX86XRNrwkgNUqcKLIPilytmj4iDj7WFd5cZ05w8L22Rn/YC4D6c81EA8n5 bx-test";
+/// The same, for a key type age cannot encrypt to.
+const GENERATED_ECDSA: &str = "ecdsa-sha2-nistp256 \
+    AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCzcgPkA2tbQYV9plP3TfCjVzSLMa390AJpJ59u8v56O\
+    073KfNG1rDpj72/0rAcTJ4FjNYicpcHgJyumtyTT75s= bx-test";
+/// An X25519 recipient, and the same with its last character changed so the
+/// bech32 checksum fails.
+const AGE: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+const AGE_BAD_CHECKSUM: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8q";
+
 #[test]
 fn an_age_recipient_accepts_age1_and_an_ssh_key() {
-    let age = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
-    assert_eq!(check(ValueKind::AgeRecipient, age).unwrap(), age);
+    assert_eq!(check(ValueKind::AgeRecipient, AGE).unwrap(), AGE);
     // age accepts an ssh recipient, and so does bx.
-    let ssh = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
-    assert_eq!(check(ValueKind::AgeRecipient, ssh).as_deref(), Ok(ssh));
+    for ssh in [GENERATED_ED25519, GENERATED_RSA] {
+        assert_eq!(check(ValueKind::AgeRecipient, ssh).as_deref(), Ok(ssh));
+    }
 
     for bad in ["age1", "age1BADCHARS", "age2ql3z7", "ql3z7hjy54pw3hy"] {
         assert!(malformed(ValueKind::AgeRecipient, bad), "{bad}");
@@ -506,24 +525,50 @@ fn an_age_recipient_accepts_age1_and_an_ssh_key() {
 }
 
 #[test]
+fn an_age_recipient_is_one_age_can_encrypt_to() {
+    // Each of these is spelled like a recipient, and age refuses every one:
+    // a bech32 string with no key in it, a checksum that fails, and ssh key
+    // types age does not encrypt to.
+    for bad in [
+        "age1qqqq",
+        AGE_BAD_CHECKSUM,
+        GENERATED_ECDSA,
+        "sk-ssh-ed25519@openssh.com AAAAGnNr",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample",
+    ] {
+        assert!(
+            malformed(ValueKind::AgeRecipient, bad),
+            "{bad} was accepted"
+        );
+    }
+    // An `ssh-key` value is about ssh, not age: an ecdsa key is a fine one.
+    assert_eq!(
+        check(ValueKind::SshKey, GENERATED_ECDSA).as_deref(),
+        Ok(GENERATED_ECDSA)
+    );
+}
+
+#[test]
 fn a_key_blob_may_carry_every_base64_symbol() {
     // Base64 spells key material with `+` and `/` as well as letters and
-    // digits, and a real key's blob holds both almost every time. Every
-    // other fixture here is alphanumeric, so a check that refused either
-    // symbol would pass them all and reject nearly every real key.
+    // digits, and a real key's blob holds both almost every time. A check
+    // that refused either symbol would reject nearly every real key.
     //
     // Synthetic: the algorithm headers are the real encodings of the
     // algorithm names, and what follows them is made-up material, not
-    // anyone's key.
+    // anyone's key. An `ssh-key` value is held to its shape alone.
     let ed25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB+synthetic/key+material/for+tests/only0";
     let rsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC+synthetic/rsa+material/for+tests/only0== a comment";
 
-    for key in [ed25519, rsa] {
+    for key in [ed25519, rsa, GENERATED_ED25519, GENERATED_RSA] {
         assert_eq!(
             check(ValueKind::SshKey, key).as_deref(),
             Ok(key),
             "an ssh-key value"
         );
+    }
+    // An age recipient is parsed as a key, so it is held to generated ones.
+    for key in [GENERATED_ED25519, GENERATED_RSA] {
         assert_eq!(
             check(ValueKind::AgeRecipient, key).as_deref(),
             Ok(key),
@@ -535,7 +580,6 @@ fn a_key_blob_may_carry_every_base64_symbol() {
     for blob in ["AAAA+AAAA", "AAAA/AAAA"] {
         let key = format!("ssh-ed25519 {blob}");
         assert!(check(ValueKind::SshKey, &key).is_ok(), "{key}");
-        assert!(check(ValueKind::AgeRecipient, &key).is_ok(), "{key}");
     }
 }
 

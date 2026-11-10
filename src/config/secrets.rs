@@ -110,9 +110,8 @@ impl Secrets {
 /// # Errors
 ///
 /// [`Error::UnknownKey`] for a key this version does not know, and
-/// [`Error::BadValue`] for a recipient that is neither an age recipient nor an
-/// ssh public key, an empty recipient list, or an identity that is not a usable
-/// path.
+/// [`Error::BadValue`] for a recipient age cannot encrypt to, an empty
+/// recipient list, or an identity that is not a usable path.
 pub fn parse_secrets(
     table: &Table,
     file: &Path,
@@ -136,7 +135,10 @@ pub fn parse_secrets(
             return Err(ctx.bad(
                 table,
                 "recipients",
-                format!("{bad:?} is neither an `age1…` recipient nor an ssh public key"),
+                format!(
+                    "{bad:?} is not a recipient age can encrypt to: an `age1…` recipient, or an \
+                     `ssh-ed25519` or `ssh-rsa` public key"
+                ),
             ));
         }
         Some(Recipients {
@@ -172,6 +174,9 @@ mod tests {
 
     const HOME: &str = "/var/home/example";
     const AGE: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+    /// The public half of a throwaway key generated for these tests.
+    const SSH: &str = "ssh-ed25519 \
+        AAAAC3NzaC1lZDI1NTE5AAAAIDRgIMdfCcjBrb0DLH6nJeNNHH1XkH50spiqT5vkgbv/ host";
 
     fn parse(text: &str) -> Result<Secrets, Error> {
         parse_str(text, Path::new("bx.toml"), Path::new(HOME)).map(|config| config.secrets)
@@ -189,13 +194,13 @@ mod tests {
     #[test]
     fn recipients_and_an_identity_parse_with_their_lines() {
         let secrets = parse(&format!(
-            "[secrets]\nrecipients = [\"{AGE}\", \"ssh-ed25519 AAAAC3Nz host\"]\n\
+            "[secrets]\nrecipients = [\"{AGE}\", \"{SSH}\"]\n\
              identity = \"~/.config/age/./key.txt\"\n"
         ))
         .expect("parses");
 
         let recipients = secrets.recipients.expect("recipients");
-        assert_eq!(recipients.keys, [AGE, "ssh-ed25519 AAAAC3Nz host"]);
+        assert_eq!(recipients.keys, [AGE, SSH]);
         assert_eq!(recipients.origin.line, 2);
         let identity = secrets.identity.expect("an identity");
         assert_eq!(
@@ -211,6 +216,24 @@ mod tests {
         let message = message("[secrets]\nrecipients = [\"age1\", \"nope\"]\n");
         assert!(message.contains("bx.toml:2"), "{message}");
         assert!(message.contains("\"age1\""), "{message}");
+    }
+
+    #[test]
+    fn a_recipient_age_cannot_encrypt_to_is_refused() {
+        // Spelled like recipients, and refused by age: a bech32 string with no
+        // key in it, a failing checksum, and ssh key types age does not support.
+        let bad_checksum = format!("{}q", &AGE[..AGE.len() - 1]);
+        for bad in [
+            "age1qqqq",
+            &bad_checksum,
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCzcgPkA2tbQYV9p\
+             lP3TfCjVzSLMa390AJpJ59u8v56O073KfNG1rDpj72/0rAcTJ4FjNYicpcHgJyumtyTT75s= host",
+            "sk-ssh-ed25519@openssh.com AAAAGnNr",
+        ] {
+            let message = message(&format!("[secrets]\nrecipients = [\"{AGE}\", \"{bad}\"]\n"));
+            assert!(message.contains(&format!("{bad:?}")), "{message}");
+            assert!(message.contains("age can encrypt to"), "{message}");
+        }
     }
 
     #[test]

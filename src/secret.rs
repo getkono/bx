@@ -274,17 +274,28 @@ fn classify(bytes: Vec<u8>, shown: &str) -> Result<Loaded, Refusal> {
 
 /// The keys of a plain age identity file, or `None` when it is not one.
 ///
-/// Every line that is not blank and not a `#` comment must be a key, as `age`
-/// itself requires: a file with one bad line is not an identity file with one
-/// key fewer.
+/// age's own parser, [`age::IdentityFile`], reads it: every line that is not
+/// blank and not a `#` comment must be a key, so a file with one bad line is
+/// not an identity file with one key fewer. Two things are bx's on top of it.
+/// Each line is trimmed first, so whitespace around a key or a comment, which
+/// age refuses, is accepted as bx always has, and `text` arrives already
+/// lossily decoded, so a stray byte in a comment costs nothing. And a file with
+/// no key at all, which age reads as zero identities, is not one. Plugin lines
+/// are refused, since bx builds age without plugins. age's error names the
+/// line it stopped at and is dropped here: nothing of the file is shown.
 fn age_keys(text: &str) -> Option<Loaded> {
-    let mut keys: Keys = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        keys.push(Box::new(line.parse::<age::x25519::Identity>().ok()?));
-    }
+    let trimmed: String = text
+        .lines()
+        .map(str::trim)
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    let keys: Keys = age::IdentityFile::from_buffer(trimmed.as_bytes())
+        .ok()?
+        .into_identities()
+        .ok()?
+        .into_iter()
+        .map(|key| key as Box<dyn age::Identity>)
+        .collect();
     (!keys.is_empty()).then_some(Loaded::Ready(keys))
 }
 
@@ -533,6 +544,58 @@ ffxbALZN3JpDBBEk8TeZk55mo+jjJlOtAf63Q=
             asking(&ciphertext, &file, Some("pass")),
             Err(Refusal::NotAnIdentity { .. })
         ));
+    }
+
+    #[test]
+    fn an_age_identity_file_is_read_alike_plain_and_passphrase_encrypted() {
+        let home = guarded_home();
+        let key = age::x25519::Identity::generate();
+        let secret = age::secrecy::ExposeSecret::expose_secret(&key.to_string()).to_string();
+        let ciphertext = encrypt_to(&key.to_public().to_string(), b"age\n");
+        let bytes = |text: String| text.into_bytes();
+        // (name, file bytes, whether it is an identity file)
+        let cases: [(&str, Vec<u8>, bool); 10] = [
+            ("a comment then the key", bytes(format!("# c\n{secret}\n")), true),
+            ("crlf line endings", bytes(format!("# c\r\n{secret}\r\n")), true),
+            ("a trailing space", bytes(format!("{secret} \n")), true),
+            ("a leading tab", bytes(format!("\t{secret}\n")), true),
+            ("a whitespace-only line", bytes(format!("  \t\n{secret}\n")), true),
+            ("an indented comment", bytes(format!("  # c\n{secret}\n")), true),
+            (
+                "a comment that is not utf-8",
+                [b"# \xff\n".as_slice(), secret.as_bytes(), b"\n"].concat(),
+                true,
+            ),
+            ("empty", Vec::new(), false),
+            ("comments only", b"# one\n\n# two\n".to_vec(), false),
+            (
+                "a plugin identity",
+                b"AGE-PLUGIN-EXAMPLE-1QYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZQGPQYQSZ\n"
+                    .to_vec(),
+                false,
+            ),
+        ];
+        for (name, text, identity) in cases {
+            let plain = home.child(format!("{name}.txt"));
+            std::fs::write(&plain, &text).expect("the plain identity");
+            let locked = home.child(format!("{name}.age"));
+            std::fs::write(&locked, passphrase_encrypted(&text, "pass"))
+                .expect("the passphrase-encrypted identity");
+            let outcomes = [
+                ("plain", never(&ciphertext, &plain)),
+                ("passphrase", asking(&ciphertext, &locked, Some("pass"))),
+            ];
+            for (kind, outcome) in outcomes {
+                if identity {
+                    assert_eq!(outcome.as_deref(), Ok(&b"age\n"[..]), "{name}, {kind}");
+                } else {
+                    assert!(
+                        matches!(outcome, Err(Refusal::NotAnIdentity { .. })),
+                        "{name}, {kind}: {outcome:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

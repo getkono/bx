@@ -351,7 +351,9 @@ impl Context {
     /// compared by the path they resolve to ([`resolved_path`]), as `rm`
     /// compares them: `~/.config/{{profile}}/s` switched off is still the
     /// declaration of `~/.config/work/s`, so adopting that file is refused
-    /// rather than declared a second time.
+    /// rather than declared a second time. Only a target toggle switches a
+    /// target off: an `[[external]]` toggle at the same path switches off a
+    /// checkout and declares no target.
     fn declared(&self, target: &Portable) -> Declared<'_> {
         let values = &self.resolved.values;
         let names = |raw: &str| resolved_path(raw, values).is_some_and(|path| path == *target);
@@ -374,6 +376,7 @@ impl Context {
                 .config
                 .toggles
                 .iter()
+                .filter(|toggle| toggle.section == merge::Section::Target)
                 .find(|toggle| names(&toggle.key))
             {
                 return Declared::Disabled(&toggle.origin);

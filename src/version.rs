@@ -59,44 +59,26 @@ fn format_version(
 }
 
 /// `epoch` seconds as a UTC `YYYY-MM-DDTHH:MM:SSZ`, or `unknown` when it is not
-/// a count of seconds.
+/// a count of seconds or falls past 9999-12-30T22:00:00Z, the last instant jiff
+/// represents.
 fn built(epoch: &str) -> String {
     epoch
         .parse::<u64>()
-        .map_or_else(|_| "unknown".to_string(), utc)
+        .ok()
+        .and_then(utc)
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-/// `seconds` after the Unix epoch as a UTC `YYYY-MM-DDTHH:MM:SSZ`.
+/// `seconds` after the Unix epoch as a UTC `YYYY-MM-DDTHH:MM:SSZ`, or `None`
+/// past 9999-12-30T22:00:00Z, the last instant jiff represents.
 ///
-/// The date is the proleptic Gregorian one, by Neri and Schneider's Euclidean
-/// affine functions ("Euclidean affine functions and their application to
-/// calendar algorithms", 2022). It counts from 1 March of year 0, so a leap
-/// day is the last day of its year. A century is 146 097 quarter days, a
-/// four-year cycle 1 461 days, and one affine map takes the day of the year to
-/// its month and day of month, the month in its high 16 bits.
-pub(crate) fn utc(seconds: u64) -> String {
-    // Four times the days since 0000-03-01, plus three: 1970-01-01 is day
-    // 719 468 of that count.
-    let quarters = seconds / 86_400 * 4 + 2_877_875;
-    // Four times the day of the century, plus three: the remainder with its
-    // two low bits set is the remainder rounded down to a whole day, plus three.
-    let of_century = (quarters % 146_097) | 3;
-    let day_of_year = of_century % 1_461 / 4;
-    let month_day = 2_141 * day_of_year + 197_913;
-    // Counted from March, January and February are months 13 and 14 of the
-    // year before.
-    let january = day_of_year >= 306;
-    let year = quarters / 146_097 * 100 + of_century / 1_461 + u64::from(january);
-    let month = month_day / 65_536;
-    let month = if january { month - 12 } else { month };
-    let day = month_day % 65_536 / 2_141 + 1;
-    let of_day = seconds % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        of_day / 3_600,
-        of_day % 3_600 / 60,
-        of_day % 60
-    )
+/// A whole-second `Timestamp` displays as RFC 3339 in UTC, with `Z` and no
+/// fractional part, which is exactly this layout.
+pub(crate) fn utc(seconds: u64) -> Option<String> {
+    let seconds = i64::try_from(seconds).ok()?;
+    jiff::Timestamp::from_second(seconds)
+        .ok()
+        .map(|instant| instant.to_string())
 }
 
 #[cfg(test)]
@@ -138,6 +120,12 @@ mod tests {
             // A year's last second and the next year's first.
             ("1798761599", "2026-12-31T23:59:59Z"),
             ("1798761600", "2027-01-01T00:00:00Z"),
+            // The last instant jiff represents, and the next second.
+            ("253402207200", "9999-12-30T22:00:00Z"),
+            ("253402207201", "unknown"),
+            // The year 10000, and a count that does not fit an i64.
+            ("253402300800", "unknown"),
+            ("18446744073709551615", "unknown"),
         ] {
             assert_eq!(built(epoch), expected, "{epoch}");
         }

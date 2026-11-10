@@ -236,11 +236,13 @@ impl GitFiles {
         }
     }
 
-    /// When the last fetch was, or `None` when nothing has fetched.
+    /// When the last fetch was, or `None` when nothing has fetched. A fetch
+    /// whose time is past what a UTC instant can name still happened, so it
+    /// reads `unknown` rather than `None`.
     fn fetched(&self) -> Option<String> {
         let modified = std::fs::metadata(&self.fetch_head).ok()?.modified().ok()?;
         let seconds = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
-        Some(crate::version::utc(seconds))
+        Some(crate::version::utc(seconds).unwrap_or_else(|| "unknown".to_string()))
     }
 }
 

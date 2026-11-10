@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
 
-use super::decide::{guard_environment_d, guard_fragment};
+use super::decide::{CLAIM, guard_environment_d, guard_fragment};
 use super::tests::{inline, load, own, seed, snapshot};
-use super::{Action, Inputs, LedgerView, Mechanism, Mode, Report, StateDir, region, run};
+use super::{Action, Change, Inputs, LedgerView, Mechanism, Mode, Report, StateDir, region, run};
 use crate::config::env::ENVIRONMENT_D;
 use crate::paths::Portable;
 use crate::shell::bash;
@@ -379,6 +379,17 @@ fn ledger(home: &Path) -> Vec<Portable> {
         .collect()
 }
 
+/// Whether `change` is a claim: a modify with no diff that takes a file bx
+/// does not own, already holding what bx wants, into the ledger.
+fn is_claim(change: &Change) -> bool {
+    change.action == Action::Modify
+        && change.diff.is_none()
+        && change
+            .note
+            .as_deref()
+            .is_some_and(|note| note.starts_with(CLAIM))
+}
+
 /// Whether `text` assigns `name` on any line, as `NAME=` or `export NAME=`.
 fn assigns(text: &str, name: &str) -> bool {
     let assignment = format!("{name}=");
@@ -400,85 +411,176 @@ fn phase<'a>(file: &'a str, phase: &str) -> &'a str {
     })
 }
 
+/// Invariants 3 and 7 over `layer`: apply changes exactly the files plan
+/// announced and announces what plan did, a claim plan announced changes no
+/// byte and lands in the ledger, and the plan after it announces no work.
+fn plan_and_apply_agree(layer: &Layer) -> Result<(), TestCaseError> {
+    let home = guarded_home();
+    let inputs = layer.inputs(&home);
+
+    let untouched = snapshot(home.path(), &[]);
+    let planned = run(&inputs, Mode::Plan, &mut |_| panic!("plan never asks")).expect("plan runs");
+    prop_assert_eq!(snapshot(home.path(), &[]), untouched, "plan wrote");
+    // A claim is announced work that writes no byte: it takes a file that
+    // already holds what bx wants into the ledger, and nothing else.
+    let (claims, announced): (Vec<&Change>, Vec<&Change>) = planned
+        .changes
+        .iter()
+        .filter(|change| matches!(change.action, Action::Create | Action::Modify))
+        .partition(|change| is_claim(change));
+    let rel = |change: &&Change| PathBuf::from(change.target.strip_prefix("~/").expect("in home"));
+    let claims = claims.iter().map(rel).collect::<BTreeSet<_>>();
+    let announced = announced.iter().map(rel).collect::<BTreeSet<_>>();
+
+    let before = tree(home.path());
+    let applied = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("apply runs");
+    let after = tree(home.path());
+    prop_assert_eq!(rows(&applied), rows(&planned));
+    prop_assert_eq!(
+        applied.executed,
+        !(announced.is_empty() && claims.is_empty())
+    );
+    let held = ledger(home.path());
+    for claim in &claims {
+        prop_assert_eq!(
+            before.get(claim),
+            after.get(claim),
+            "claim {} changed",
+            claim.display()
+        );
+        prop_assert!(
+            before.contains_key(claim),
+            "claim {} is absent",
+            claim.display()
+        );
+        let target =
+            Portable::parse_in(&format!("~/{}", claim.display()), home.path()).expect("a path");
+        prop_assert!(
+            held.contains(&target),
+            "claim {} is not in the ledger",
+            claim.display()
+        );
+    }
+
+    let changed = before
+        .keys()
+        .chain(after.keys())
+        .filter(|path| before.get(*path) != after.get(*path))
+        .collect::<BTreeSet<_>>();
+    let (dirs, files): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) = changed
+        .iter()
+        .partition(|path| home.path().join(path).is_dir());
+    // Every file that changed is an announced target, or lies within an
+    // announced external's checkout; every announced target changed.
+    for file in &files {
+        prop_assert!(
+            announced.iter().any(|target| file.starts_with(target)),
+            "{} changed unannounced",
+            file.display()
+        );
+    }
+    for target in &announced {
+        prop_assert!(
+            changed.iter().any(|path| path.starts_with(target)),
+            "{} was announced and did not change",
+            target.display()
+        );
+    }
+    // A directory changes only by being created: as a parent of an
+    // announced target, or within an announced checkout.
+    for dir in dirs {
+        prop_assert!(
+            !before.contains_key(dir)
+                && announced
+                    .iter()
+                    .any(|target| target.starts_with(dir) || dir.starts_with(target)),
+            "{} changed",
+            dir.display()
+        );
+    }
+
+    let second =
+        run(&inputs, Mode::Plan, &mut |_| panic!("plan never asks")).expect("the second plan");
+    prop_assert!(
+        second
+            .changes
+            .iter()
+            .all(|change| !matches!(change.action, Action::Create | Action::Modify)),
+        "{:?}",
+        second.actions()
+    );
+    let again =
+        run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve")).expect("the second apply");
+    prop_assert!(!again.executed);
+    prop_assert_eq!(tree(home.path()), after);
+    Ok(())
+}
+
+/// The case proptest shrank #366 to: a whole-file target over a file the user
+/// wrote with exactly its bytes. Plan announces a claim, apply leaves the
+/// file's bytes and mode as they were and records it, and the next plan is
+/// empty.
+#[test]
+fn a_target_over_a_users_file_that_already_matches_is_claimed() {
+    let layer = Layer {
+        targets: vec![Generated {
+            nested: false,
+            region: false,
+            body: "t\n".to_string(),
+            before: Before::Users("t\n".to_string()),
+        }],
+        variables: Vec::new(),
+        aliases: Vec::new(),
+        startup: vec![None; STARTUP.len()],
+        external: false,
+    };
+    plan_and_apply_agree(&layer).expect("plan and apply agree");
+
+    let home = guarded_home();
+    let inputs = layer.inputs(&home);
+    let planned = run(&inputs, Mode::Plan, &mut |_| panic!("plan never asks")).expect("plan");
+    let claims = planned
+        .changes
+        .iter()
+        .filter(|change| is_claim(change))
+        .map(|change| change.target.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(claims, vec!["~/.p0"], "{:?}", rows(&planned));
+
+    let before = tree(home.path());
+    let applied = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("apply");
+    assert!(applied.executed);
+    assert_eq!(tree(home.path()), before);
+    assert_eq!(
+        before
+            .get(Path::new(".p0"))
+            .map(|(bytes, _)| bytes.as_deref()),
+        Some(Some(&b"t\n"[..]))
+    );
+    assert_eq!(
+        ledger(home.path()),
+        vec![Portable::parse_in("~/.p0", home.path()).expect("a path")]
+    );
+
+    let second = run(&inputs, Mode::Plan, &mut |_| panic!("plan never asks")).expect("plan");
+    assert!(
+        second
+            .changes
+            .iter()
+            .all(|change| !matches!(change.action, Action::Create | Action::Modify)),
+        "{:?}",
+        second.actions()
+    );
+}
+
 proptest::proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
-    /// Invariants 3 and 7 over generated configurations: apply changes
-    /// exactly the files plan announced and announces what plan did, and
-    /// the plan after it announces no work.
+    /// Invariants 3 and 7 over generated configurations, as
+    /// [`plan_and_apply_agree`] states them.
     #[test]
     fn apply_changes_what_plan_announced_and_a_second_plan_is_empty(layer in layers()) {
-        let home = guarded_home();
-        let inputs = layer.inputs(&home);
-
-        let untouched = snapshot(home.path(), &[]);
-        let planned = run(&inputs, Mode::Plan, &mut |_| panic!("plan never asks"))
-            .expect("plan runs");
-        prop_assert_eq!(snapshot(home.path(), &[]), untouched, "plan wrote");
-        let announced = planned
-            .changes
-            .iter()
-            .filter(|change| matches!(change.action, Action::Create | Action::Modify))
-            .map(|change| PathBuf::from(change.target.strip_prefix("~/").expect("in home")))
-            .collect::<BTreeSet<_>>();
-
-        let before = tree(home.path());
-        let applied = run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("apply runs");
-        let after = tree(home.path());
-        prop_assert_eq!(rows(&applied), rows(&planned));
-        prop_assert_eq!(applied.executed, !announced.is_empty());
-
-        let changed = before
-            .keys()
-            .chain(after.keys())
-            .filter(|path| before.get(*path) != after.get(*path))
-            .collect::<BTreeSet<_>>();
-        let (dirs, files): (BTreeSet<&PathBuf>, BTreeSet<&PathBuf>) = changed
-            .iter()
-            .partition(|path| home.path().join(path).is_dir());
-        // Every file that changed is an announced target, or lies within an
-        // announced external's checkout; every announced target changed.
-        for file in &files {
-            prop_assert!(
-                announced.iter().any(|target| file.starts_with(target)),
-                "{} changed unannounced",
-                file.display()
-            );
-        }
-        for target in &announced {
-            prop_assert!(
-                changed.iter().any(|path| path.starts_with(target)),
-                "{} was announced and did not change",
-                target.display()
-            );
-        }
-        // A directory changes only by being created: as a parent of an
-        // announced target, or within an announced checkout.
-        for dir in dirs {
-            prop_assert!(
-                !before.contains_key(dir)
-                    && announced
-                        .iter()
-                        .any(|target| target.starts_with(dir) || dir.starts_with(target)),
-                "{} changed",
-                dir.display()
-            );
-        }
-
-        let second = run(&inputs, Mode::Plan, &mut |_| panic!("plan never asks"))
-            .expect("the second plan");
-        prop_assert!(
-            second
-                .changes
-                .iter()
-                .all(|change| !matches!(change.action, Action::Create | Action::Modify)),
-            "{:?}",
-            second.actions()
-        );
-        let again = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve"))
-            .expect("the second apply");
-        prop_assert!(!again.executed);
-        prop_assert_eq!(tree(home.path()), after);
+        plan_and_apply_agree(&layer)?;
     }
 
     /// Invariant 4 over generated configurations: `rm` of everything bx

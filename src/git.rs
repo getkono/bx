@@ -52,8 +52,11 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    /// `git` ran past the deadline it was given, and was killed.
-    #[error("`git {args}` did not finish in time, and was stopped")]
+    /// `git`, or a process it left holding its output after it exited, ran
+    /// past the deadline it was given, and bx stopped waiting for it. A `git`
+    /// still running is killed; a leftover process is killed only with
+    /// [`Git::in_own_group`], and otherwise left to run on.
+    #[error("`git {args}` did not finish in time, and bx stopped waiting for it")]
     TimedOut {
         /// The arguments it was given.
         args: String,
@@ -143,8 +146,9 @@ impl Git {
             .with_env("GCM_INTERACTIVE", "never")
     }
 
-    /// The same `git`, every command killed and failed with
-    /// [`Error::TimedOut`] once `deadline` passes.
+    /// The same `git`, every command failed with [`Error::TimedOut`] once
+    /// `deadline` passes, whether git is still running (it is killed) or its
+    /// output is still being collected.
     ///
     /// For a question to a remote, whose network has to be bounded: one that
     /// accepts the connection and never answers would otherwise hold a person

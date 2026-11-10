@@ -698,7 +698,9 @@ pub(super) const SCRATCH: &str = "[[value]]\n\
 #[test]
 fn the_secrets_table_is_carried_through_resolution() {
     let resolved = resolved(
-        "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz one\"]\n",
+        // The public half of a throwaway key generated for this test.
+        "[secrets]\nrecipients = [\"ssh-ed25519 \
+         AAAAC3NzaC1lZDI1NTE5AAAAIDRgIMdfCcjBrb0DLH6nJeNNHH1XkH50spiqT5vkgbv/ one\"]\n",
         Some("[secrets]\nidentity = \"~/.config/age/key.txt\"\n"),
     )
     .unwrap();

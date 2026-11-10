@@ -1060,7 +1060,13 @@ mod tests {
         );
     }
 
-    const RECIPIENTS: &str = "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz one\"]\n";
+    /// Public halves of throwaway keys generated for these tests.
+    const ONE: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDRgIMdfCcjBrb0DLH6nJeNNHH1XkH50spiqT5vkgbv/ one";
+    const OLD: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILpRtvOx0zOm/XKZJrN+JuCEL+zeQk5RimfOXq9BeNTr old";
+    const RECIPIENTS: &str = "[secrets]\nrecipients = [\"ssh-ed25519 \
+        AAAAC3NzaC1lZDI1NTE5AAAAIDRgIMdfCcjBrb0DLH6nJeNNHH1XkH50spiqT5vkgbv/ one\"]\n";
 
     #[test]
     fn an_identity_in_a_committed_layer_is_an_error() {
@@ -1086,21 +1092,14 @@ mod tests {
     #[test]
     fn each_secrets_key_merges_from_its_own_layer() {
         let merged = merge(&[
-            global(
-                "bx.toml",
-                "[secrets]\nrecipients = [\"ssh-ed25519 AAAAC3Nz old\"]\n",
-            ),
+            global("bx.toml", &format!("[secrets]\nrecipients = [\"{OLD}\"]\n")),
             global("modules/k.toml", RECIPIENTS),
             local("[secrets]\nidentity = \"~/.config/age/key.txt\"\n"),
         ])
         .expect("merges");
 
         let recipients = merged.secrets.recipients.expect("recipients");
-        assert_eq!(
-            recipients.keys,
-            ["ssh-ed25519 AAAAC3Nz one"],
-            "the later layer wins"
-        );
+        assert_eq!(recipients.keys, [ONE], "the later layer wins");
         assert_eq!(recipients.origin.file, Path::new("modules/k.toml"));
         assert_eq!(
             merged.secrets.identity.expect("an identity").path.as_str(),

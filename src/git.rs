@@ -267,17 +267,27 @@ impl Git {
     }
 }
 
-/// Run `command` to its end, or kill it once `deadline` passes: the command
-/// alone, or with `own_group` the process group it leads, and so whatever it
-/// started.
+/// Run `command` and collect what it printed, both by `deadline`, or kill it
+/// once `deadline` passes: the command alone, or with `own_group` the process
+/// group it leads, and so whatever it started.
 ///
-/// `None` when it was killed. Each stream is read on its own thread, so a
-/// child that fills one pipe while this waits on the other cannot stall.
+/// `None` when it ran out of time. Each stream is read on its own thread, so
+/// a child that fills one pipe while this waits on the other cannot stall.
+/// A pipe is closed only once every process holding it is gone, so a process
+/// the command left behind holding one — an ssh `ControlPersist` master, a
+/// helper that backgrounds something — keeps its stream open after the
+/// command exits; collecting the streams is therefore bounded by the same
+/// deadline, and a reader still waiting then is left behind rather than
+/// joined. Under `own_group` the group is killed then too, which stops that
+/// process unless it left the group. The command is not reaped until its
+/// streams are collected, so the group's id cannot have passed to another
+/// process when it is killed.
 fn bounded(
     command: &mut Command,
     deadline: Instant,
     own_group: bool,
 ) -> Option<std::io::Result<Output>> {
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
     use std::io::Read as _;
 
     if own_group {
@@ -296,19 +306,23 @@ fn bounded(
         let _ = child.wait();
     };
     let read = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             if let Some(mut stream) = stream {
                 let _ = stream.read_to_end(&mut bytes);
             }
-            bytes
-        })
+            let _ = send.send(bytes);
+        });
+        receive
     };
     let stdout = read(child.stdout.take().map(|s| Box::new(s) as _));
     let stderr = read(child.stderr.take().map(|s| Box::new(s) as _));
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
+    // Whether the command has exited, leaving it unreaped.
+    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    loop {
+        match waitid(WaitId::Pid(group), exited) {
+            Ok(Some(_)) => break,
             Ok(None) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -319,14 +333,23 @@ fn bounded(
             }
             Err(error) => {
                 kill(&mut child);
-                return Some(Err(error));
+                return Some(Err(error.into()));
             }
         }
+    }
+    let collect = |stream: &std::sync::mpsc::Receiver<Vec<u8>>| {
+        stream
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
     };
-    Some(Ok(Output {
+    let (Some(stdout), Some(stderr)) = (collect(&stdout), collect(&stderr)) else {
+        kill(&mut child);
+        return None;
+    };
+    Some(child.wait().map(|status| Output {
         status,
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout,
+        stderr,
     }))
 }
 
@@ -521,6 +544,56 @@ mod tests {
                 error.to_string().contains("did not finish in time"),
                 "{error}"
             );
+        }
+    }
+
+    #[test]
+    fn a_process_left_holding_the_output_is_bounded_by_the_same_deadline() {
+        for own_group in [false, true] {
+            let scratch = tempfile::tempdir().expect("a scratch directory");
+            let pid_file = scratch.path().join("pid");
+            // The command exits at once, leaving `sleep` holding both pipes.
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    &format!("sleep 30 & echo $! > {}; echo hi", pid_file.display()),
+                ])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let started = Instant::now();
+            let output = bounded(
+                &mut command,
+                started + Duration::from_millis(300),
+                own_group,
+            );
+            assert!(output.is_none(), "own_group {own_group}: {output:?}");
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "own_group {own_group}: waited {:?} on the leftover",
+                started.elapsed()
+            );
+            let pid = std::fs::read_to_string(&pid_file).expect("the leftover's pid");
+            let leftover = pid
+                .trim()
+                .parse()
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+                .expect("a process id");
+            if own_group {
+                let gone = (0..100).any(|_| {
+                    let running = runs(leftover);
+                    if running {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    !running
+                });
+                assert!(gone, "the leftover {leftover:?} still runs");
+            } else {
+                // Out of reach without a group; stopped here so the suite
+                // leaves nothing behind.
+                let _ = rustix::process::kill_process(leftover, rustix::process::Signal::KILL);
+            }
         }
     }
 

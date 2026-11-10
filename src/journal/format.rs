@@ -1,7 +1,6 @@
 //! The bytes on disk: a header naming the format and the session's nonce,
 //! then length-prefixed, checksummed frames, each holding one [`Record`].
 
-use std::fs::File;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -324,25 +323,28 @@ pub(super) fn encode(record: &Record, nonce: &[u8; NONCE]) -> Result<Vec<u8>, Er
 /// A nonce no other journal is expected to share.
 ///
 /// It guards against damage, not an adversary, so it needs to differ between
-/// sessions, not to be secret. The kernel's random bytes are the source; the
-/// process's own hash seed, its id, a per-process counter and the clock are
-/// mixed in too, so a system without `/dev/urandom` still gets a nonce that
-/// differs from every earlier session's, and creating a journal never fails
-/// for want of one. The journal is machine state that exists only while a
-/// session is in flight, so a value that differs per run breaks no
-/// byte-identical output.
+/// sessions, not to be secret. The platform's random source, through
+/// [`getrandom::fill`], is the source; the process's own hash seed, its id, a
+/// per-process counter and the clock are mixed in too, so when the system's
+/// random source fails the nonce still differs from every earlier session's,
+/// and creating a journal never fails for want of one. The journal is machine
+/// state that exists only while a session is in flight, so a value that
+/// differs per run breaks no byte-identical output.
 pub(super) fn fresh_nonce() -> [u8; NONCE] {
+    nonce_from(|random| getrandom::fill(random).is_ok())
+}
+
+/// [`fresh_nonce`] over a random `source` that fills its buffer and says
+/// whether it did; a source that fails contributes nothing, and the rest of
+/// the mix still makes the nonce differ.
+fn nonce_from(source: impl FnOnce(&mut [u8]) -> bool) -> [u8; NONCE] {
     use sha2::Digest as _;
     use std::hash::BuildHasher as _;
-    use std::io::Read as _;
 
     static SESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut hasher = sha2::Sha256::new();
     let mut random = [0_u8; 32];
-    if File::open("/dev/urandom")
-        .and_then(|mut source| source.read_exact(&mut random))
-        .is_ok()
-    {
+    if source(&mut random) {
         hasher.update(random);
     }
     let count = SESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -535,5 +537,25 @@ mod tests {
             whole_frame_after(&bytes, last - 1, &nonce),
             "one byte earlier, it is"
         );
+    }
+
+    #[test]
+    fn consecutive_nonces_differ() {
+        assert_ne!(fresh_nonce(), fresh_nonce());
+    }
+
+    #[test]
+    fn a_failing_random_source_still_yields_distinct_nonces() {
+        let mut asked = 0;
+        let mut failing = |random: &mut [u8]| {
+            asked += 1;
+            assert_eq!(random.len(), 32, "the source is asked for 32 bytes");
+            false
+        };
+        let first = nonce_from(&mut failing);
+        let second = nonce_from(&mut failing);
+        assert_eq!(asked, 2, "each nonce asks the source once");
+        assert_ne!(first, second);
+        assert_ne!(first, [0; NONCE]);
     }
 }

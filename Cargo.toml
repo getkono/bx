@@ -71,6 +71,9 @@ toml_edit = { version = "0.25.14", features = ["serde"] }
 sha2 = "0.11.0"
 # Atomic writes: temp file in the destination directory, fsync, rename.
 tempfile = "3.27.0"
+# The write-ahead journal's per-session nonce, from the platform's own random
+# source. Already built for tempfile, with the same default features off.
+getrandom = { version = "0.4.3", default-features = false }
 # File modes, fsync, the advisory lock on the state directory, and discarding
 # what was typed ahead of a confirmation.
 rustix = { version = "1.1.4", features = ["fs", "process", "system", "termios"] }

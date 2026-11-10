@@ -2,7 +2,8 @@
 //!
 //! The second half of `CLAUDE.md` Invariant 4: *an interrupted `apply` must be
 //! detectable and recoverable*. [`pending`] is the detection, [`recover`] is the
-//! undo, and `abandon` is the escape when the undo cannot be taken.
+//! undo, and [`abandon`] — `bx abandon` — is the escape when the undo cannot
+//! be taken.
 //!
 //! # Roll back, not forward
 //!
@@ -49,7 +50,8 @@
 //! diff, one already holding what was there before as [`Action::Unchanged`]
 //! (or a modify naming the directories recovery removes where empty), every
 //! write of a session that finished as [`Action::Unchanged`], and a write
-//! recovery cannot account for as an [`Action::Conflict`] naming `abandon`.
+//! recovery cannot account for as an [`Action::Conflict`] naming
+//! [`ABANDON`].
 //! It exits [`Exit::Pending`] whatever the rows are. That is what keeps `plan` usable from CI, a prompt segment or a login
 //! banner.
 //!
@@ -75,11 +77,11 @@
 //! and that does not lapse because a crash happened. The journal is **not**
 //! unlinked, so every writing command keeps refusing until it is resolved, and
 //! the message names the file, both digests it could legitimately hold, and
-//! `abandon` as the way out.
+//! [`ABANDON`] as the way out.
 //!
 //! A destination whose parent no longer resolves to a directory blocks
 //! recovery the same way: bx can neither confirm what is there nor write the
-//! undo through it, and the message names the parent and `abandon`.
+//! undo through it, and the message names the parent and [`ABANDON`].
 //!
 //! [`Action::Modify`]: crate::report::Action::Modify
 //! [`Action::Unchanged`]: crate::report::Action::Unchanged
@@ -101,9 +103,11 @@ mod fixtures;
 mod inspect;
 mod rollback;
 
-#[cfg(test)]
-pub use entry::abandon;
-pub use entry::{lock_for_writing, pending, recover};
+pub use entry::{abandon, lock_for_writing, pending, recover};
+
+/// The command that runs [`abandon`], which every note naming the way out of
+/// a blocked recovery spells exactly.
+pub const ABANDON: &str = "bx abandon";
 
 /// Everything that can go wrong recovering.
 #[derive(Debug, thiserror::Error)]

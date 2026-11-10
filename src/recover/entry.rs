@@ -1,7 +1,6 @@
 //! The entry points: reporting an interrupted session, recovering it, and
 //! abandoning it.
 
-#[cfg(test)]
 use std::path::PathBuf;
 
 use super::inspect::{Spelling, decide, rebuild_home};
@@ -162,7 +161,7 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 ///
 /// As [`recover`], plus [`Error::Blocked`] when a destination cannot be
 /// accounted for — a command that is about to write must stop. The escape from
-/// that is `abandon`.
+/// that is [`abandon`].
 pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
     state.ensure()?;
     let lock = ExclusiveLock::acquire(state)?;
@@ -185,7 +184,6 @@ pub fn lock_for_writing(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// the journal cannot be moved, or with [`journal::Error::FutureVersion`] when
 /// a newer bx wrote it, which is left exactly where it is. A journal abandoned earlier is never renamed
 /// over: this one takes the next free set-aside name.
-#[cfg(test)]
 pub fn abandon(state: &StateDir) -> Result<Option<PathBuf>, Error> {
     let lock = ExclusiveLock::acquire(state)?;
     #[cfg(test)]

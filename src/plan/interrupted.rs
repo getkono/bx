@@ -20,7 +20,7 @@ use crate::{journal, state};
 /// created — and names the directories the session created that recovery
 /// removes where empty. A write in a session that finished is only recorded,
 /// which touches no file, so its row is unchanged. A write recovery cannot
-/// account for is a conflict whose note names abandon.
+/// account for is a conflict whose note names [`recover::ABANDON`].
 ///
 /// The prior bytes a diff shows are read from the journal and its restore
 /// snapshot, lockless, as `pending` read them. A snapshot that cannot be read
@@ -71,13 +71,14 @@ pub(super) fn interrupted_rows(
         };
 
         if !unfinished.resolvable {
-            let note = if unfinished.note.contains("abandon") {
+            let note = if unfinished.note.contains(recover::ABANDON) {
                 unfinished.note.clone()
             } else {
                 format!(
-                    "{}; recovery cannot put it back, so the interrupted session has to be \
-                     abandoned",
-                    unfinished.note
+                    "{}; recovery cannot put it back, so run `{}` to set the interrupted \
+                     session aside",
+                    unfinished.note,
+                    recover::ABANDON,
                 )
             };
             rows.push(row(Action::Conflict, None, note));
@@ -416,9 +417,16 @@ mod tests {
 
             assert_eq!(report.actions(), vec![Action::Conflict]);
             let note = report.changes[0].note.as_deref().expect("a note");
-            // Decision 18 adds that the session has to be abandoned.
+            // Decision 18 adds that the session has to be abandoned, and
+            // names the command that does it.
             assert!(note.starts_with(&want.to_string()), "{note}");
-            assert!(note.contains("abandon"), "{note}");
+            assert!(
+                note.ends_with(
+                    "; recovery cannot put it back, so run `bx abandon` to set the \
+                     interrupted session aside"
+                ),
+                "{note}"
+            );
             let shown = diff::render(
                 &report,
                 View::Plan,

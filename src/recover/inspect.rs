@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Error, Standing, Unfinished};
+use super::{ABANDON, Error, Standing, Unfinished};
 use crate::fs::{self, Kind, Mode};
 use crate::journal::{Intent, Loaded, Written};
 use crate::paths::Portable;
@@ -506,8 +506,8 @@ fn unreachable(intent: &Intent) -> String {
     format!(
         "{}: {parent} does not resolve to a directory, so bx cannot tell what is \
          there and will not roll it back. Make {parent} a directory again, or \
-         abandon the interrupted session to have bx report it as a conflict \
-         instead.",
+         run `{ABANDON}` to set the interrupted session aside and have bx \
+         report it as a conflict instead.",
         Standing::Unreachable,
     )
 }
@@ -534,8 +534,8 @@ fn note(intent: &Intent, standing: Standing) -> String {
     format!(
         "{standing}; before the interruption it {before}, and it {after}. \
          bx will not overwrite it. Put back either of those two states, or \
-         abandon the interrupted session to have bx report it as a conflict \
-         instead."
+         run `{ABANDON}` to set the interrupted session aside and have bx \
+         report it as a conflict instead."
     )
 }
 
@@ -876,8 +876,8 @@ mod tests {
             ..intent(&portable, &dest, b"")
         };
         let tail = "bx will not overwrite it. Put back either of those two states, \
-                    or abandon the interrupted session to have bx report it as a \
-                    conflict instead.";
+                    or run `bx abandon` to set the interrupted session aside and \
+                    have bx report it as a conflict instead.";
 
         let created = Intent {
             after: Written::Present {
@@ -1410,7 +1410,7 @@ mod tests {
         );
         assert!(report.blocked().next().is_some());
         assert!(write.note.contains("~/.made"), "{}", write.note);
-        assert!(write.note.contains("abandon"), "{}", write.note);
+        assert!(write.note.contains("run `bx abandon`"), "{}", write.note);
         assert!(state.journal().exists(), "the journal is kept");
         assert!(matches!(
             lock_for_writing(&state),

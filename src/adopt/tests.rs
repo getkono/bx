@@ -653,6 +653,41 @@ fn a_switched_off_placeholder_pathed_declaration_is_found_by_the_path_it_resolve
 }
 
 #[test]
+fn an_external_toggle_at_the_path_declares_no_target_and_the_file_is_adopted() {
+    let external = "[[external]]\npath = \"~/.x\"\nurl = \"https://example.invalid/x.git\"\n\
+                    rev = \"0123456789abcdef0123456789abcdef01234567\"\n";
+    let home = repo(external);
+    let local = StateDir::resolve(home.path()).local_toml();
+    let toggle = "[[external]]\npath = \"~/.x\"\nenabled = false\n";
+    std::fs::create_dir_all(local.parent().expect("parent")).expect("state dir");
+    std::fs::write(&local, toggle).expect("local.toml");
+    plant(&home, ".x", b"x\n", 0o644);
+
+    let ctx = context(&home);
+    assert!(
+        ctx.layers.iter().any(|layer| {
+            layer
+                .config
+                .toggles
+                .iter()
+                .any(|t| t.key == "~/.x" && t.section == merge::Section::External)
+        }),
+        "the fixture holds a bare external toggle at the path"
+    );
+    assert!(
+        discover(&ctx, home.path())
+            .expect("discover")
+            .contains(&target(&home, ".x")),
+        "discovery offers it"
+    );
+    let rows = add_rel(&home, ".x");
+    assert_eq!(adopted(&rows), ["~/.x"], "and add adopts it: {rows:?}");
+    assert!(layer(&home).contains("path = \"~/.x\"\nfile = \"files/.x\""));
+    assert_eq!(std::fs::read(body(&home, ".x")).expect("the copy"), b"x\n");
+    assert_eq!(std::fs::read_to_string(&local).expect("local.toml"), toggle);
+}
+
+#[test]
 fn discovery_leaves_out_what_a_blocked_target_or_a_switched_off_toggle_declares() {
     let values = "[[value]]\nname = \"who\"\nkind = \"string\"\n";
     let home = repo(&format!(

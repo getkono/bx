@@ -520,7 +520,11 @@ fn decision_18_an_apply_over_a_blocked_interruption_refuses_before_rolling_anyth
 
     let planned = bx(home.path(), &["plan"]);
     assert_eq!(planned.status.code(), Some(2), "{}", stderr(&planned));
-    assert!(stdout(&planned).contains("abandon"), "{}", stdout(&planned));
+    assert!(
+        stdout(&planned).contains("run `bx abandon`"),
+        "{}",
+        stdout(&planned)
+    );
 
     let before = snapshot(home.path());
     let refused = bx(home.path(), &["apply", "--yes"]);
@@ -533,6 +537,74 @@ fn decision_18_an_apply_over_a_blocked_interruption_refuses_before_rolling_anyth
     );
     assert_eq!(snapshot(home.path()), before, "a refused apply wrote");
     assert!(home.child(".config/made/new.conf").exists());
+}
+
+#[test]
+fn abandon_sets_a_blocked_interruption_aside_touching_no_destination() {
+    let home = guarded_home();
+    crashed(home.path());
+    std::fs::write(home.child(".owned"), "user edit\n").expect("the user's edit");
+    let refused = bx(home.path(), &["apply", "--yes"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("run `bx abandon` to set the interrupted session aside"),
+        "{}",
+        stderr(&refused)
+    );
+    let state = bx::state::StateDir::resolve(home.path());
+    let journal = std::fs::read(state.journal()).expect("the journal");
+    let new_conf = std::fs::read(home.child(".config/made/new.conf")).expect("new.conf");
+
+    let abandoned = bx(home.path(), &["abandon"]);
+
+    assert_eq!(abandoned.status.code(), Some(0), "{}", stderr(&abandoned));
+    assert!(
+        stdout(&abandoned).starts_with("Set the interrupted session aside in ~/"),
+        "{}",
+        stdout(&abandoned)
+    );
+    assert!(!state.journal().exists(), "the journal is set aside");
+    let aside: Vec<_> = std::fs::read_dir(state.root())
+        .expect("the state directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| std::fs::read(path).is_ok_and(|bytes| bytes == journal))
+        .collect();
+    assert_eq!(aside.len(), 1, "the journal's bytes are kept aside");
+    assert_eq!(
+        std::fs::read(home.child(".owned")).expect("kept"),
+        b"user edit\n"
+    );
+    assert_eq!(
+        std::fs::read(home.child(".config/made/new.conf")).expect("kept"),
+        new_conf
+    );
+
+    let replanned = bx(home.path(), &["plan"]);
+    let text = stdout(&replanned);
+    assert_eq!(replanned.status.code(), Some(2), "{}", stderr(&replanned));
+    assert!(!text.contains("interrupted"), "{text}");
+    assert!(
+        text.lines().any(|line| line.starts_with("  ! ~/.owned ")),
+        "{text}"
+    );
+    assert!(text.contains(", 1 conflict,"), "{text}");
+    let applied = bx(home.path(), &["apply", "--yes"]);
+    assert_eq!(applied.status.code(), Some(2), "{}", stderr(&applied));
+    assert_eq!(
+        std::fs::read(home.child(".owned")).expect("kept"),
+        b"user edit\n",
+        "a conflict is never overwritten"
+    );
+}
+
+#[test]
+fn abandon_with_no_interrupted_session_says_so_and_succeeds() {
+    let home = guarded_home();
+
+    let abandoned = bx(home.path(), &["abandon"]);
+
+    assert_eq!(abandoned.status.code(), Some(0), "{}", stderr(&abandoned));
+    assert_eq!(stdout(&abandoned), "No interrupted session to abandon.\n");
 }
 
 #[test]

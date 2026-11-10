@@ -95,7 +95,7 @@ start with.
 
 ## Commands
 
-There are thirteen. You should not need a manual.
+There are fourteen. You should not need a manual.
 
 | | |
 |---|---|
@@ -110,6 +110,7 @@ There are thirteen. You should not need a manual.
 | `bx upgrade` | everything `bx update` does, and move [pinned externals](#externals) to their newest release, rewriting `rev` where it is declared; then say whether `bx self-upgrade` has a newer bx |
 | `bx secret list` | list declared secrets, and whether each decrypts here |
 | `bx doctor` | missing tools, unanswered values, damaged state, and what else needs a look; changes nothing |
+| `bx abandon` | set aside an [interrupted session](#idempotent-and-reversible) that recovery cannot finish, touching no other file |
 | `bx shell-init` | the one line for your shell rc — not built yet |
 | `bx self-upgrade` | install the latest release over this one; `--check` only looks, `--force` reinstalls even when this one is not older |
 
@@ -239,6 +240,13 @@ path, `bx rm` when a conflict left something as it was, and
   read-only command reports it, and the next writing command undoes it before
   it does anything else. No torn files, ever, and no half-applied plan left
   standing.
+- A rollback never overwrites what you changed since. When a file the
+  interrupted session was writing has been edited, removed, or put out of
+  reach, `bx plan` reports it and `bx apply` and `bx rm` refuse, naming the
+  file. Put it back as it was, or run `bx abandon`: it sets the
+  interrupted session aside and touches no other file, and `plan` then
+  reports whatever bx cannot account for as a conflict — skipped, never
+  overwritten.
 - Two `bx` processes cannot corrupt each other.
 
 ### Opinionated, to avoid surprises

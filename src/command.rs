@@ -1451,7 +1451,7 @@ pub fn add(
 
 /// One `add` row, with its note and any warning on the lines below it.
 fn adoption_row(row: &Adoption) -> String {
-    let target = row.target();
+    let target = row.subject();
     match row {
         Adoption::Adopt {
             body,

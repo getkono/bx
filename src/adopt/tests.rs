@@ -69,7 +69,7 @@ fn apply_yes(home: &GuardedHome) {
 fn adopted(rows: &[Adoption]) -> Vec<&str> {
     rows.iter()
         .filter(|row| matches!(row, Adoption::Adopt { .. }))
-        .map(|row| row.target().as_str())
+        .map(|row| row.subject())
         .collect()
 }
 
@@ -216,7 +216,7 @@ fn a_directory_adopts_every_regular_file_in_byte_order_and_skips_the_rest() {
     let rows = add_rel(&home, ".config/app");
     let shape: Vec<(&str, bool)> = rows
         .iter()
-        .map(|row| (row.target().as_str(), matches!(row, Adoption::Adopt { .. })))
+        .map(|row| (row.subject(), matches!(row, Adoption::Adopt { .. })))
         .collect();
     assert_eq!(
         shape,
@@ -266,9 +266,11 @@ fn credentials_are_refused_by_name_and_skipped_inside_a_directory() {
     let rows = add_rel(&home, ".ssh");
     assert_eq!(adopted(&rows), ["~/.ssh/config", "~/.ssh/id_ed25519.pub"]);
     assert!(
-            rows.iter().any(|row| matches!(row, Adoption::Skipped { target: t, .. } if t.as_str() == "~/.ssh/id_ed25519")),
-            "{rows:?}"
-        );
+        rows.iter().any(
+            |row| matches!(row, Adoption::Skipped { subject, .. } if subject == "~/.ssh/id_ed25519")
+        ),
+        "{rows:?}"
+    );
     assert!(!body(&home, ".ssh/id_ed25519").exists());
     assert!(!layer(&home).contains("id_ed25519\""));
 }
@@ -389,9 +391,38 @@ fn bxs_own_directories_are_never_adopted() {
     plant(&home, ".config/tool.conf", b"t\n", 0o644);
     let rows = add_rel(&home, ".config");
     assert_eq!(adopted(&rows), ["~/.config/tool.conf"]);
-    assert!(rows.iter().any(
-        |row| matches!(row, Adoption::Skipped { target: t, .. } if t.as_str() == "~/.config/bx")
-    ));
+    assert!(
+        rows.iter().any(
+            |row| matches!(row, Adoption::Skipped { subject, .. } if subject == "~/.config/bx")
+        )
+    );
+}
+
+// macOS APFS refuses a file name that is not UTF-8, so only Linux can hold one.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_child_whose_name_is_not_utf8_is_skipped_under_its_own_name() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let home = repo(MINE);
+    plant(&home, "d/a", b"a\n", 0o644);
+    let odd = home.child("d").join(std::ffi::OsStr::from_bytes(b"\xff"));
+    std::fs::write(&odd, b"odd\n").expect("write");
+
+    let rows = add_rel(&home, "d");
+    assert_eq!(adopted(&rows), ["~/d/a"]);
+    let skipped: Vec<&str> = rows
+        .iter()
+        .filter(|row| matches!(row, Adoption::Skipped { .. }))
+        .map(Adoption::subject)
+        .collect();
+    assert_eq!(skipped, ["~/d/\u{fffd}"], "{rows:?}");
+
+    let mut out = Vec::new();
+    crate::command::add(&env(home.path()), home.path(), Some("d"), &mut out).expect("add");
+    let out = String::from_utf8(out).expect("UTF-8");
+    assert!(out.contains("  - ~/d/\u{fffd}  skipped: "), "{out}");
+    assert!(!out.contains("  - ~/d  skipped"), "{out}");
 }
 
 #[test]

@@ -1140,11 +1140,7 @@ pub(crate) mod tests {
                 "~/.zshrc"
             ]]
         );
-        let adopted: Vec<&str> = prepared
-            .adopted
-            .iter()
-            .map(|row| row.target().as_str())
-            .collect();
+        let adopted: Vec<&str> = prepared.adopted.iter().map(|row| row.subject()).collect();
         assert_eq!(
             adopted,
             ["~/.config/nvim/init.lua", "~/.zshrc"],

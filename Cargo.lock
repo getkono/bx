@@ -344,6 +344,7 @@ dependencies = [
  "clap",
  "color-eyre",
  "eyre",
+ "getrandom 0.4.3",
  "indicatif",
  "inquire",
  "jiff",

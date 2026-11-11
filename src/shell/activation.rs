@@ -162,7 +162,7 @@ use crate::config::when::Machine;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
 use crate::process;
-use crate::report::Action;
+use crate::report::{Action, stderr_suffix};
 use crate::state::{ContentHash, Fingerprint, Fingerprints};
 
 /// The prefix of every cache key this module owns for zsh's commands.
@@ -245,11 +245,11 @@ pub enum RunError {
     #[error("could not run it: {0}")]
     Spawn(String),
     /// It exited unsuccessfully.
-    #[error("it exited with {status}{}", stderr_suffix(.stderr))]
+    #[error("it exited with {status}{}", stderr_suffix(.stderr.as_bytes()))]
     Exited {
         /// The exit status, as the standard library renders it.
         status: String,
-        /// The start of what it printed on standard error.
+        /// The first line of what it printed on standard error, trimmed.
         stderr: String,
     },
     /// It ran longer than it may.
@@ -258,15 +258,6 @@ pub enum RunError {
     /// It printed more than it may.
     #[error("it printed more than {0} bytes")]
     TooLarge(usize),
-}
-
-/// `: <stderr>` when there is any, and nothing otherwise.
-fn stderr_suffix(stderr: &str) -> String {
-    if stderr.is_empty() {
-        String::new()
-    } else {
-        format!(": {stderr}")
-    }
 }
 
 /// What [`plan`] asks of the machine. [`System`] is the machine itself; a

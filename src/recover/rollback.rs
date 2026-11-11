@@ -191,7 +191,7 @@ pub(super) fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome,
                     }
                 }
                 // The entry's *own* claims, which are not always the Intent's.
-                // A removal's Intent carries them, because `plan_restore` takes
+                // A removal's Intent carries them, because `plan_restore_with` takes
                 // them from the entry; a released write's does not — it records
                 // only the directories that write invented, which is none. The
                 // replay path drops the same entry `Session::write` drops, so

@@ -1363,7 +1363,12 @@ mod tests {
             dest,
             created_dirs,
             planned,
-        } = crate::restore::plan_restore(&entry, home.path()).expect("plan")
+        } = crate::restore::plan_restore_with(
+            &entry,
+            home.path(),
+            &crate::git::Git::at_home(home.path()),
+        )
+        .expect("plan")
         else {
             panic!("bx created it, so rm removes it");
         };

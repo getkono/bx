@@ -653,7 +653,9 @@ fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
 
     let done = restore(&state, home.path(), &targets);
     let entry = entry_for(&state, home.path(), &targets[1]);
-    let planned = entry.as_ref().map(|entry| plan_restore(entry, home.path()));
+    let planned = entry
+        .as_ref()
+        .map(|entry| plan_restore_with(entry, home.path(), &Git::at_home(home.path())));
     // Before any assertion, so the tempdir can be removed whatever happens.
     std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644))
         .expect("chmod back");
@@ -729,7 +731,7 @@ fn an_rm_target_whose_parent_does_not_resolve_is_a_conflict_and_the_rest_still_r
             .expect("link");
 
         let entry = entry_for(&state, &home, &second).expect("managed");
-        let preview = plan_restore(&entry, &home).expect("preview");
+        let preview = plan_restore_with(&entry, &home, &Git::at_home(&home)).expect("preview");
         let Restoration::Conflict { note, dest } = &preview else {
             panic!("{case}: the preview is a conflict: {preview:?}");
         };
@@ -827,7 +829,7 @@ fn restore_is_journalled_and_an_interrupted_restore_recovers() {
     let entry = entry_for(&state, home.path(), &portable).expect("managed");
     let Restoration::Revert {
         reference, planned, ..
-    } = plan_restore(&entry, home.path()).expect("plan")
+    } = plan_restore_with(&entry, home.path(), &Git::at_home(home.path())).expect("plan")
     else {
         panic!("a displaced file is reverted")
     };
@@ -957,7 +959,12 @@ fn plan_restore_says_exactly_what_restore_then_does() {
         .expect("read the ledger")
         .value;
     let plan_for = |portable: &Portable| {
-        plan_restore(ledger.get(portable).expect("managed"), home.path()).expect("plan")
+        plan_restore_with(
+            ledger.get(portable).expect("managed"),
+            home.path(),
+            &Git::at_home(home.path()),
+        )
+        .expect("plan")
     };
 
     match plan_for(&modified) {
@@ -1027,7 +1034,7 @@ fn an_edit_between_plan_restore_and_the_removal_is_kept_and_nothing_is_unlinked(
     )
     .expect("open");
     let entry = session.ledger().get(&portable).cloned().expect("managed");
-    let plan = plan_restore(&entry, home.path()).expect("plan");
+    let plan = plan_restore_with(&entry, home.path(), &Git::at_home(home.path())).expect("plan");
     plant_file(
         &dest,
         "the user's edit after rm's plan\n",
@@ -1182,7 +1189,7 @@ fn a_claim_is_handed_on_when_the_rm_session_dies_between_its_end_and_its_save() 
         dest,
         created_dirs,
         planned,
-    } = plan_restore(&entry, home.path()).expect("plan")
+    } = plan_restore_with(&entry, home.path(), &Git::at_home(home.path())).expect("plan")
     else {
         panic!("a file bx created is removed")
     };
@@ -1643,7 +1650,7 @@ fn rm_of_a_directory_back_at_the_mode_it_had_only_forgets_it() {
     let portable = managed_dir(&state, home.path(), ".d", Mode::DEFAULT_DIR);
     let entry = entry_for(&state, home.path(), &portable).expect("managed");
     assert_eq!(
-        plan_restore(&entry, home.path()).expect("plan"),
+        plan_restore_with(&entry, home.path(), &Git::at_home(home.path())).expect("plan"),
         Restoration::Release {
             dest: home.child(".d")
         }
@@ -1669,7 +1676,7 @@ fn an_interrupted_rm_of_a_directory_makes_it_again() {
         dest,
         created_dirs,
         planned,
-    } = plan_restore(&entry, home.path()).expect("plan")
+    } = plan_restore_with(&entry, home.path(), &Git::at_home(home.path())).expect("plan")
     else {
         panic!("bx created it");
     };
@@ -1873,9 +1880,10 @@ fn rm_removes_a_link_bx_made_with_the_directories_it_made_and_never_its_target()
     assert_eq!(portable, linked_twice);
 
     assert!(matches!(
-        plan_restore(
+        plan_restore_with(
             &entry_for(&state, home.path(), &portable).expect("managed"),
-            home.path()
+            home.path(),
+            &Git::at_home(home.path()),
         )
         .expect("plan"),
         Restoration::RemoveLink { .. }

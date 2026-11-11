@@ -376,7 +376,7 @@ impl Session {
     /// [`Session::finish`], so its journal stays for recovery to roll back —
     /// whatever failed, and however early. A caller that wants to skip a target
     /// and go on decides that before calling, the way [`crate::restore`] asks
-    /// [`crate::restore::plan_restore`] first.
+    /// [`crate::restore::plan_restore_with`] first.
     ///
     /// # Errors
     ///
@@ -1389,7 +1389,7 @@ fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
 /// absolute, normalised UTF-8 path, which
 /// [`Portable::from_path`] always converts. Kept rather than unwrapped — a panic in a writer's durability
 /// path is worse than a returned error nothing produces — and named here so it
-/// reads as a gap on purpose rather than a missed test, like `plan_restore`'s own
+/// reads as a gap on purpose rather than a missed test, like `plan_restore_with`'s own
 /// unreachable `Err` arm.
 fn portable_dirs(dirs: &[PathBuf], home: &Path) -> Result<Vec<Portable>, Error> {
     dirs.iter()

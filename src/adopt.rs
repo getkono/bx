@@ -1417,10 +1417,10 @@ fn undeclare(
 ///
 /// The targets are every declaration of a path at or beneath `target`, in any
 /// layer, and every ledger entry there — so a target whose declaration was
-/// deleted by hand is still handed back. [`restore::restore_with`] decides and
-/// restores each; each one it released is then removed from every layer
-/// declaring it. A conflict is left declared and untouched, and a tree is
-/// handed back whole or not at all (`hold_trees`). A file nothing declares
+/// deleted by hand is still handed back. [`restore::restore_undeclared_with`]
+/// decides and restores each; each one it released is then removed from every
+/// layer declaring it. A conflict is left declared and untouched, and a tree
+/// is handed back whole or not at all (`hold_trees`). A file nothing declares
 /// (`Context::undeclared`) that was edited since bx wrote it is not a
 /// conflict: it is kept exactly as it is and forgotten, as `apply` releases
 /// it. Nothing to do is an empty result, which is what makes a second `rm` a
@@ -1527,8 +1527,8 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
     Ok(removals)
 }
 
-/// Restore `targets` as [`restore::restore_with`] does, one result per
-/// target in order, with each tracked target handed back through its repo
+/// Restore `targets` as [`restore::restore_undeclared_with`] does, one result
+/// per target in order, with each tracked target handed back through its repo
 /// copy, and a row after them for each repo copy restored.
 ///
 /// # Decision: `rm` restores a tracked target's two copies by what bx claimed of each

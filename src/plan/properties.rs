@@ -608,10 +608,11 @@ proptest::proptest! {
         let inputs = load(home.path()).with_git(git(home.path()));
 
         run(&inputs, Mode::Apply, &mut |_| Ok(true)).expect("apply runs");
-        crate::restore::restore_with(
+        crate::restore::restore_undeclared_with(
             &StateDir::resolve(home.path()),
             home.path(),
             &ledger(home.path()),
+            &std::collections::BTreeSet::new(),
             &git(home.path()),
         )
         .expect("rm");

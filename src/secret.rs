@@ -107,11 +107,12 @@ pub enum Refusal {
         /// The identity, spelled portably.
         identity: String,
     },
-    /// The identity is protected by a passphrase and nothing may ask for it.
+    /// The identity is protected by a passphrase and none was given: nothing
+    /// may ask for it, or the question asked was cancelled.
     #[error(
-        "the identity {identity} is locked by a passphrase, and bx plan and bx apply never ask \
-         for one; set `identity` under [secrets] in local.toml to a key without a passphrase \
-         that this secret is encrypted to"
+        "the identity {identity} is locked by a passphrase and none was given; set `identity` \
+         under [secrets] in local.toml to a key without a passphrase that this secret is \
+         encrypted to"
     )]
     Locked {
         /// The identity, spelled portably.
@@ -511,7 +512,11 @@ ffxbALZN3JpDBBEk8TeZk55mo+jjJlOtAf63Q=
                 identity: "~/id".to_string()
             }
         );
-        assert!(refused.to_string().contains("never ask"), "{refused}");
+        assert!(refused.to_string().contains("none was given"), "{refused}");
+        assert!(
+            !refused.to_string().contains("bx "),
+            "names no command: {refused}"
+        );
         assert!(
             refused.to_string().contains("local.toml"),
             "names the fix: {refused}"

@@ -32,7 +32,6 @@
 
 use std::cmp::Ordering;
 use std::ffi::OsStr;
-use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -40,6 +39,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use crate::detect;
 use crate::hash::ContentHash;
 use crate::report::{Exit, stderr_suffix};
+use crate::version::{ParseVersionError, Version};
 
 /// Where a fresh install fetches the installer from, and so where an upgrade
 /// does.
@@ -108,8 +108,8 @@ pub enum Error {
         stderr: String,
     },
     /// A version that is not `vMAJOR.MINOR.PATCH`.
-    #[error("{0:?} is not a release version bx understands")]
-    Version(String),
+    #[error(transparent)]
+    Version(#[from] ParseVersionError),
     /// The running binary's location could not be established.
     #[error("could not find the running bx: {0}")]
     CurrentExe(#[source] std::io::Error),
@@ -124,49 +124,6 @@ pub enum Error {
     /// The output could not be written.
     #[error("writing the output: {0}")]
     Output(#[source] std::io::Error),
-}
-
-/// A release version: `MAJOR.MINOR.PATCH`, ordered numerically.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Version {
-    major: u64,
-    minor: u64,
-    patch: u64,
-}
-
-impl Version {
-    /// `text` as a version, with or without the tag's leading `v`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Version`] for anything but three dot-separated decimal numbers.
-    pub fn parse(text: &str) -> Result<Self, Error> {
-        let invalid = || Error::Version(text.to_string());
-        let bare = text.strip_prefix('v').unwrap_or(text);
-        let mut parts = bare.split('.').map(|part| {
-            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(invalid());
-            }
-            part.parse::<u64>().map_err(|_| invalid())
-        });
-        let (Some(major), Some(minor), Some(patch), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(invalid());
-        };
-        Ok(Self {
-            major: major?,
-            minor: minor?,
-            patch: patch?,
-        })
-    }
-}
-
-/// The release tag form, `vMAJOR.MINOR.PATCH`.
-impl fmt::Display for Version {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}.{}.{}", self.major, self.minor, self.patch)
-    }
 }
 
 /// The body of `url`, fetched with `curl`, or `wget` when there is no `curl`,
@@ -290,7 +247,9 @@ impl Installer {
                 stderr: stderr_suffix(&output.stderr),
             });
         }
-        Version::parse(String::from_utf8_lossy(&output.stdout).trim())
+        Ok(Version::parse(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        )?)
     }
 
     /// Install `version` into `dir`, exactly as a fresh install with
@@ -640,63 +599,17 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
     }
 
     #[test]
-    fn versions_parse_with_or_without_the_tag_prefix_and_order_numerically() {
-        assert_eq!(
-            Version::parse("v0.1.1").unwrap(),
-            Version::parse("0.1.1").unwrap()
-        );
-        assert_eq!(Version::parse("0.10.0").unwrap().to_string(), "v0.10.0");
-        assert!(Version::parse("v0.10.0").unwrap() > Version::parse("v0.9.9").unwrap());
-        assert!(Version::parse("v1.0.0").unwrap() > Version::parse("v0.99.99").unwrap());
-        assert!(Version::parse(crate::VERSION).is_ok());
-    }
-
-    #[test]
-    fn anything_but_three_numbers_is_not_a_version() {
-        for text in [
-            "",
-            "v",
-            "1.2",
-            "1.2.3.4",
-            "1.2.x",
-            "1..3",
-            "v1.2.3-rc.1",
-            "+1.2.3",
-            " 1.2.3",
-        ] {
-            assert!(
-                matches!(Version::parse(text), Err(Error::Version(t)) if t == text),
-                "{text:?}"
-            );
-        }
-    }
-
-    proptest::proptest! {
-        #[test]
-        fn a_version_round_trips_through_its_tag_and_orders_as_its_triple(
-            a in (0..u64::MAX, 0..u64::MAX, 0..u64::MAX),
-            b in (0..4u64, 0..4u64, 0..4u64),
-        ) {
-            let version = |(major, minor, patch)| Version { major, minor, patch };
-            let tag = version(a).to_string();
-            proptest::prop_assert_eq!(&tag, &format!("v{}.{}.{}", a.0, a.1, a.2));
-            proptest::prop_assert_eq!(Version::parse(&tag).ok(), Some(version(a)));
-            proptest::prop_assert_eq!(Version::parse(&tag[1..]).ok(), Some(version(a)));
-            // Small triples, so equal parts and every ordering turn up.
-            proptest::prop_assert_eq!(version(b).cmp(&version(a)), b.cmp(&a));
-            let small = (a.0 % 4, a.1 % 4, a.2 % 4);
-            proptest::prop_assert_eq!(version(b).cmp(&version(small)), b.cmp(&small));
-        }
-    }
-
-    #[test]
     fn an_unparseable_current_version_is_refused_before_any_request() {
         let served = Served::new(INSTALL_SH, "v0.2.0");
         for request in [CHECK, UPGRADE, FORCE] {
             let (result, out) = served.run(request, "0.2.0-dev");
             assert!(
-                matches!(&result, Err(Error::Version(t)) if t == "0.2.0-dev"),
+                matches!(&result, Err(Error::Version(ParseVersionError(t))) if t == "0.2.0-dev"),
                 "{result:?}"
+            );
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "\"0.2.0-dev\" is not a release version bx understands"
             );
             assert_eq!(out, "");
         }
@@ -944,7 +857,7 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
     fn a_latest_tag_that_is_not_a_version_is_an_error() {
         let served = Served::new(INSTALL_SH, "nightly");
         let (result, _) = served.run(CHECK, "0.1.1");
-        assert!(matches!(result, Err(Error::Version(t)) if t == "nightly"));
+        assert!(matches!(result, Err(Error::Version(ParseVersionError(t))) if t == "nightly"));
     }
 
     #[test]

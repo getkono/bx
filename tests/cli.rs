@@ -539,6 +539,47 @@ fn decision_18_an_apply_over_a_blocked_interruption_refuses_before_rolling_anyth
     assert!(home.child(".config/made/new.conf").exists());
 }
 
+/// The one file in `state`'s directory holding `journal`'s bytes, which is
+/// where `bx abandon` set the journal aside.
+fn set_aside(state: &bx::state::StateDir, journal: &[u8]) -> std::path::PathBuf {
+    let aside: Vec<_> = std::fs::read_dir(state.root())
+        .expect("the state directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| std::fs::read(path).is_ok_and(|bytes| bytes == journal))
+        .collect();
+    assert_eq!(aside.len(), 1, "the journal's bytes are kept aside");
+    aside.into_iter().next().expect("one")
+}
+
+/// All `bx abandon` prints once it set the journal aside at `aside`.
+fn abandoned_text(home: &Path, aside: &Path) -> String {
+    let shown = aside.strip_prefix(home).expect("under HOME");
+    format!(
+        "Set the interrupted session aside in ~/{}, touching no other file.\n\
+         `bx plan` shows what it left; a file bx cannot account for is a conflict, \
+         never overwritten.\n",
+        shown.display()
+    )
+}
+
+#[test]
+fn abandon_sets_the_journal_aside_even_when_the_config_does_not_parse() {
+    let home = guarded_home();
+    crashed(home.path());
+    seed(home.path(), "[[target]\nthis is not toml\n");
+    let refused = bx(home.path(), &["plan"]);
+    assert_eq!(refused.status.code(), Some(1), "the config does not parse");
+    let state = bx::state::StateDir::resolve(home.path());
+    let journal = std::fs::read(state.journal()).expect("the journal");
+
+    let abandoned = bx(home.path(), &["abandon"]);
+
+    assert_eq!(abandoned.status.code(), Some(0), "{}", stderr(&abandoned));
+    assert!(!state.journal().exists(), "the journal is set aside");
+    let aside = set_aside(&state, &journal);
+    assert_eq!(stdout(&abandoned), abandoned_text(home.path(), &aside));
+}
+
 #[test]
 fn abandon_sets_a_blocked_interruption_aside_touching_no_destination() {
     let home = guarded_home();
@@ -558,18 +599,9 @@ fn abandon_sets_a_blocked_interruption_aside_touching_no_destination() {
     let abandoned = bx(home.path(), &["abandon"]);
 
     assert_eq!(abandoned.status.code(), Some(0), "{}", stderr(&abandoned));
-    assert!(
-        stdout(&abandoned).starts_with("Set the interrupted session aside in ~/"),
-        "{}",
-        stdout(&abandoned)
-    );
     assert!(!state.journal().exists(), "the journal is set aside");
-    let aside: Vec<_> = std::fs::read_dir(state.root())
-        .expect("the state directory")
-        .map(|entry| entry.expect("an entry").path())
-        .filter(|path| std::fs::read(path).is_ok_and(|bytes| bytes == journal))
-        .collect();
-    assert_eq!(aside.len(), 1, "the journal's bytes are kept aside");
+    let aside = set_aside(&state, &journal);
+    assert_eq!(stdout(&abandoned), abandoned_text(home.path(), &aside));
     assert_eq!(
         std::fs::read(home.child(".owned")).expect("kept"),
         b"user edit\n"
@@ -1417,6 +1449,51 @@ fn self_upgrade_check_and_force_are_exclusive() {
         "{}",
         stderr(&output)
     );
+}
+
+#[test]
+fn upgrade_check_and_yes_are_exclusive() {
+    let home = guarded_home();
+    let output = bx(home.path(), &["upgrade", "--check", "--yes"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("the argument '--check' cannot be used with '--yes'"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn upgrade_check_with_nothing_declared_exits_zero_and_writes_nothing() {
+    let home = guarded_home();
+    seed(home.path(), "");
+    let (path, requests) = served(home.path(), &format!("v{}", bx::VERSION));
+    let served = home.child("served");
+    let mine = |root: &Path| {
+        snapshot(root)
+            .into_iter()
+            .filter(|(path, ..)| !path.starts_with(&served))
+            .collect::<Vec<_>>()
+    };
+    let before = mine(home.path());
+
+    let checked = bx_command()
+        .args(["upgrade", "--check"])
+        .env("HOME", home.path())
+        .env("PATH", &path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run bx");
+
+    assert_eq!(checked.status.code(), Some(0), "{}", stderr(&checked));
+    assert_eq!(
+        stdout(&checked),
+        format!("bx v{} is the latest release.\n", bx::VERSION),
+        "only the binary's check reports, and nothing is planned or applied"
+    );
+    assert_eq!(mine(home.path()), before, "a check wrote");
+    let requests = std::fs::read_to_string(requests).expect("the requests");
+    assert!(!requests.contains("/download/"), "{requests}");
 }
 
 #[test]

@@ -176,9 +176,9 @@
 //! [`Reason`] precisely because a [`Reason`] there could never be returned,
 //! which is a branch no test can reach and no mutant can kill. Being a
 //! `debug_assert!` it does nothing in a release build — the compiler keeps
-//! the code and then eliminates it, so a release binary pays nothing for it; what it buys is that every test in the suite,
-//! not only the one that targets the property, checks it on every location it
-//! judges.
+//! the code and then eliminates it, so a release binary pays nothing for it;
+//! what it buys is that every test in the suite, not only the one that targets
+//! the property, checks it on every location it judges.
 //!
 //! **Before adding a second one**, ask which of the two it is. A statement
 //! about a *value* is a [`Reason`], always, even when it seems impossible —

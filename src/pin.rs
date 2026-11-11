@@ -4,7 +4,7 @@
 //! the configuration says another, so nothing moves it but an edit of that
 //! `rev`. `bx upgrade` makes that edit: [`look`] asks the remote for its
 //! release tags — `vMAJOR.MINOR.PATCH` or `MAJOR.MINOR.PATCH`, as
-//! [`crate::upgrade::Version`] reads them, so a pre-release is never one —
+//! [`crate::version::Version`] reads them, so a pre-release is never one —
 //! and finds the newest; [`rewrite`] replaces the `rev` in the layer whose
 //! entry won the merge with that tag's commit, keeping every other byte.
 //!
@@ -27,7 +27,7 @@ use crate::fs::Mode;
 use crate::git::checkout::{self, problem};
 use crate::git::{self, Git};
 use crate::paths::Portable;
-use crate::upgrade::Version;
+use crate::version::Version;
 
 /// The subject of the commit `bx upgrade` makes for the pins it moves.
 pub const SUBJECT: &str = "chore(bx): upgrade pinned externals";

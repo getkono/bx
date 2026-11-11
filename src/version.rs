@@ -5,8 +5,65 @@
 //! does not say that: the output also carries the commit, the profile, the
 //! compiler and the build time. `build.rs` captures each fact at compile time,
 //! best-effort, and a fact it could not establish reads `unknown`.
+//!
+//! # Release versions
+//!
+//! [`Version`] is a release tag, `vMAJOR.MINOR.PATCH`, ordered numerically. It
+//! is what `bx self-upgrade` compares the running build against the latest
+//! release with, and what `bx upgrade` orders a pinned external's tags by, so
+//! neither depends on the other for it.
 
+use std::fmt;
 use std::sync::OnceLock;
+
+/// A release version: `MAJOR.MINOR.PATCH`, ordered numerically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
+/// Text that is not `vMAJOR.MINOR.PATCH`, carried as it was given.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not a release version bx understands")]
+pub struct ParseVersionError(pub String);
+
+impl Version {
+    /// `text` as a version, with or without the tag's leading `v`.
+    ///
+    /// # Errors
+    ///
+    /// [`ParseVersionError`] for anything but three dot-separated decimal
+    /// numbers.
+    pub fn parse(text: &str) -> Result<Self, ParseVersionError> {
+        let invalid = || ParseVersionError(text.to_string());
+        let bare = text.strip_prefix('v').unwrap_or(text);
+        let mut parts = bare.split('.').map(|part| {
+            if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            part.parse::<u64>().map_err(|_| invalid())
+        });
+        let (Some(major), Some(minor), Some(patch), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(invalid());
+        };
+        Ok(Self {
+            major: major?,
+            minor: minor?,
+            patch: patch?,
+        })
+    }
+}
+
+/// The release tag form, `vMAJOR.MINOR.PATCH`.
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
 
 /// The commit bx was built from, `-dirty` when the tree had uncommitted
 /// changes, or `unknown`.
@@ -149,5 +206,64 @@ mod tests {
         assert_eq!(lines[2], format!("profile: {BUILD_PROFILE}"));
         assert_eq!(lines[3], format!("rustc:   {RUSTC_VERSION}"));
         assert_eq!(lines[4], format!("built:   {}", built(BUILD_EPOCH)));
+    }
+
+    #[test]
+    fn versions_parse_with_or_without_the_tag_prefix_and_order_numerically() {
+        assert_eq!(
+            Version::parse("v0.1.1").unwrap(),
+            Version::parse("0.1.1").unwrap()
+        );
+        assert_eq!(Version::parse("0.10.0").unwrap().to_string(), "v0.10.0");
+        assert!(Version::parse("v0.10.0").unwrap() > Version::parse("v0.9.9").unwrap());
+        assert!(Version::parse("v1.0.0").unwrap() > Version::parse("v0.99.99").unwrap());
+        assert!(Version::parse(crate::VERSION).is_ok());
+    }
+
+    #[test]
+    fn anything_but_three_numbers_is_not_a_version() {
+        for text in [
+            "",
+            "v",
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "1..3",
+            "v1.2.3-rc.1",
+            "+1.2.3",
+            " 1.2.3",
+        ] {
+            assert_eq!(
+                Version::parse(text),
+                Err(ParseVersionError(text.to_string())),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parse_error_names_the_text_it_refused() {
+        assert_eq!(
+            ParseVersionError("nightly".to_string()).to_string(),
+            "\"nightly\" is not a release version bx understands"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_version_round_trips_through_its_tag_and_orders_as_its_triple(
+            a in (0..u64::MAX, 0..u64::MAX, 0..u64::MAX),
+            b in (0..4u64, 0..4u64, 0..4u64),
+        ) {
+            let version = |(major, minor, patch)| Version { major, minor, patch };
+            let tag = version(a).to_string();
+            proptest::prop_assert_eq!(&tag, &format!("v{}.{}.{}", a.0, a.1, a.2));
+            proptest::prop_assert_eq!(Version::parse(&tag).ok(), Some(version(a)));
+            proptest::prop_assert_eq!(Version::parse(&tag[1..]).ok(), Some(version(a)));
+            // Small triples, so equal parts and every ordering turn up.
+            proptest::prop_assert_eq!(version(b).cmp(&version(a)), b.cmp(&a));
+            let small = (a.0 % 4, a.1 % 4, a.2 % 4);
+            proptest::prop_assert_eq!(version(b).cmp(&version(small)), b.cmp(&small));
+        }
     }
 }

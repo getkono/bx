@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_repo_the_environment_moved_is_the_repo_a_generated_fragment_may_not_name() {
-        // The env guard's r3 round gave `RootSet` the config repo, derived
+        // The env guard's `RootSet` holds the config repo, derived
         // from the home unless a caller that read `XDG_CONFIG_HOME` names it.
         // The whole home is a declared root, so only the repo refuses it.
         let home = guarded_home();

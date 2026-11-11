@@ -1135,10 +1135,10 @@ mod tests {
 
     #[test]
     fn an_unreadable_journal_that_cannot_be_set_aside_is_refused_and_never_replaced() {
-        // r3, routed from #7's repair planning. `load_exclusive` reported a
-        // journal it could not move aside as `Unreadable { moved_to: None }`,
-        // which is not an interruption, so `Session::open` created its own
-        // journal over it by rename and the bytes were gone.
+        // Reporting a journal `load_exclusive` could not move aside as
+        // `Unreadable { moved_to: None }`, which is not an interruption, would
+        // let `Session::open` create its own journal over it by rename, and the
+        // bytes would be gone.
         let home = guarded_home();
         // Every set-aside name is longer than the kernel accepts, so the move
         // fails with no permission bit involved, and a session could write.

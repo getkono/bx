@@ -94,8 +94,9 @@ pub(crate) fn store_bytes(
 /// O_NONBLOCK`, the descriptor must be a regular file, and the read is
 /// bounded by `reference.len`.
 ///
-/// The write side's `st_nlink == 1` test is **not** repeated here. A second hard link changes nothing about availability,
-/// and content integrity is settled by the digest recomputed below — bytes
+/// The write side's `st_nlink == 1` test is **not** repeated here. A second
+/// hard link changes nothing about availability, and content integrity is
+/// settled by the digest recomputed below — bytes
 /// that hash to `reference.digest` are the user's prior bytes whoever else
 /// has a name for them. Refusing them would make an ordinary hard-linking
 /// deduplicator or backup tool run over `$HOME` turn an intact, verifiable
@@ -168,7 +169,7 @@ pub fn read(dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
     }
     // The `st_size` test above is a statement about the file when it was
     // `fstat`ed, not when it is read: a blob with a second hard link can
-    // grow in between, and `read_to_end` would follow it (r5, D2). So the
+    // grow in between, and `read_to_end` would follow it. So the
     // read itself stops at `reference.len`. Whatever the first
     // `reference.len` bytes are, the digest below judges them.
     let mut bytes = Vec::new();

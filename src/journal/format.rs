@@ -464,8 +464,9 @@ mod tests {
 
     #[test]
     fn a_frame_copied_from_another_sessions_journal_does_not_validate() {
-        // Review round 5, item 3. Two sessions with the same header wrote
-        // byte-identical frames, so a frame from one validated in the other.
+        // The checksum is keyed by the session nonce. Without it, two sessions
+        // with the same header would write byte-identical frames, so a frame
+        // from one would validate in the other.
         let dir = tempfile::tempdir().expect("a tempdir");
         let (one, two) = (dir.path().join("one.mpk"), dir.path().join("two.mpk"));
         let done = Record::Done(Done {
@@ -496,7 +497,7 @@ mod tests {
 
     #[test]
     fn a_frame_length_is_bounded_at_max_frame_inclusive() {
-        // Coverage review round 5, item 5.
+        // Pins the boundary itself: `MAX_FRAME` is a length, one past it is not.
         let nonce = [7; NONCE];
         let prefix = |len: usize| {
             let mut bytes = u32::try_from(len).expect("fits").to_le_bytes().to_vec();
@@ -518,7 +519,8 @@ mod tests {
 
     #[test]
     fn the_search_for_a_whole_frame_after_damage_starts_past_the_damaged_frame() {
-        // Coverage review round 5, item 6.
+        // Pins where the search starts: a frame at the damaged offset is not
+        // one after it.
         let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         journal

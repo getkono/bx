@@ -1004,10 +1004,10 @@ fn a_file_that_cannot_be_read_is_an_error_not_damage() {
 
 #[test]
 fn a_state_file_that_is_not_a_regular_file_is_never_read() {
-    // r5 (D1): `judge` read state files with plain `std::fs::read`, so a
-    // FIFO at the name blocked in `open` until a writer appeared, and a
-    // link to `/dev/zero` allocated until the process was killed. Both
-    // return at once now, whether the name is the thing or a link to it.
+    // Reading state files with plain `std::fs::read` would block in `open`
+    // on a FIFO at the name until a writer appeared, and allocate on a link
+    // to `/dev/zero` until the process was killed. Both return at once,
+    // whether the name is the thing or a link to it.
     let (dir, path) = state_file();
     let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
     let fifo = || mkfifo(&path);
@@ -1040,7 +1040,7 @@ fn a_state_file_that_is_not_a_regular_file_is_never_read() {
 
 #[test]
 fn a_state_file_longer_than_the_limit_is_never_read_whole() {
-    // r5 (D1): the length was not bounded at all. A sparse file one byte
+    // The length is bounded. A sparse file one byte
     // past the limit costs nothing to make and is refused before any of
     // it is allocated.
     let (dir, path) = state_file();

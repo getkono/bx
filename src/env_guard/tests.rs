@@ -1,5 +1,5 @@
-//! The guard as a whole: `check` and the scans, the review rounds'
-//! reproductions, and (in `census`) the sites outside this module that reach
+//! The guard as a whole: `check` and the scans, the reproductions of bypasses
+//! it once approved, and (in `census`) the sites outside this module that reach
 //! it.
 
 use std::path::{Path, PathBuf};
@@ -1108,9 +1108,9 @@ fn scan_reports_every_violation() {
     assert_eq!(found[1].line, 3);
 }
 
-// Review rounds 3 and 4: each reproduction, written against the API of the
-// round before it and labelled with its round and item. The guard approves
-// none of them, under any root set its row names.
+// Bypass reproductions: each row is a way of relocating a tool that an earlier
+// version of the guard approved, and its label names the construct. The guard
+// approves none of them, under any root set its row names.
 
 /// The root sets a reproduction is scanned under, each built afresh.
 type Sets = &'static [fn() -> RootSet];

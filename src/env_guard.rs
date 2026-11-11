@@ -174,10 +174,9 @@
 //! [`RootSet::contains`], or [`crate::paths::normalize`], which decides what a
 //! path's components are. It is written as an assertion rather than as a
 //! [`Reason`] precisely because a [`Reason`] there could never be returned,
-//! which is a branch no test can reach and no mutant can kill — the defect it
-//! replaced (#47 round 3). Being a `debug_assert!` it does nothing in a release
-//! build — the compiler keeps the code and then eliminates it, so a release
-//! binary pays nothing for it; what it buys is that every test in the suite,
+//! which is a branch no test can reach and no mutant can kill. Being a
+//! `debug_assert!` it does nothing in a release build — the compiler keeps
+//! the code and then eliminates it, so a release binary pays nothing for it; what it buys is that every test in the suite,
 //! not only the one that targets the property, checks it on every location it
 //! judges.
 //!

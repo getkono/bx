@@ -900,7 +900,7 @@ fn degrade<T>(
 /// is loadable anyway.
 ///
 /// **It is here rather than at a call site because three call-site shapes in a
-/// row satisfied the obligation while proving nothing** (r4 rounds 1, 2 and 3):
+/// row satisfied the obligation while proving nothing**:
 /// a value saved twice instead of built twice; a constructor that cloned; and a
 /// constructor that built the old fields and left a new one empty. Each fix
 /// closed the hole it was shown. A check a caller can write in a way that

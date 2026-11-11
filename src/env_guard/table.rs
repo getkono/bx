@@ -566,7 +566,7 @@ pub(super) fn emittable(name: &str) -> Option<Kind> {
 /// lists of locations and anchors, and the `XDG_*_HOME` family, are
 /// relocating too; [`is_relocating`] is the whole set.
 ///
-/// These are the names this module's review rounds found some tool reading
+/// These are the names some tool has been found reading
 /// as a location — `rg` and `git` were shown to obey two of them — plus the
 /// homes of the tools whose activation output bx caches (mise, starship,
 /// zoxide). The list is knowledge, not a closed name space: a name missing
@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn the_xdg_base_directories_and_the_operator_caches_are_locations() {
         // Not `XDG_CONFIG_HOME` or `XDG_STATE_HOME`: bx finds its own
-        // directories through them (round 6).
+        // directories through them.
         for name in [
             "XDG_DATA_HOME",
             "XDG_CACHE_HOME",
@@ -698,7 +698,7 @@ mod tests {
             assert_eq!(is_relocating(name), locates, "{name}");
         }
         // The whole `XDG_*_HOME` family, listed or not, and every name a
-        // review round found a tool reading as a location.
+        // tool has been found reading as a location.
         for name in [
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
@@ -736,8 +736,8 @@ mod tests {
 
     #[test]
     fn a_name_the_table_does_not_list_is_not_emittable_whatever_its_family() {
-        // Every rule round 4 matched a name by — an exact list, a family
-        // prefix, a location suffix, an exception — is gone. None of these is
+        // No rule matches a name by an exact list, a family prefix, a
+        // location suffix or an exception. None of these is
         // in the table, so each is refused, even given a path inside the root.
         for name in [
             "GNUPGHOME",
@@ -1064,8 +1064,8 @@ mod tests {
 
     #[test]
     fn npm_config_in_any_other_case_is_not_emittable() {
-        // npm reads `npm_config_*` in any case, and round 3 judged every case
-        // for that. The table spells `NPM_CONFIG_CACHE` alone, so every other
+        // npm reads `npm_config_*` in any case, so every case would need
+        // judging. The table spells `NPM_CONFIG_CACHE` alone, so every other
         // spelling is refused whatever it is given — which is stricter than
         // judging it, and needs no knowledge of which tools ignore case.
         for name in [

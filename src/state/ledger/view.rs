@@ -117,7 +117,7 @@ impl LedgerView {
     /// directory can be: a ledger with a stray directory in one entry and a
     /// path spelled absolutely under the home in another is refused as a home
     /// problem, nothing is renamed or dropped, and the stray is reported only
-    /// once the home problem is cleared (r5, C1). That is deliberate, not an
+    /// once the home problem is cleared. That is deliberate, not an
     /// oversight. A `created_dirs` entry spelled absolutely under the home is
     /// itself "not above its target" to the stray test, so running the stray
     /// test first would drop it as damage — quietly losing a directory the
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn a_home_problem_in_one_entry_is_reported_before_a_stray_directory_in_another() {
-        // r5 (C1): the order `check_paths` documents. The home check runs
+        // The order `check_paths` documents. The home check runs
         // before the stray test, so a stray in one entry is not reported while
         // another entry has a home problem — and nothing is renamed or
         // dropped, so the stray is still there for the load after.
@@ -905,9 +905,10 @@ mod tests {
 
     #[test]
     fn a_stored_duplicate_directory_is_not_recorded_again() {
-        // r5 (C2): `merge_created_dirs` promised a deduplicated result, and
-        // deduplicated only the incoming list. A stored duplicate — which bx
-        // never writes — was carried through every re-record.
+        // `merge_created_dirs` promises a deduplicated result, so it
+        // deduplicates the stored list as well as the incoming one. A stored
+        // duplicate — which bx never writes — is not carried through a
+        // re-record.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let file = "~/.config/tool/x.conf";

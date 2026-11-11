@@ -1531,8 +1531,8 @@ mod tests {
 
     #[test]
     fn a_linked_directory_that_cannot_be_examined_is_an_error_naming_the_link() {
-        // r5 (V1): `tighten`'s `metadata` failure that is not a link to
-        // nowhere was never reached. A link into a directory nobody can
+        // Reaches `tighten`'s `metadata` failure that is not a link to
+        // nowhere. A link into a directory nobody can
         // search can itself be examined, and what it names cannot.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.

@@ -637,7 +637,7 @@ fn merge_created_dirs(
         if is_ancestor(dir, target) {
             // The stored list is deduplicated as the incoming one is: bx never
             // writes a duplicate, so one here is tampering, and carrying it
-            // forward would make the result the doc promises false (r5, C2).
+            // forward would make the result the doc promises false.
             if !merged.contains(dir) {
                 merged.push(dir.clone());
             }

@@ -4,7 +4,7 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use crate::state::ledger::fixtures::*;
 use crate::state::{Fingerprint, Fingerprints, Health};
-use crate::testing::guarded_home;
+use crate::testing::{guarded_home, mode_of};
 
 #[test]
 fn recording_a_target_stores_the_digest_mode_mechanism_and_prior_snapshot() {
@@ -54,7 +54,7 @@ fn the_prior_blob_is_durable_before_record_returns() {
     // No `save` has happened. The blob must already be on disk.
     let blob = dir.restore().join(ContentHash::of(b"prior bytes").to_hex());
     assert_eq!(std::fs::read(&blob).expect("read"), b"prior bytes");
-    assert_eq!(mode_of(&blob), Mode::PRIVATE_FILE);
+    assert_eq!(mode_of(&blob), Mode::PRIVATE_FILE.bits());
     assert!(!dir.ledger().exists(), "the ledger itself is not yet saved");
 }
 

@@ -61,7 +61,7 @@
 //! [`StateDir::ensure`] and the lock path compare the state directory's owner
 //! against the *effective* uid, so a `~/.local/state/bx` owned by the ordinary
 //! user is [`Error::ForeignOwner`] to a root process and `sudo bx` stops there.
-//! That is the intended consequence and not an oversight (r4 round 2, CL8): the
+//! That is the intended consequence and not an oversight: the
 //! directory holds verbatim copies of the user's private files, and a root run
 //! writing into a directory an unprivileged account controls is a directory
 //! that account can swap under it. The message says "run bx as the account that

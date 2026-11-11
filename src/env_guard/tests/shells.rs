@@ -307,7 +307,7 @@ impl Shells {
 /// it cannot share a blind spot with them. Every entry shaped like a path —
 /// containing `/`, beginning `~` or `=`, or `.` or `..` — makes the whole
 /// value one the roots must admit, for any name; so does any value of a
-/// name the round-5 review saw a tool read as a location. bx's state
+/// name a real tool was seen to read as a location. bx's state
 /// directory is worked out here from `home` — the sandbox home the shell
 /// actually ran with, which is not always the root set's, since some of
 /// these fragments are judged against [`RootSet::strict`] — and the
@@ -356,7 +356,7 @@ fn escapes(
     // An argument escapes when a path in it — from its first `/`, or
     // from a leading `~`, in a whole word or in a piece of one — lands
     // inside bx's directories, or when it names `HOME`, an `XDG_` name or
-    // one the round-5 review saw a tool read as a location, which a shell
+    // one a real tool was seen to read as a location, which a shell
     // assigns with an `=` or without one (`for HOME in`, `read HOME`).
     // Quotes join words, so they are dropped first.
     let argument_escapes = |text: &str| {
@@ -891,7 +891,7 @@ fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
         ),
         ("npm_config_cache=/etc/evil", rooted.clone()),
         ("ZDOTDIR=/etc/evil", rooted.clone()),
-        // Round 4: names no list held, a state directory the fragment
+        // Names no list held, a state directory the fragment
         // moved, a history file, and a search list with a relative entry.
         ("export RIPGREP_CONFIG_PATH=/etc/evil", rooted.clone()),
         ("export GIT_CONFIG_SYSTEM=/etc/evil", rooted.clone()),
@@ -906,7 +906,7 @@ fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
         ("export HISTFILE=/etc/evil", rooted.clone()),
         ("export PATH=.:/usr/bin", rooted.clone()),
         ("export EDITOR=./nvim", rooted.clone()),
-        // Round 5: a bare word a tool reads as a path, a program given
+        // A bare word a tool reads as a path, a program given
         // arguments, a state directory a later line moves, a URL-shaped
         // relative path, bx's default state directory with no home, and a
         // config repo landing on the state directory.
@@ -957,11 +957,11 @@ fn every_review_falsifier_relocates_in_a_real_shell_and_is_refused() {
             RootSet::strict(),
         ),
         ("export XDG_CONFIG_HOME=~/.local/state", home_rooted.clone()),
-        // r3 round 2: a location that contains bx's state directory.
+        // A location that contains bx's state directory.
         ("export UV_CACHE_DIR=~/.local/state", home_rooted.clone()),
-        // Round 6: a tool pointed into bx's config repo.
+        // A tool pointed into bx's config repo.
         ("export CARGO_HOME=~/.config/bx/cargo", home_rooted.clone()),
-        // Round 6: a location whose entries are inside the root and whose
+        // A location whose entries are inside the root and whose
         // whole value, which cargo reads, is not.
         (
             "export CARGO_HOME=/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y",

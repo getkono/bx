@@ -196,7 +196,7 @@ pub(super) fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome,
                 // only the directories that write invented, which is none. The
                 // replay path drops the same entry `Session::write` drops, so
                 // it has to carry the same claim on, or a crash turns a
-                // hand-off into a loss. See `r3 round 4` decision R3R4-1.
+                // hand-off into a loss.
                 if let (Some(dropped), Some(home)) = (dropped, home) {
                     released.extend(dropped.created_dirs.iter().map(|dir| dir.render(home)));
                 }
@@ -204,11 +204,10 @@ pub(super) fn resolve(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome,
         }
         resolved += 1;
     }
-    // Blocked first, and *before* the hand-off. r3 coverage COV4: the
-    // hand-off used to stand ahead of this return behind a
-    // `conflicts.is_empty()` guard, and deleting that guard changed no
-    // assertion — a blocked run saves no ledger, so the mutation it protected
-    // against was invisible and the arm's correctness rested on the drop.
+    // Blocked first, and *before* the hand-off. A hand-off ahead of this
+    // return would need a `conflicts.is_empty()` guard that no assertion can
+    // see — a blocked run saves no ledger, so deleting the guard would change
+    // nothing observable and its correctness would rest on the drop.
     // Returning first is the same behaviour with the ordering as the
     // guarantee: past this point there are no conflicts, so nothing has to say
     // so a second time.
@@ -759,11 +758,11 @@ mod tests {
 
     #[test]
     fn a_killed_rm_rolls_back_into_the_directory_it_found() {
-        // r3 round 2, P9R4-D2. A removal pruned the directories it claimed
-        // before its session's `End`, so a rollback re-created `~/.vault` at
-        // the default mode after the user had made it `0700`. Pruning now
-        // waits for `End`; a crash between the two leaves the directory,
-        // empty, for `bx doctor`.
+        // A removal that pruned the directories it claimed before its
+        // session's `End` would let a rollback re-create `~/.vault` at the
+        // default mode after the user had made it `0700`. Pruning waits for
+        // `End`; a crash between the two leaves the directory, empty, for
+        // `bx doctor`.
         let guard = guarded_home();
         for (index, phase) in [
             (0, "after-intent"),
@@ -1475,13 +1474,13 @@ mod tests {
 
     #[test]
     fn replaying_a_released_write_hands_on_the_directories_its_entry_claimed() {
-        // r3 round 4, D1 and COV2. `Session::write` was repaired in round 3 to
-        // stop discarding the entry `ledger.forget` returns; `resolve`'s
-        // `Step::Forget` still discarded it, so the same `rm`, crashed between
-        // its `End` frame and its save, lost the claims the live path keeps.
-        // `hand_off_claims` documents the replay as running "the same hand-off
-        // … so a crash between the `End` frame and the save loses no claim",
-        // and nothing reached `Step::Forget` for a released write at all.
+        // `Session::write` keeps the entry `ledger.forget` returns, and
+        // `resolve`'s `Step::Forget` must too: discarding it, the same `rm`,
+        // crashed between its `End` frame and its save, would lose the claims
+        // the live path keeps. `hand_off_claims` documents the replay as
+        // running "the same hand-off … so a crash between the `End` frame and
+        // the save loses no claim", and this is the test that reaches
+        // `Step::Forget` for a released write.
         //
         // A released write's Intent cannot stand in for the entry: it records
         // the directories *that write* invented, which for a write over a file
@@ -1566,7 +1565,7 @@ mod tests {
 
     #[test]
     fn a_blocked_recovery_hands_no_claim_on_and_leaves_the_saved_ledger_alone() {
-        // r3 coverage COV4. One terminated journal holding both a blocked
+        // One terminated journal holding both a blocked
         // intent and a released removal: the removal's claims must not reach
         // the entry beneath them while the run returns `Blocked`, and the
         // saved ledger must be exactly what it was. Once the conflict is
@@ -1786,8 +1785,8 @@ mod tests {
 
     #[test]
     fn a_blocked_write_keeps_its_temporary_file() {
-        // Review round 3, item 2: the temporary file was unlinked before the
-        // decision, so a blocked write lost it on every re-run.
+        // Unlinking the temporary file before the decision would lose it for
+        // a blocked write on every re-run.
         let guard = guarded_home();
         let home = guard.child("crashed");
         plant_crash_fixture(&home);
@@ -1816,11 +1815,10 @@ mod tests {
 
     #[test]
     fn a_crash_inside_finish_is_recorded_and_rm_still_restores_the_originals() {
-        // Review round 3, item 1. Every write has landed when `finish` runs, so
-        // a crash there is bookkeeping, never a rollback. With an earlier apply
-        // behind it, a crash after the ledger save and before the unlink is the
-        // one that used to hand `rm` bx's first output instead of the user's
-        // file.
+        // Every write has landed when `finish` runs, so a crash there is
+        // bookkeeping, never a rollback. With an earlier apply behind it, a
+        // crash after the ledger save and before the unlink is the one that
+        // could hand `rm` bx's first output instead of the user's file.
         let guard = guarded_home();
         for phase in finish_crash_phases() {
             for earlier_apply in [false, true] {
@@ -2059,8 +2057,8 @@ mod tests {
 
     #[test]
     fn a_rollback_removes_nested_created_directories_last_write_first() {
-        // Coverage review round 5, item 1. Deleting the `!` before `complete`
-        // survived: no rollback had two writes whose created directories nest.
+        // Only a rollback with two writes whose created directories nest
+        // fails when the `!` before `complete` is deleted.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         interrupted(
@@ -2095,8 +2093,8 @@ mod tests {
 
     #[test]
     fn a_rollback_under_a_created_directory_replaced_with_a_symlink_completes() {
-        // r3 round 1, D1. Pruning the created directory failed with ENOTDIR
-        // after the unlink, so every writing run failed and the journal stood.
+        // Pruning the created directory fails with ENOTDIR after the unlink;
+        // treated as an error, every writing run would fail and the journal stand.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         interrupted(

@@ -35,7 +35,7 @@ pub(super) fn judge(
                 let whole = (kind == Kind::Location).then_some(value);
                 // Every entry is judged for every other reason before any is
                 // judged for being a root itself, so a root earlier in the
-                // list does not hide a later entry's reason (#47 round 1).
+                // list does not hide a later entry's reason.
                 let reason = value
                     .split(':')
                     .find_map(|entry| refuses_entry_placement(entry, None, roots))
@@ -49,7 +49,7 @@ pub(super) fn judge(
                     // `CARGO_HOME=<root>/x:<root>/y/.local/state` passes, and
                     // the whole value, the path cargo reads, contains bx's
                     // state directory. That reason outranks an entry that is a
-                    // root itself, as it does on one path (#47 round 2).
+                    // root itself, as it does on one path.
                     .or_else(|| whole.and_then(|value| refuses_entry_bx(value, Some(':'), roots)))
                     .or_else(|| {
                         value
@@ -57,7 +57,7 @@ pub(super) fn judge(
                             .find_map(|entry| refuses_entry_at_root(entry, roots))
                     });
                 // There is no whole-value placement check after this, because
-                // one could not refuse anything (#47 round 3). Every entry now
+                // one could not refuse anything. Every entry now
                 // lies strictly beneath a root, so the first entry's parent is
                 // inside one; the whole value extends that parent's components,
                 // so the whole value and its own parent are inside that root
@@ -704,7 +704,7 @@ mod tests {
             ("CARGO_TERM_COLOR", "https://example.invalid"),
             ("LANG", "\"C UTF-8\""),
             ("LANG", "sr_RS@latin"),
-            // Each setting holds only what its tool accepts (round 6): cargo
+            // Each setting holds only what its tool accepts: cargo
             // knows three colour modes, mise a job count, sccache a size with
             // a unit.
             ("CARGO_TERM_COLOR", "bogus"),
@@ -845,7 +845,7 @@ mod tests {
         refused("SSH_AUTH_SOCK", "~/agent", &RootSet::strict(), NoHome);
     }
 
-    // Review round 6 (r3 round 1).
+    // Where a value may point, and what a path may hold.
 
     #[test]
     fn a_fragment_never_moves_bxs_own_directories() {
@@ -988,8 +988,8 @@ mod tests {
             Reason::OutsideDeclaredRoots,
         );
         // The review's climbing case: its entries normalise inside the root
-        // and the whole string outside it. Since r3 round 2 its `..` is refused
-        // before either, whichever kind holds it.
+        // and the whole string outside it. Its `..` is refused before either,
+        // whichever kind holds it.
         let climbing = "/var/mnt/scratch/example/x:/../../../var/mnt/scratch/example/y";
         for name in ["CARGO_HOME", "GOPATH"] {
             refused(name, climbing, &rooted(), Reason::ParentComponent);
@@ -1337,8 +1337,8 @@ mod tests {
     #[test]
     fn the_anchor_exemption_is_closed_to_an_exported_anchor() {
         // The measurement `refuses_anchor`'s doc records as what the exemption
-        // was, asserted in its own test so an earlier assertion cannot hide it
-        // (round-5 note COV3): exported, an anchor is refused for containing
+        // was, asserted in its own test so an earlier assertion cannot hide it:
+        // exported, an anchor is refused for containing
         // bx's state directory exactly as a tool-read location with the
         // identical value is, and only unexported does the exemption stand.
         use Reason::ContainsBxDirectory;
@@ -1522,7 +1522,7 @@ mod tests {
         // inside a root, so the whole value and its own parent are inside that
         // root too. A whole-value `OutsideDeclaredRoots` or `DeclaredRootItself`
         // check would therefore be an equivalent mutant no test could catch
-        // (#47 round 3), and this pins what it would have caught instead: break
+        // and this pins what it would have caught instead: break
         // an entry rule and this fails, where a dead branch would not have.
         let layouts = [
             (vec!["/r"], "/h"),
@@ -1788,8 +1788,8 @@ mod tests {
 
     #[test]
     fn no_character_outside_the_allowlist_passes_any_path_valued_kind() {
-        // The r3 round 3 self-sweep. Every round from 3 to 6 reopened this
-        // class — a character a tool reads its own way — so every path-valued
+        // A self-sweep. Review after review reopened this class — a
+        // character a tool reads its own way — so every path-valued
         // kind is tried against every character class a value can carry. The
         // grammar refuses some before any kind is judged (`Unreadable`); every
         // other one is refused by name. None is approved.

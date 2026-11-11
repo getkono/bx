@@ -1,5 +1,5 @@
-//! The guard as a whole: `check` and the scans, the review rounds'
-//! reproductions, and (in `census`) the sites outside this module that reach
+//! The guard as a whole: `check` and the scans, the reproductions of bypasses
+//! it once approved, and (in `census`) the sites outside this module that reach
 //! it.
 
 use std::path::{Path, PathBuf};
@@ -98,7 +98,7 @@ fn an_empty_value_is_not_absolute() {
 
 #[test]
 fn a_location_given_a_word_is_not_absolute_and_an_unlisted_name_is_not_emittable() {
-    // Round 5 retires `NotAPath`. It existed because a name list was the
+    // There is no `NotAPath`. It would exist only if a name list were the
     // only evidence that a variable held a location; the emit table now
     // says so, and a bare word, a number or a URL given to a location is a
     // path relative to wherever the shell is. The remedy is an absolute
@@ -111,8 +111,8 @@ fn a_location_given_a_word_is_not_absolute_and_an_unlisted_name_is_not_emittable
     ] {
         refused(name, value, &rooted(), Reason::NotAbsolute);
     }
-    // Round 4 judged these by their names' families; the table lists none
-    // of them, so each is refused whatever it is given.
+    // Their names' families say nothing; the table lists none of them, so
+    // each is refused whatever it is given.
     for (name, value) in [
         ("SOMETOOL_CONFIG_DIR", "yes"),
         ("PIP_TARGET", "build"),
@@ -174,7 +174,7 @@ fn bxs_own_state_directory_is_refused_even_inside_a_declared_root() {
         refused("CARGO_HOME", value, &home_rooted, Reason::BxOwnedDirectory);
     }
     // The parent is not bx's either, but it contains bx's state directory,
-    // and a tool that clears it clears bx's record (r3 round 2). A sibling
+    // and a tool that clears it clears bx's record. A sibling
     // whose name merely extends it is fine.
     refused(
         "CARGO_HOME",
@@ -386,7 +386,7 @@ fn a_second_assignment_on_one_line_is_refused_rather_than_half_judged() {
 #[test]
 fn a_valueless_export_is_refused_and_teaches_the_scan_nothing() {
     // `export X` marks an inherited value for export; it does not set `X`.
-    // Round 2 judged it and learned nothing. Round 3 does not read it at
+    // Judging it learns nothing, so the guard does not read it at
     // all — bx has no reason to export a value it did not write — so it is
     // refused, and a later reference is as unknown as after any refused
     // line.
@@ -543,7 +543,7 @@ fn a_name_a_block_assigned_is_unknown_after_it() {
 fn whitespace_in_a_value_is_not_a_second_assignment() {
     // The refusal is for another `NAME=`, not for a space: a quoted path
     // with a space in it, and a trailing comment, both still resolve.
-    // Since r3 round 3 the space is itself refused, by name, as a
+    // The space is itself refused, by name, as a
     // character no path bx writes holds, and never as a second assignment.
     assert_eq!(
         reasons(
@@ -649,7 +649,7 @@ fn an_sccache_directory_is_value_checked() {
 #[test]
 fn the_same_fragment_is_all_violations_with_no_root_declared() {
     // A user who declares no root gets the strict guard, and the strict
-    // guard refuses every location. Round 5 keeps the count at 25: the 23
+    // guard refuses every location. The count is 25: the 23
     // exports and the two helpers `CACHE_DIR` and `DATA_DIR` are all in
     // the emit table, as locations, a list of them, or anchors, each of
     // which needs a root. So every one is `NoRootsDeclared` and none is
@@ -736,7 +736,7 @@ fn scan_ignores_comments() {
 
 #[test]
 fn scan_refuses_a_line_that_is_not_a_statement_it_reads() {
-    // Round 2 let a command through as assigning nothing. Round 3 does not
+    // A command is not let through as assigning nothing. The guard does not
     // decide what a command assigns: a line that is not blank, a comment or
     // an assignment in the grammar is refused.
     assert_eq!(
@@ -753,15 +753,15 @@ fn scan_refuses_a_line_that_is_not_a_statement_it_reads() {
     );
 }
 
-// Review round 2: the guard fails closed on shell it cannot read, reads
+// The guard fails closed on shell it cannot read, reads
 // a value quote-aware, and gives one verdict whichever entry point asks.
 
 #[test]
 fn a_keyword_other_than_export_is_refused_whatever_it_assigns() {
-    // Each of these sets `CARGO_HOME=/etc/evil` in bash or zsh. Round 2
-    // read the keyword and judged the operand; round 3 reads no keyword but
-    // `export`, so each is refused before its operand is looked at — and
-    // so would be the next spelling of a keyword round 2 did not know.
+    // Each of these sets `CARGO_HOME=/etc/evil` in bash or zsh. Reading the
+    // keyword and judging the operand misses any keyword it does not know;
+    // the guard reads no keyword but `export`, so each is refused before its
+    // operand is looked at — and so would be the next spelling of a keyword.
     for line in [
         "declare -gx CARGO_HOME=/etc/evil",
         "typeset -gx CARGO_HOME=/etc/evil",
@@ -866,10 +866,9 @@ fn a_prefix_does_not_carry_a_value_past_bxs_own_directory() {
 #[test]
 fn a_value_or_a_line_the_guard_does_not_read_is_refused_whatever_the_name() {
     // A command substitution, an escape, a brace expansion, an array and
-    // mixed quoting are shell the guard does not run. Round 2 refused them
-    // for a relocating variable only; round 3 refuses them for every one,
-    // because a line the grammar does not read may do anything whatever
-    // its first name is.
+    // mixed quoting are shell the guard does not run. They are refused for
+    // every variable, not only a relocating one, because a line the grammar
+    // does not read may do anything whatever its first name is.
     for name in ["CARGO_HOME", "EDITOR"] {
         for value in [
             "$(pwd)/cargo",
@@ -883,7 +882,7 @@ fn a_value_or_a_line_the_guard_does_not_read_is_refused_whatever_the_name() {
             refused(name, value, &rooted(), Reason::Unreadable);
         }
     }
-    // Ordinary rc content that round 2 let through as assigning nothing.
+    // Ordinary rc content that reads as assigning nothing, refused anyway.
     for line in [
         "export GPG_TTY=$(tty)",
         "export GIT_TOP=\"$(git rev-parse --show-toplevel)\"",
@@ -933,7 +932,7 @@ fn a_quoted_tilde_is_a_literal_tilde() {
 fn a_single_assignment_with_an_equals_sign_in_its_value_is_not_two() {
     // Each assigns one variable. The `=` is inside the value, so the old
     // remedy — split the line — was impossible to follow.
-    // Since r3 round 3 a space in a location is refused by name; what is
+    // A space in a location is refused by name; what is
     // pinned is that none of these is read as two assignments.
     for (line, expected) in [
         (
@@ -1047,8 +1046,8 @@ fn behaviour_variables_in_a_location_family_are_allowed() {
             "{name}"
         );
     }
-    // Round 4 allowed the rest of the family as settings. The table does
-    // not list them, so round 5 refuses them, with or without a root.
+    // The rest of the family are not settings bx knows. The table does
+    // not list them, so they are refused, with or without a root.
     for (name, value) in [
         ("NPM_CONFIG_REGISTRY", "https://registry.example.invalid"),
         ("NPM_CONFIG_FUND", "false"),
@@ -1109,9 +1108,9 @@ fn scan_reports_every_violation() {
     assert_eq!(found[1].line, 3);
 }
 
-// Review rounds 3 and 4: each reproduction, written against the API of the
-// round before it and labelled with its round and item. The guard approves
-// none of them, under any root set its row names.
+// Bypass reproductions: each row is a way of relocating a tool that an earlier
+// version of the guard approved, and its label names the construct. The guard
+// approves none of them, under any root set its row names.
 
 /// The root sets a reproduction is scanned under, each built afresh.
 type Sets = &'static [fn() -> RootSet];
@@ -1233,7 +1232,7 @@ fn no_round_3_or_4_reproduction_is_approved() {
         let content = format!("export {name}=/etc/evil");
         judge("r4.3 a relocation no list held", &content, BOTH);
     }
-    // r3.6: relocating names the round-3 lists missed, judged by `check`.
+    // Relocating names an earlier name list missed, judged by `check`.
     for name in [
         "HOME",
         "npm_config_cache",
@@ -1251,7 +1250,7 @@ fn no_round_3_or_4_reproduction_is_approved() {
     assert_eq!(approved, Vec::<String>::new());
 }
 
-// Review round 5: a fragment may set only a variable bx knows how to judge.
+// A fragment may set only a variable bx knows how to judge.
 
 #[test]
 fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
@@ -1301,8 +1300,8 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
     // directories is the user's command line to write: the maintainer's
     // ruling on #112 judges arguments only for bx's directories.
     assert_eq!(check("PAGER", lesskey, &rooted()), Verdict::Allowed);
-    // 3: a state directory a later line moves. Since round 6 the move is
-    // what is refused.
+    // 3: a state directory a later line moves. The move is what is
+    // refused.
     assert_eq!(
         reasons(
             "export CARGO_HOME=/var/mnt/scratch/example/state/bx\n\
@@ -1356,7 +1355,7 @@ fn every_round_5_falsifier_is_refused_for_the_reason_that_names_its_defect() {
             vec![(1, ReservedName)]
         );
     }
-    // 7: a config repo landing on the state directory. Since round 6 no
+    // 7: a config repo landing on the state directory. No
     // fragment may move the config repo at all.
     assert_eq!(
         reasons("export XDG_CONFIG_HOME=~/.local/state", &home_rooted),
@@ -1378,7 +1377,7 @@ fn is_shell_name(word: &str) -> bool {
 /// are found by walking the `=`s. The rest hold no `=` at all and name
 /// their target as a word after a keyword: the control variable of a `for`
 /// or a `select`, an operand of `read` or `getopts`, the target of
-/// `printf -v`. The `=` sweep alone is what round-2 note COV1 was about —
+/// `printf -v`. The `=` sweep alone is not enough —
 /// it cannot see a single one of the second group, so a `read -r
 /// CARGO_HOME` in the snippet went unnoticed.
 ///
@@ -1388,7 +1387,7 @@ fn is_shell_name(word: &str) -> bool {
 /// only make the caller stricter. Taking only the first non-flag operand
 /// under-reported instead, against this very sentence — `read -p "Enter: "
 /// N`, `read -d '' N`, `read -rn 1 N` and `read -r A N` each hid `N`
-/// behind a flag's own operand or a second target (round-3 note D2).
+/// behind a flag's own operand or a second target.
 /// Comments are dropped first, so prose ending in the word `for` is not an
 /// assignment.
 ///
@@ -1509,7 +1508,7 @@ fn the_assignment_sweep_sees_every_form_the_module_knows_assigns() {
             "the sweep does not see {content:?} assign CARGO_HOME"
         );
     }
-    // The exact shapes round-3 note D2 measured returning nothing, where
+    // The exact shapes once measured returning nothing, where
     // a flag's own operand or a second target sat between the command and
     // the name. `read -d ''` is here and not in the table above because
     // the table's `{V}` substitution cannot express an empty delimiter.
@@ -1627,7 +1626,7 @@ fn the_init_snippet_is_not_an_environment_fragment() {
     // outside the grammar, which is no evidence at all that the line sets
     // nothing. Every name the snippet gives a value to is found instead —
     // through an `=` or through any of the assigning forms that hold no
-    // `=`, which is what round-2 note COV1 found this missing — and each
+    // `=`, which an `=` sweep alone misses — and each
     // must be one of bx's own `BX_` names, which no tool reads, or an
     // array the completion function declares `local`, which never leaves
     // that function.
@@ -1850,12 +1849,12 @@ fn the_operator_fragment_and_a_data_home_beneath_its_root_scan_clean_in_all_thre
     assert!(found.iter().all(|v| v.reason == Reason::NoRootsDeclared));
 }
 
-// Review round 4: a value is judged whatever it is assigned to.
+// A value is judged whatever it is assigned to.
 
 #[test]
 fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape() {
     use Reason::{NotAbsolute, NotEmittable};
-    // Round 4 judged these by value: allowed inside a root. Round 5 does
+    // Judged by value, these would be allowed inside a root. The guard does
     // not know what they hold, so it refuses each whatever it is given.
     for name in R4_UNLISTED_RELOCATIONS {
         for value in ["/etc/evil", "/var/mnt/scratch/example/x", "1"] {
@@ -1865,17 +1864,17 @@ fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape(
         }
     }
     // A location is refused anything that is not an absolute path inside
-    // a root — a bare word, a number, and every URL included (round 5).
+    // a root — a bare word, a number, and every URL included.
     for (value, reason) in [
         (".", NotAbsolute),
         ("..", NotAbsolute),
         ("build/cache", NotAbsolute),
         ("a:.", NotAbsolute),
-        // The home contains bx's directories (r3 round 2).
+        // The home contains bx's directories.
         ("~", Reason::ContainsBxDirectory),
         ("\"~x\"", NotAbsolute),
         // Its first entry is the root itself, refused before `a` (#45).
-        // Since #47 round 1, `a` is judged for every other reason before
+        // `a` is judged for every other reason before
         // any entry is judged for being a root, so `a` names the fix.
         ("/var/mnt/scratch/example:a", NotAbsolute),
         ("/var/mnt/scratch/example/x:a", NotAbsolute),
@@ -1893,7 +1892,7 @@ fn a_name_no_table_holds_is_refused_and_a_location_is_judged_whatever_its_shape(
     ] {
         refused("CARGO_HOME", value, &rooted(), reason);
     }
-    // Of the round-4 brief's settings, the ones the table lists still pass
+    // Of these ordinary settings, the ones the table lists pass
     // with no root declared; the others are not emittable.
     for (name, value) in [("UV_NO_CACHE", "1"), ("MISE_JOBS", "8"), ("EDITOR", "nvim")] {
         assert_eq!(

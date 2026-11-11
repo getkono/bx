@@ -87,7 +87,7 @@ pub(super) fn unexported(name: &str, value: &str, roots: &RootSet) -> Option<Rea
         .map(|violation| violation.reason)
 }
 
-/// Names the round-3 lists did not hold, each of which moves a tool's
+/// Names an earlier table did not hold, each of which moves a tool's
 /// config, data or cache — `rg` and `git` were shown to obey two of them.
 pub(super) const R4_UNLISTED_RELOCATIONS: &[&str] = &[
     "CARGO_TARGET_DIR",
@@ -127,7 +127,7 @@ pub(super) const R4_UNLISTED_RELOCATIONS: &[&str] = &[
     "LD_LIBRARY_PATH",
 ];
 
-/// Names the round-5 review ran a real tool against, and saw the tool
+/// Names a real tool was run against, and seen to
 /// read a bare word as a path relative to the current directory: `git`
 /// followed `GIT_DIR=evil` to `./evil`, `rg` read `./rc`, `cargo` built
 /// into `./target2`, a child `bash` sourced `./rc`.
@@ -162,9 +162,9 @@ pub(super) const R5_READ_AS_LOCATIONS: &[(&str, &str)] = &[
 /// is refused by not being `NAME=VALUE`, not by appearing below. This
 /// table is a regression net over the forms review has actually produced,
 /// and the thing it is worth being complete about is that every form in it
-/// stays refused. `mapfile`, `readarray` and `coproc` were added in round
-/// 3, which is what this paragraph exists to stop being read as a gap in a
-/// proof.
+/// stays refused. `mapfile`, `readarray` and `coproc` were added after the
+/// rest, which is what this paragraph exists to stop being read as a gap in
+/// a proof.
 pub(super) const ASSIGNING_FORMS: &[&str] = &[
     // A keyword quoted, escaped or aliased.
     "\\export {N}={V}",

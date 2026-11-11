@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_malformed_layer_is_a_config_error_not_a_missing_repo() {
-        // P42R1-COV3. Only a missing repo becomes `RepoMissing`; everything
+        // Only a missing repo becomes `RepoMissing`; everything
         // else the configuration refuses stays the configuration's error.
         let home = guarded_home();
         seed(home.path(), "[[target]\npath = \n");
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn a_repo_the_environment_moved_is_the_repo_a_generated_fragment_may_not_name() {
-        // The env guard's r3 round gave `RootSet` the config repo, derived
+        // The env guard's `RootSet` holds the config repo, derived
         // from the home unless a caller that read `XDG_CONFIG_HOME` names it.
         // The whole home is a declared root, so only the repo refuses it.
         let home = guarded_home();

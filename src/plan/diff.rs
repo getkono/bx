@@ -972,8 +972,8 @@ mod tests {
 
     #[test]
     fn decision_19_a_line_ending_change_on_an_owned_file_is_shown() {
-        // P42R1-D3. Lines were split with `str::lines`, which drops a `\r`
-        // before the `\n`, so a CRLF-only change showed identical lines.
+        // Splitting lines with `str::lines` would drop a `\r` before the
+        // `\n`, so a CRLF-only change would show identical lines.
         let home = crate::testing::guarded_home();
         crate::plan::tests::own(
             home.path(),

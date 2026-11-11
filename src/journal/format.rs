@@ -91,7 +91,8 @@ pub struct Begin {
     /// fails makes the whole journal unreadable — so a session that wrote an
     /// unportable scope entry could never be rolled back.
     /// [`Session::open_locked`](super::Session::open_locked) therefore refuses the same entries the loader
-    /// refuses, before the journal exists: see `r3 round 3` decision R3R3-1.
+    /// refuses, before the journal exists, so no journal is ever written that
+    /// its own loader would refuse.
     pub scope: Vec<Portable>,
 }
 
@@ -214,12 +215,17 @@ pub(super) enum Damage {
     /// length that was damaged.
     Torn,
     /// The frame is all there, and it is not what bx wrote: its checksum or its
-    /// decoding fails, or its length is past the bound.
+    /// decoding fails, or its length is zero or past the bound.
     Invalid,
 }
 
 /// Decode the frame at `at`: a little-endian `u32` length, a [`CHECK`]-byte
 /// checksum under the session's `nonce`, and a MessagePack body of that length.
+///
+/// A zero length is [`Damage::Invalid`] before any checksum is taken: no
+/// record encodes to an empty body, and a zero-filled tail carries a zero
+/// length at every offset, so refusing it first keeps a scan of such a tail
+/// from hashing once per byte.
 pub(super) fn frame(
     bytes: &[u8],
     at: usize,
@@ -395,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_zero_length_frame_is_refused_before_its_checksum_is_taken() {
-        // r3 round 3, D3. A zero length passes the `MAX_FRAME` bound, and an
+        // A zero length passes the `MAX_FRAME` bound, and an
         // empty body is always inside the file, so without the `len == 0`
         // refusal `frame` reaches `checksum` at every offset of a zero-filled
         // tail: one SHA-256 per byte, on the lock-free path every read-only
@@ -458,8 +464,9 @@ mod tests {
 
     #[test]
     fn a_frame_copied_from_another_sessions_journal_does_not_validate() {
-        // Review round 5, item 3. Two sessions with the same header wrote
-        // byte-identical frames, so a frame from one validated in the other.
+        // The checksum is keyed by the session nonce. Without it, two sessions
+        // with the same header would write byte-identical frames, so a frame
+        // from one would validate in the other.
         let dir = tempfile::tempdir().expect("a tempdir");
         let (one, two) = (dir.path().join("one.mpk"), dir.path().join("two.mpk"));
         let done = Record::Done(Done {
@@ -490,7 +497,7 @@ mod tests {
 
     #[test]
     fn a_frame_length_is_bounded_at_max_frame_inclusive() {
-        // Coverage review round 5, item 5.
+        // Pins the boundary itself: `MAX_FRAME` is a length, one past it is not.
         let nonce = [7; NONCE];
         let prefix = |len: usize| {
             let mut bytes = u32::try_from(len).expect("fits").to_le_bytes().to_vec();
@@ -512,7 +519,8 @@ mod tests {
 
     #[test]
     fn the_search_for_a_whole_frame_after_damage_starts_past_the_damaged_frame() {
-        // Coverage review round 5, item 6.
+        // Pins where the search starts: a frame at the damaged offset is not
+        // one after it.
         let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         journal

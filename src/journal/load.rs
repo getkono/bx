@@ -606,8 +606,8 @@ mod tests {
 
     #[test]
     fn a_journal_from_a_future_format_is_refused_and_never_moved_aside() {
-        // Review round 5, item 2. It read as `Unreadable`, and the lock holder
-        // set it aside with nothing rolled back.
+        // Read as `Unreadable`, it would be set aside by the lock holder with
+        // nothing rolled back.
         let dir = tempfile::tempdir().expect("a tempdir");
         let state = StateDir::new(dir.path().to_path_buf());
         let lock = ExclusiveLock::acquire(&state).expect("lock");
@@ -670,10 +670,10 @@ mod tests {
 
     #[test]
     fn nul_bytes_after_a_whole_frame_are_a_torn_tail() {
-        // Review round 4, item 1. A filesystem that zero-fills an unsynced tail
-        // after a power loss leaves them. Round 3 read that as damage and set
-        // the journal aside with nothing rolled back; with no whole frame after
-        // them they are the tail, and the whole frames before are kept.
+        // A filesystem that zero-fills an unsynced tail after a power loss
+        // leaves them. Read as damage, they would set the journal aside with
+        // nothing rolled back; with no whole frame after them they are the
+        // tail, and the whole frames before are kept.
         let dir = tempfile::tempdir().expect("a tempdir");
         let state = StateDir::new(dir.path().to_path_buf());
         let lock = ExclusiveLock::acquire(&state).expect("lock");
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn a_damaged_frame_is_a_torn_tail_only_when_no_whole_frame_follows_it() {
-        // Review round 4, item 1. Only the last frame can be unsynced, so a
+        // Only the last frame can be unsynced, so a
         // damaged last frame is what a power loss leaves, and a damaged frame
         // with a whole one after it is what no crash leaves.
         let (_dir, path) = journal_file();
@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn a_journal_with_a_second_session_header_is_unreadable() {
-        // r3 coverage C5.
+        // A journal holds one session, so a second header is damage.
         let (_dir, path) = journal_file();
         let begin = Record::Begin(some_begin());
         raw_journal(&path, &[begin.clone(), begin]);
@@ -1003,10 +1003,10 @@ mod tests {
 
     #[test]
     fn an_unreadable_journal_is_never_set_aside_over_an_earlier_one() {
-        // Review round 3, item 5. The set-aside name was fixed, and opening a
-        // session renamed the unreadable journal over the earlier one. Round 3
-        // refused the session instead; since #7's numbered names integrated,
-        // the journal takes the next free name and the session opens.
+        // A fixed set-aside name would let opening a session rename the
+        // unreadable journal over the earlier one. Set-aside names are
+        // numbered, so the journal takes the next free name and the session
+        // opens.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         state.ensure().expect("ensure");
@@ -1135,10 +1135,10 @@ mod tests {
 
     #[test]
     fn an_unreadable_journal_that_cannot_be_set_aside_is_refused_and_never_replaced() {
-        // r3, routed from #7's repair planning. `load_exclusive` reported a
-        // journal it could not move aside as `Unreadable { moved_to: None }`,
-        // which is not an interruption, so `Session::open` created its own
-        // journal over it by rename and the bytes were gone.
+        // Reporting a journal `load_exclusive` could not move aside as
+        // `Unreadable { moved_to: None }`, which is not an interruption, would
+        // let `Session::open` create its own journal over it by rename, and the
+        // bytes would be gone.
         let home = guarded_home();
         // Every set-aside name is longer than the kernel accepts, so the move
         // fails with no permission bit involved, and a session could write.
@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn a_whole_record_after_the_end_of_a_session_is_unreadable_and_nothing_rolls_back() {
-        // Coverage review round 5, item 2. Believed, the trailing Intent made
+        // Believed, the trailing Intent would make
         // this an unterminated session, and both files would be unlinked.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1225,7 +1225,8 @@ mod tests {
 
     #[test]
     fn bytes_after_the_end_of_a_session_are_unreadable_not_terminated() {
-        // Coverage review round 5, item 3.
+        // A session ends at its `End`; bytes after it make the journal
+        // unreadable, never a terminated session.
         let (_dir, path) = journal_file();
         let mut journal = Journal::create(&path, some_begin()).expect("create");
         journal
@@ -1251,7 +1252,7 @@ mod tests {
 
     #[test]
     fn a_journal_path_that_cannot_be_looked_at_is_an_error_not_an_absent_journal() {
-        // r3 round 2, restricted mutants on P42R1-D5. The look before the read
+        // The look before the read
         // treats only NotFound as "no journal": any other failure — here
         // ENOTDIR, a state directory that is a file, which no permission
         // setting can bypass — is an error, as the read's was before it.
@@ -1273,7 +1274,7 @@ mod tests {
 
     #[test]
     fn a_journal_that_cannot_be_read_is_an_error_and_a_session_does_not_replace_it() {
-        // Coverage review round 5, item 4. Read as absent, it would be replaced
+        // Read as absent, it would be replaced
         // by the next session's journal without ever being examined.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1369,10 +1370,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_journal_that_is_not_a_regular_file_is_refused_without_being_read() {
-        // P42R1-D5 (journal part). The journal was read whole with a blocking
-        // read and no look at its type, so a FIFO at `journal.mpk` blocked
-        // load, Session::open and recovery forever, and a link to /dev/zero
-        // read without end.
+        // Read whole with a blocking read and no look at its type, a FIFO at
+        // `journal.mpk` would block load, Session::open and recovery forever,
+        // and a link to /dev/zero would read without end.
         fn fifo(path: &Path) {
             crate::testing::mkfifo(path);
         }

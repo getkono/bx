@@ -78,12 +78,11 @@ fn esc_and_ctrl_c_at_the_confirmation_are_a_cancel_and_every_other_failure_is_an
 
 #[test]
 fn every_prompt_without_a_terminal_is_a_prompt_error_and_never_an_answer() {
-    // P42R1 "Untested line: the `inquire` confirmation call". `cargo
-    // mutants` reported `confirm -> Ok(true)` and `-> Ok(false)` as missed.
-    // The earlier round recorded it as needing a pseudo-terminal and a
-    // dependency this pull request does not add, and left it. It does not:
-    // the question is what `confirm` does when there is NO terminal, and
-    // that is reachable by giving it one that certainly is not.
+    // Pins the `inquire` confirmation call, which `cargo mutants` would
+    // otherwise replace with `Ok(true)` or `Ok(false)` unnoticed. It needs
+    // no pseudo-terminal: the question is what `confirm` does when there is
+    // NO terminal, and that is reachable by giving it one that certainly is
+    // not.
     //
     // Run in a child rather than here, because `inquire` reads the
     // process's stdin and a test must not depend on how `cargo test` was

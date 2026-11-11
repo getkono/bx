@@ -392,8 +392,8 @@ fn parent_state(dir: &Path) -> Result<ParentState, Error> {
     // Both guards below are pinned in both directions at the granularity
     // `cargo mutants` works at: forcing the `NotFound` comparison either way
     // fails a test, and replacing `unresolvable_path`'s body with `true` or
-    // with `false` fails a test too — re-measured at r4 round 2, correcting an
-    // r4 round 1 note that called the second one equivalent.
+    // with `false` fails a test too — measured, so neither is an equivalent
+    // mutant.
     //
     // What is not distinguished is the *first* `unresolvable_path` call site
     // alone, forced true. `cargo mutants` does not generate a per-call-site

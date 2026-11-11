@@ -1536,7 +1536,7 @@ fn a_directory_that_cannot_be_opened_for_its_fsync_fails_before_the_rename() {
 
 #[test]
 fn a_directory_that_opens_but_refuses_the_temporary_file_fails_the_write_naming_it() {
-    // Integration of #7 @b70d40e (r3), porting ec3a544. In this writer
+    // In this writer
     // `stage` creates the temporary file, and only `Filled::publish`, later,
     // opens the directory to sync the rename. So the temporary file's own
     // creation failing is the first thing a directory without write

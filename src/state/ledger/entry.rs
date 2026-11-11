@@ -729,7 +729,7 @@ mod tests {
 
     #[test]
     fn a_ledger_that_never_superseded_an_absent_prior_saves_as_it_did_before_the_field() {
-        // Review round 5 added `superseded_absent`. It is written only when
+        // `superseded_absent` came after the format. It is written only when
         // true, so every other ledger keeps its bytes (Invariant 3), and a
         // build that predates the field reads one where it is set.
         #[derive(Serialize, Deserialize)]
@@ -806,11 +806,11 @@ mod tests {
 
     #[test]
     fn a_created_directory_that_is_not_an_ancestor_of_the_target_is_refused() {
-        // r4 round 1 (CL8): the stored list is ordered by depth, and depth
+        // The stored list is ordered by depth, and depth
         // alone orders it only because every entry is an ancestor of one path.
         // A directory that is not would be sorted among them by a number that
         // says nothing about it, and `bx rm` would try to remove it in that
-        // order. The contract was documented and checked nowhere.
+        // order. This test is where that contract is checked.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;

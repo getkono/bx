@@ -1281,7 +1281,7 @@ mod tests {
 
     #[test]
     fn an_absent_target_bx_attached_to_another_way_is_a_conflict_not_a_create() {
-        // P42R1-COV2. The ledger still names the file as one bx attached to as
+        // The ledger still names the file as one bx attached to as
         // a region or an include line, and the file is gone. Creating it whole
         // would make bx the owner of a file it never owned whole.
         for (mechanism, words) in [

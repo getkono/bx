@@ -67,7 +67,7 @@ pub struct Session {
     /// Called with the directory [`Session::write`] just made for the home,
     /// before [`crate::fs::stage`] looks, so a test can produce the one
     /// trigger the claim filter has left: that directory going away in
-    /// between. See `r3 round 7` decision R3R7-2.
+    /// between, which no test could otherwise reach.
     #[cfg(test)]
     before_stage: Option<fn(&Path)>,
     /// Called with the destination after a write's Intent is durable and
@@ -575,9 +575,8 @@ impl Session {
         // must already have passed to announce a write — and its
         // `refuse_wider_than_declared`, which no target in this tree can
         // trigger because nothing declares a directory. If either ever refuses
-        // where this does not, the cost is the directory this used to make
-        // unconditionally: the behaviour before `r3 round 7`, not worse.
-        // See decision R3R7-1.
+        // where this does not, the cost is one home directory made for a
+        // write that is then refused — no worse than making it unconditionally.
         refuse_unplanned(&dest, planned)?;
         // The home, and anything above it, that this destination needs and
         // that is not there. `fs::stage` would invent them like any other
@@ -596,7 +595,7 @@ impl Session {
         // state directory's own ancestors get: `mkdir(0o777)` masked by the
         // `umask`, and no `chmod`. Made before `stage`, so the directory never
         // exists at `0755` for an instant — a window a descriptor opened
-        // inside would outlive. See `r3 round 6` decision R3R6-1.
+        // inside would outlive.
         self.make_shared_ancestors(&dest)?;
         // Every refusal `stage` would make, made now, so a write that could
         // not begin is refused with nothing announced. The observation is the
@@ -626,22 +625,19 @@ impl Session {
         // would both make the journal unreadable and put the home itself in
         // reach of a rollback's `prune_dirs` and a later `rm`'s
         // `prune_claims`. Unclaimed, it is left standing — the orphan
-        // decision 11 already keeps. See `r3 round 5` decision R3R5-1.
+        // decision 11 already keeps.
         //
-        // Since `r3 round 6` the `create_dir_all` above makes those same
+        // The `create_dir_all` above makes those same
         // directories before `stage` runs, so `stage` no longer finds them
         // missing and this loop drops nothing in the ordinary sequence. Its one
-        // live trigger is the race that fix created: the directory going away
+        // live trigger is the race that call opens: the directory going away
         // between the two calls, which `before_stage` produces on purpose and
         // `a_claim_that_appears_after_the_directory_is_lost_is_still_dropped`
         // pins.
         //
         // It is kept because that trigger is a branch that can be taken, not a
-        // branch that cannot. `r3 round 6` claimed instead that this is "the
-        // only place the property is checked rather than argued"; that was a
-        // true statement about the code and a false one about the tests, which
-        // constrained it nowhere until the seam above existed (`r3 round 7`,
-        // CL1). `missing_parents` leaves the same directories out of what is
+        // branch that cannot, and only the `before_stage` seam lets a test
+        // constrain it. `missing_parents` leaves the same directories out of what is
         // read beforehand, and `claimable` drops them from what `stage` made.
         let created_dirs = missing_parents(&dest, &self.home, &self.created);
         // Assembled now, while the writer still holds the prior, and handed to
@@ -828,7 +824,7 @@ impl Session {
             // handed to a surviving entry beneath them when the session
             // finishes — exactly as `Session::forget` and `Session::remove`
             // hand theirs on. Dropped here instead, no entry would claim them
-            // and no later `rm` could remove them: see `r3 round 3` decision 2.
+            // and no later `rm` could remove them.
             // `self.forgotten`, not `self.released`, because this write
             // announced no removal and so prunes nothing.
             None => {
@@ -1368,8 +1364,7 @@ fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
     // directory that exists and that this process may not examine, and
     // treating it as missing would try to create it and report the failure as
     // a write — where [`crate::fs::observe`], which has already looked at the
-    // destination through the same chain, reports it as a read (`r3 round 7`,
-    // D2).
+    // destination through the same chain, reports it as a read.
     let missing = |dir: &Path| {
         std::fs::symlink_metadata(dir)
             .err()
@@ -1394,7 +1389,7 @@ fn shared_ancestor(dest: &Path, home: &Path) -> Option<PathBuf> {
 /// absolute, normalised UTF-8 path, which
 /// [`Portable::from_path`] always converts. Kept rather than unwrapped — a panic in a writer's durability
 /// path is worse than a returned error nothing produces — and named here so it
-/// reads as a gap on purpose (`r3 round 6`, COV3), like `plan_restore`'s own
+/// reads as a gap on purpose rather than a missed test, like `plan_restore`'s own
 /// unreachable `Err` arm.
 fn portable_dirs(dirs: &[PathBuf], home: &Path) -> Result<Vec<Portable>, Error> {
     dirs.iter()

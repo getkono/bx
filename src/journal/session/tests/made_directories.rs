@@ -121,14 +121,14 @@ fn a_link_refused_for_an_unannounced_directory_removes_what_it_made() {
 
 #[test]
 fn a_claim_that_appears_after_the_directory_is_lost_is_still_dropped() {
-    // r3 round 7, CL1/COV1. The `r3 round 6` fix makes the home before
-    // `fs::stage` looks, so `stage` stops inventing it and the claim
-    // filter stops firing — and nothing constrained the filter at all:
-    // mutating it left the suite green at 1064 passed, and the "pair"
-    // witness only showed that deleting the fix *and* the filter together
-    // fails, which deleting the fix alone already does.
+    // `Session::write` makes the home before `fs::stage` looks, so `stage`
+    // stops inventing it and the claim filter stops firing in the ordinary
+    // sequence — which leaves no other test constraining the filter: a
+    // mutant of it passes everything else, and deleting the home-making
+    // call *and* the filter together fails only as deleting the call alone
+    // already does.
     //
-    // The filter's one live trigger is the race the fix created: the
+    // The filter's one live trigger is the race that call opens: the
     // directory going away between the two calls. `before_stage` produces
     // it, so the branch a race would take is taken here on purpose.
     let guard = guarded_home();
@@ -183,11 +183,11 @@ fn a_claim_that_appears_after_the_directory_is_lost_is_still_dropped() {
 
 #[test]
 fn a_refused_write_makes_no_directory_at_all() {
-    // r3 round 7, D1/COV3. The `create_dir_all` sat ahead of `fs::stage`'s
-    // plan-verdict refusals, whose own comment is "before creating
-    // anything, so a refusal leaves nothing behind" — so a write refused
-    // because the destination changed since plan left the user's home
-    // created. Nothing pinned what a refused write leaves on disk.
+    // `fs::stage`'s plan-verdict refusals come "before creating anything,
+    // so a refusal leaves nothing behind". A `create_dir_all` ahead of them
+    // would leave the user's home created by a write refused because the
+    // destination changed since plan. This pins what a refused write
+    // leaves on disk.
     let guard = guarded_home();
     let home = guard.child("account/home");
     let state = StateDir::resolve_in(&home, Some(guard.child("elsewhere").as_os_str()));
@@ -230,7 +230,7 @@ fn a_refused_write_makes_no_directory_at_all() {
 
 #[test]
 fn a_shared_directory_that_cannot_be_made_is_the_write_that_names_it() {
-    // r3 round 7, COV2. `create_dir_all`'s error mapping had no test.
+    // `create_dir_all`'s error mapping, which nothing else reaches.
     let guard = guarded_home();
     let under = guard.child("locked");
     std::fs::create_dir(&under).expect("mkdir");
@@ -272,11 +272,11 @@ fn a_shared_directory_that_cannot_be_made_is_the_write_that_names_it() {
 
 #[test]
 fn a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write() {
-    // r3 round 7, D2. `shared_ancestor` read "cannot look" as "not there",
-    // so an `EACCES` on the way up became a failed `create_dir_all` and
-    // surfaced as `Error::Write` — where looking at the destination
-    // surfaces the same permission as `Error::Read`. Since the verdict now
-    // comes first, `fs::observe` walks that chain before anything is made,
+    // Were `shared_ancestor` to read "cannot look" as "not there", an
+    // `EACCES` on the way up would become a failed `create_dir_all` and
+    // surface as `Error::Write` — where looking at the destination
+    // surfaces the same permission as `Error::Read`. The verdict comes
+    // first, so `fs::observe` walks that chain before anything is made,
     // so the read error is what a caller sees; the refined predicate keeps
     // that true if the order ever moves.
     let guard = guarded_home();
@@ -325,16 +325,14 @@ fn a_destination_behind_a_directory_bx_cannot_search_is_a_read_not_a_write() {
 
 #[test]
 fn a_write_makes_the_home_it_needs_and_claims_none_of_it() {
-    // r3 round 4 D2, repaired again in r3 round 5 (D1, COV3, CL4).
-    //
     // `admit` sees `&[]` for a `Content::Bytes` request — a write's claims
     // do not exist until `fs::stage` has made the parents — so an Intent's
-    // `created_dirs` never went through the `stray_created_dir` rule the
-    // loader applies to it. At 8e0abc3 the write landed and left an
-    // `Unreadable` journal. Round 4 refused it instead, which turned
-    // silent corruption into a permanent refusal naming the user's own
-    // home: the in-home case below is a *first write to `~/.bashrc`*, and
-    // there is nothing the user could do about it.
+    // `created_dirs` does not go through the `stray_created_dir` rule the
+    // loader applies to it. Letting such a write land leaves an
+    // `Unreadable` journal. Refusing it instead turns silent corruption
+    // into a permanent refusal naming the user's own home: the in-home
+    // case below is a *first write to `~/.bashrc`*, and there is nothing
+    // the user could do about it.
     //
     // Neither is right. The directory is made — it has to be, to reach the
     // destination — and claimed by nobody: not by the Intent, so the

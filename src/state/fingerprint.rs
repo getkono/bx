@@ -89,10 +89,10 @@ impl<'de> Deserialize<'de> for Fingerprint {
 /// Accepts any run of bytes: a fingerprint's length is its writer's business.
 ///
 /// No `visit_byte_buf` override. rmp-serde hands this visitor a borrowed slice
-/// whether it decodes from a slice or from a stream, so the override was
+/// whether it decodes from a slice or from a stream, so an override would be
 /// reachable through no decode path in the crate and pinnable by no test: a
-/// mutant returning an empty fingerprint from it survived the whole suite
-/// (r4 round 1, COV5). Serde's default forwards to
+/// mutant returning an empty fingerprint from it would survive the whole
+/// suite. Serde's default forwards to
 /// [`Visitor::visit_bytes`] and behaves identically if a decoder ever does
 /// hand over an owned buffer.
 struct FingerprintVisitor;
@@ -247,12 +247,12 @@ mod tests {
 
     #[test]
     fn a_cache_written_before_entries_existed_still_loads() {
-        // r4 round 1 (COV5): `#[serde(default)]` on `entries` was pinned by no
-        // test — nothing decoded an envelope whose payload map lacks the field
-        // — so removing the attribute would turn such a file from
-        // `Health::Loaded` into `Health::Reset(Malformed)` with the suite
-        // still green, defeating the forward-compatibility argument that
-        // justifies the named encoding in `store::save`.
+        // `#[serde(default)]` on `entries` is pinned only here — nothing else
+        // decodes an envelope whose payload map lacks the field — and removing
+        // the attribute would turn such a file from `Health::Loaded` into
+        // `Health::Reset(Malformed)` with the suite still green, defeating the
+        // forward-compatibility argument that justifies the named encoding in
+        // `store::save`.
         // `Deserialize` too, because `store::save` decodes its own bytes and
         // re-encodes them to establish the payload iterates deterministically.
         #[derive(Serialize, Deserialize)]
@@ -270,10 +270,9 @@ mod tests {
 
     #[test]
     fn a_fingerprint_decodes_from_a_stream_as_well_as_a_slice() {
-        // r4 round 1 (COV5): the crate decodes only from slices, so nothing
-        // pinned what a stream does. It reaches `visit_bytes` too, which is
-        // why the `visit_byte_buf` override this visitor used to carry was
-        // unreachable and has gone.
+        // The crate decodes only from slices, so nothing else pins what a
+        // stream does. It reaches `visit_bytes` too, which is why this
+        // visitor carries no `visit_byte_buf` override.
         let encoded = rmp_serde::to_vec_named(&Fingerprint::raw(vec![1, 2, 3])).expect("encode");
         assert_eq!(
             rmp_serde::from_read::<_, Fingerprint>(encoded.as_slice())
@@ -368,8 +367,8 @@ mod tests {
         //
         // The closure *builds* a cache rather than cloning one. A clone carries
         // the original's hasher and its table layout, so two clones of one
-        // `HashMap` iterate identically and a hash-ordered payload passed the
-        // assertion this call exists to fail (r4 round 2, D1/COV2). Sixty-four
+        // `HashMap` iterate identically and a hash-ordered payload would pass
+        // the assertion this call exists to fail. Sixty-four
         // keys, not two, because two independently built hash maps of two keys
         // agree half the time.
         store::assert_saves_identically(KIND, VERSION, || {
@@ -391,8 +390,8 @@ mod tests {
 
     #[test]
     fn a_value_that_is_not_bytes_is_refused_as_a_fingerprint() {
-        // r3 round 1 (C5): nothing decoded a fingerprint from anything but
-        // bytes, so `expecting` never ran and its text survived mutation.
+        // Nothing else decodes a fingerprint from anything but bytes, so
+        // without this `expecting` never runs and its text survives mutation.
         let encoded = rmp_serde::to_vec(&7_u32).expect("encode");
         let err = rmp_serde::from_slice::<Fingerprint>(&encoded)
             .expect_err("an integer is not a fingerprint");
@@ -441,7 +440,7 @@ mod tests {
 
     #[test]
     fn a_cache_from_a_newer_bx_degrades_to_recomputation() {
-        // Review round 4 made a newer ledger a refusal. The cache is the file
+        // A ledger from a newer bx is a refusal. The cache is the file
         // recomputation rebuilds, so it keeps degrading: this is the test that
         // both doors open it as `Loss::Recomputable`, whose mechanism
         // `state::store` tests.

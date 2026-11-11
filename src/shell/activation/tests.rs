@@ -417,7 +417,7 @@ fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
             &[],
         ),
         ("cat <<EOF\nX=1\nEOF\necho 'unclosed\n", &[]),
-        // Review item D6: `&&` inside `[[ … ]]` with a comparison after it.
+        // `&&` inside `[[ … ]]` with a comparison after it.
         (
             "if [[ \"$a\" == \"b\" && \"$c\" != \"d\" ]]; then :; fi\n",
             &[],
@@ -539,7 +539,7 @@ fn every_assignment_to_a_relocating_variable_is_judged_by_the_guard() {
         ("(( ++CARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
         ("(( ++ CARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
         ("(( --\tCARGO_HOME ))\n", &[(1, "CARGO_HOME", Unreadable)]),
-        // Review item D7: a relocating name assembled from quoted or
+        // A relocating name assembled from quoted or
         // escaped pieces is the name once quotes are removed, so it is
         // refused wherever it stands.
         ("export 'CARGO'_HOME=/x\n", &[(1, "CARGO_HOME", Unreadable)]),
@@ -631,8 +631,8 @@ const REAL_OUTPUTS: [(&str, &str); 5] = [
 
 #[test]
 fn the_real_outputs_of_common_tools_render() {
-    // Review items D1 to D5: the strict-grammar reader refused every one
-    // of these, for assignments none of which relocates anything. Under
+    // A strict-grammar reader would refuse every one of these, for
+    // assignments none of which relocates anything. Under
     // the strict root set too — nothing in them moves a tool.
     for (command, output) in REAL_OUTPUTS {
         assert_eq!(relocations(output, &RootSet::strict()), vec![], "{command}");

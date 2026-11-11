@@ -197,10 +197,10 @@ fn finished_but_left_its_journal(state: &StateDir, home: &Path, rel: &str, bytes
 
 #[test]
 fn rm_after_a_crash_between_the_save_and_the_unlink_restores_the_users_original() {
-    // Review round 3, item 1. Rebuilding the ledger from this journal
-    // re-recorded the second write with bx's first output as its prior; the
-    // ledger took that for a third party's edit, adopted it, and `rm` then
-    // handed back "bx one" instead of the user's file.
+    // Rebuilding the ledger from this journal must not re-record the second
+    // write with bx's first output as its prior: the ledger would take that
+    // for a third party's edit, adopt it, and `rm` would then hand back
+    // "bx one" instead of the user's file.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let dest = home.child(".conf");
@@ -617,9 +617,9 @@ fn one_conflicting_target_does_not_stop_the_others() {
 
 #[test]
 fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
-    // r3 round 1, Q. `plan_restore` returned `Error::Read` for a destination
-    // it could not read, and `restore` dropped its session with `?`: the
-    // journal stood, and the next writing run rolled back every target this
+    // Were `plan_restore` to return `Error::Read` for a destination it
+    // cannot read, `restore` would drop its session with `?`: the journal
+    // would stand, and the next writing run roll back every target this
     // `rm` had already restored.
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -688,10 +688,10 @@ fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
 
 #[test]
 fn an_rm_target_whose_parent_does_not_resolve_is_a_conflict_and_the_rest_still_restore() {
-    // r3 round 2, P9R4-D1. A destination whose parent does not resolve is
-    // observed as absent, so `plan_restore` said Revert (or AlreadyGone);
-    // rm's write then failed with UnusableParent and stopped the whole rm,
-    // and the next writing run rolled back the target it had restored.
+    // A destination whose parent does not resolve is observed as absent.
+    // Were `plan_restore` to say Revert (or AlreadyGone) for it, rm's write
+    // would fail with UnusableParent and stop the whole rm, and the next
+    // writing run would roll back the target it had restored.
     let guard = guarded_home();
     for displaced in [true, false] {
         let case = format!("the second target displaced a file: {displaced}");
@@ -780,8 +780,8 @@ fn an_rm_target_whose_parent_does_not_resolve_is_a_conflict_and_the_rest_still_r
 
 #[test]
 fn every_outcome_names_the_target_it_is_about() {
-    // r3 coverage C4. `Restored::target` was reached only for `Unmanaged`
-    // and `Conflict`.
+    // `Restored::target` for every outcome, not only `Unmanaged` and
+    // `Conflict`.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     plant_file(&home.child(".reverted"), "theirs\n", Mode::DEFAULT_FILE);
@@ -1010,9 +1010,9 @@ fn plan_restore_says_exactly_what_restore_then_does() {
 
 #[test]
 fn an_edit_between_plan_restore_and_the_removal_is_kept_and_nothing_is_unlinked() {
-    // Review round 5, item 1. A removal carried no plan observation, so an
-    // edit landing after `plan_restore` was unlinked, surviving only as a
-    // blob nothing named.
+    // A removal carries plan's observation; without it, an edit landing
+    // after `plan_restore` would be unlinked, surviving only as a blob
+    // nothing named.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let rel = ".config/app/created.conf";
@@ -1153,9 +1153,9 @@ fn remove_two_sharing_a_created_dir(sharing: Sharing, user_file: bool) -> (bool,
 
 #[test]
 fn rm_of_two_targets_sharing_a_created_directory_leaves_nothing_bx_created() {
-    // Review round 5, item 4. Only the first write under a new directory
-    // claims it, and pruning stopped at the first non-empty directory, so
-    // removing the claiming target first left `~/.config/app` and `~/.config`.
+    // Only the first write under a new directory claims it, and pruning
+    // stops at the first non-empty directory, so without a hand-off removing
+    // the claiming target first would leave `~/.config/app` and `~/.config`.
     for sharing in [Sharing::OneRm, Sharing::OneRmReversed, Sharing::SeparateRms] {
         assert_eq!(
             remove_two_sharing_a_created_dir(sharing, false),
@@ -1167,7 +1167,7 @@ fn rm_of_two_targets_sharing_a_created_directory_leaves_nothing_bx_created() {
 
 #[test]
 fn a_claim_is_handed_on_when_the_rm_session_dies_between_its_end_and_its_save() {
-    // Review round 5, item 4. The hand-off is bookkeeping, so recovery's
+    // The hand-off is bookkeeping, so recovery's
     // rebuild of a terminated journal makes it too.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
@@ -1221,9 +1221,8 @@ fn a_claim_is_handed_on_when_the_rm_session_dies_between_its_end_and_its_save() 
 
 #[test]
 fn a_forgotten_targets_claims_are_handed_to_an_entry_still_beneath_them() {
-    // r3 coverage C1. `rm` of a file bx created that is already gone
-    // forgets the entry and keeps its claims for the hand-off; nothing
-    // pinned that those claims reach it.
+    // `rm` of a file bx created that is already gone forgets the entry and
+    // keeps its claims for the hand-off; this pins that those claims reach it.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let (a, b) = (".config/app/a.toml", ".config/app/b.toml");
@@ -1259,8 +1258,8 @@ fn a_forgotten_targets_claims_are_handed_to_an_entry_still_beneath_them() {
 
 #[test]
 fn a_claimed_directory_a_live_entry_names_is_never_pruned() {
-    // Review round 5, item 4, and #8's open question: whichever entry
-    // claims a directory, one the ledger still holds as a target stays.
+    // Whichever entry claims a directory, one the ledger still holds as a
+    // target stays.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let rel = ".config/app/a.toml";
@@ -1303,14 +1302,14 @@ fn a_claimed_directory_a_live_entry_names_is_never_pruned() {
 
 #[test]
 fn rm_under_a_claimed_directory_the_user_replaced_with_a_symlink_finishes() {
-    // r3 round 1, D1. The file went through the link, pruning the claimed
-    // directory failed with ENOTDIR, and the session was left for a rollback
-    // that put the file back: every `rm` after that did the same.
+    // The file goes through the link and pruning the claimed directory fails
+    // with ENOTDIR. Treated as an error, that would leave the session for a
+    // rollback that put the file back, and every `rm` after it would do the
+    // same.
     //
-    // Extended for r3 coverage COV3: `hand_off_claims`' guard for a claim
-    // that is no longer a directory was reached with no entry beneath the
-    // path, so deleting it changed no assertion. `heir.conf` is that
-    // entry. Without the guard the claim on `~/d` lands on it, and the
+    // `hand_off_claims`' guard for a claim that is no longer a directory
+    // needs an entry beneath the path, or deleting it changes no assertion.
+    // `heir.conf` is that entry. Without the guard the claim on `~/d` lands on it, and the
     // `rm` that removes it calls `remove_if_empty` on a symlink — the
     // breakage this test's own repair exists to stop.
     let home = guarded_home();
@@ -1387,7 +1386,7 @@ fn rm_under_a_claimed_directory_the_user_replaced_with_a_symlink_finishes() {
 
 #[test]
 fn a_prior_snapshot_that_cannot_be_read_stops_rm_and_restores_nothing() {
-    // r3 coverage C10. A missing or corrupt snapshot is a conflict; any
+    // A missing or corrupt snapshot is a conflict; any
     // other failure to read one stops `rm`, as its documentation says.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
@@ -1414,7 +1413,7 @@ fn a_prior_snapshot_that_cannot_be_read_stops_rm_and_restores_nothing() {
 
 #[test]
 fn a_write_rm_cannot_make_is_the_sessions_own_error() {
-    // r3 coverage C11. `restore_one` returns the session's failure for a
+    // `restore_one` returns the session's failure for a
     // removal and for a revert, not the `Poisoned` a later `finish` gives.
     let guard = guarded_home();
     for revert in [false, true] {
@@ -1431,8 +1430,8 @@ fn a_write_rm_cannot_make_is_the_sessions_own_error() {
         fs::set_mode(&locked, Mode::from_bits(0o555)).expect("make it read-only");
         if !crate::journal::tests::permissions_refuse(&locked) {
             fs::set_mode(&locked, Mode::DEFAULT_DIR).expect("make it writable again");
-            // `continue`, not `return`: r3 coverage COV1. Returning out of
-            // the whole test meant the `remove` half's skip took the
+            // `continue`, not `return`: returning out of the whole test
+            // would let the `remove` half's skip take the
             // `revert` half with it, and the revert half needs no
             // privilege this one lacks that the remove half does not.
             crate::testing::cannot_build(
@@ -1779,7 +1778,7 @@ fn run_unprivileged_in_a_foreign_setgid_directory(
 ) {
     use std::os::unix::fs::MetadataExt as _;
 
-    // r3 coverage COV1. Not an `eprintln!` that passes: a scenario this
+    // Not an `eprintln!` that passes: a scenario this
     // machine cannot build fails unless a human opted the skip in. See
     // `crate::testing::cannot_build`.
     let skip = |why: &str| crate::testing::cannot_build(name, why);

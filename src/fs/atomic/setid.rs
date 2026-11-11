@@ -1152,11 +1152,11 @@ mod tests {
             "no groups"
         );
 
-        // uid 0 is not a parameter at all, and that is r4 round 1's repair: a
+        // uid 0 is not a parameter at all, and on purpose: a
         // process that is root in a user namespace without CAP_FSETID has its
         // chmod stripped like any other, and there is no arm left for it.
         //
-        // These are r4 round 2's. `capable_wrt_inode_uidgid` requires both of
+        // `capable_wrt_inode_uidgid` requires both of
         // the inode's ids to be mapped, so the capability does NOT outrank an
         // unmapped id — it is the weaker path, not the stronger one. The
         // assertion below used to read `Some(Capability)`, and the kernel

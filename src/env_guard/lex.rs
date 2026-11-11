@@ -435,8 +435,8 @@ mod tests {
                 "{value}"
             );
         }
-        // Quoted, it is text, and since r3 round 3 a character no path bx
-        // writes holds.
+        // Quoted, it is text, and a character no path bx writes holds, so it
+        // is refused by name.
         assert_eq!(
             reason_of(&check(
                 "CARGO_HOME",
@@ -824,7 +824,7 @@ mod tests {
         // The expansion grammar is closed: `$NAME` and `${NAME}`, nothing else.
         // A `$` that begins neither is a special parameter or an operator that
         // a shell expands — `$@` and `$1` to nothing, which let
-        // `<root>/$@/$@/../..` climb out of the root while round 2 read the
+        // `<root>/$@/$@/../..` climb out of the root for a guard that read the
         // `$@` as literal components — so it is refused wherever it sits.
         for value in [
             "$",
@@ -881,7 +881,7 @@ mod tests {
         assert_eq!(scan_with(content, &rooted()), vec![]);
     }
 
-    // Review round 3: the guard fails closed by shape.
+    // The guard fails closed by shape.
 
     #[test]
     fn the_value_grammar_reads_its_three_forms_and_nothing_else() {
@@ -911,7 +911,7 @@ mod tests {
             "/x\t# a comment",
             "\"/x\" # a comment",
         ];
-        // Since round 4 every value is judged, so a form the grammar reads may
+        // Every value is judged, so a form the grammar reads may
         // still be refused for where it points. What is pinned here is that no
         // accepted form is refused *as a form*, and that `check` and
         // `scan_with` agree on it.
@@ -1027,7 +1027,7 @@ mod tests {
             );
         }
         // Given to a location, `~` alone is the home, which contains bx's
-        // directories (r3 round 2), and `/a://b` starts at the filesystem root
+        // directories, and `/a://b` starts at the filesystem root
         // however URL-like its middle.
         assert_eq!(
             reason_of(&check("CARGO_HOME", "~", &rooted())),

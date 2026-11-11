@@ -262,10 +262,10 @@ mod tests {
 
     #[test]
     fn decision_35_a_finished_sessions_rows_are_shown_in_the_plan_view() {
-        // P42R2-CL3. `command::apply_with` renders its approval prompt with
-        // View::Plan, which hides Unchanged rows — and over a finished session
-        // every row IS Unchanged, so the user was asked to confirm a recovery
-        // that named none of the files it was about to record.
+        // `command::apply_with` renders its approval prompt with View::Plan,
+        // which hides Unchanged rows — and over a finished session every row
+        // IS Unchanged, so unless they are shown the user is asked to confirm
+        // a recovery that names none of the files it is about to record.
         let guard = guarded_home();
         let home = guard.child("home");
         seed_crash(&home);

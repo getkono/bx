@@ -213,7 +213,7 @@ mod tests {
             "C=cargo\n",
             "export CARGO_HOME=$A/$B/$C/$B/$C/$B\n",
         );
-        // The helpers are not in the emit table (round 5); the line that uses
+        // The helpers are not in the emit table; the line that uses
         // them resolves inside the root and is not refused.
         assert_eq!(
             reasons(content, &rooted()),
@@ -242,7 +242,7 @@ mod tests {
             content
         }
         // The links are helpers the emit table does not list, so each one is
-        // `NotEmittable` (round 5). What is pinned is that the line using the
+        // `NotEmittable`. What is pinned is that the line using the
         // chain resolves inside the root and is not refused.
         for links in [1, 7, 8, 9, 64] {
             let helpers: Vec<(usize, Reason)> = (1..=links + 1)
@@ -259,8 +259,8 @@ mod tests {
         // them again would judge a path no shell produces. `CACHE_DIR` is a
         // location and `DATA_DIR` an anchor, and each is judged as one, where
         // a single-quoted `$` is relative either way. The line that uses the literal
-        // inside the root holds a `$` a tool could expand itself, so since r3
-        // round 2 it is refused for that, and not for where a second
+        // inside the root holds a `$` a tool could expand itself, so it is
+        // refused for that, and not for where a second
         // expansion would point.
         let content =
             format!("CACHE_DIR=/etc\nDATA_DIR='$CACHE_DIR'\nexport CARGO_HOME={ROOT}/$DATA_DIR\n");
@@ -338,7 +338,7 @@ mod tests {
         // without end. The reason says so, rather than that a variable the
         // fragment plainly assigned was never assigned.
         let long = format!("{ROOT}/{}", "a".repeat(MAX_EXPANDED_LEN / 2));
-        // `Y` is judged too, as every value is (round 4).
+        // `Y` is judged too, as every value is.
         let content = format!(
             "SCRATCH_HOME={long}\nCACHE_DIR=$SCRATCH_HOME$SCRATCH_HOME\nexport CARGO_HOME=$CACHE_DIR/cargo\n"
         );

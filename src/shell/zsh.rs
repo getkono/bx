@@ -45,7 +45,7 @@ impl Interactive {
     /// alone: never of whether a plugin's or a source's file exists.
     ///
     /// A file holding a plugin, a source line or an activation closes with
-    /// [`SETTLE`]. A guarded line whose file is absent returns 1, an
+    /// `SETTLE`. A guarded line whose file is absent returns 1, an
     /// activation's `eval` returns whatever the tool's code last did, and a
     /// file sourced at
     /// startup returns the status of its last command, so a file ending on one

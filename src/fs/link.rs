@@ -5,7 +5,7 @@
 //! it and never asks whether anything is at the far end, so a dangling link is
 //! made like any other. Everything that records a link records it the way it
 //! records a file, under the digest of its text ([`digest`]) and at
-//! [`Mode::LINK`], so the ledger, the journal and the restore store need no
+//! [`Mode::LINK`](crate::fs::Mode::LINK), so the ledger, the journal and the restore store need no
 //! second vocabulary; the [`crate::state::Mechanism::Link`] or
 //! `Intent::link` beside the record says which is meant.
 //!

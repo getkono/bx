@@ -93,7 +93,7 @@ impl RootSet {
     /// normalised with [`paths::normalize`], so that a root and a value being
     /// compared have been through the same rules.
     ///
-    /// A root that does not clear [`admissible_root`] is **not honoured**. It is
+    /// A root that does not clear `admissible_root` is **not honoured**. It is
     /// kept, as declared, in `RootSet::inadmissible`, logged at error level,
     /// and it changes the verdict: a set left with no admissible root refuses
     /// every relocation as [`Reason::InadmissibleRoot`], never as
@@ -233,7 +233,7 @@ impl RootSet {
     /// its own path under a home, `.local/share/bx` under any home for a set
     /// without one — since a tool pointed into it writes beside the fragments
     /// every shell sources. Unlike the state directory it is not consulted by
-    /// [`RootSet::holds_bx_directory`]; see [`RootSet`].
+    /// `RootSet::holds_bx_directory`; see [`RootSet`].
     #[must_use]
     pub fn owns(&self, path: &Path) -> bool {
         let normalised = paths::normalize(path);

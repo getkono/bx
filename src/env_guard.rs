@@ -34,9 +34,9 @@
 //! among those files would make `bx rm` destructive. [`RootSet::owns`] is that
 //! exclusion, and it is checked before containment.
 //!
-//! **A fragment may set only a variable bx knows how to judge.** [`EMITTABLE`](table::EMITTABLE)
+//! **A fragment may set only a variable bx knows how to judge.** `EMITTABLE`
 //! is the table of every name bx may generate, and it says what each one holds
-//! — a [`Kind`]: a location, a list of locations, an anchor, a program, a
+//! — a `Kind`: a location, a list of locations, an anchor, a program, a
 //! command line, a tool's options, a search list, a socket, or a setting.
 //! The value is judged for what the name holds. Every name the table does not
 //! list is refused as [`Reason::NotEmittable`], whatever its value.
@@ -78,7 +78,7 @@
 //! So the check is asked of a location and of a list of locations, and of
 //! nothing else — not of a program, a command line, a tool's options, a
 //! search list or a socket, none of which its tool clears, and not of an
-//! anchor, which [`Kind::Anchor`] exempts because bx has found no tool that
+//! anchor, which `Kind::Anchor` exempts because bx has found no tool that
 //! reads one at all.
 //! `a_location_may_not_contain_bxs_own_directories` asserts both halves,
 //! allowing an `EDITOR`, a `PATH` and an `SSH_AUTH_SOCK` that contain bx's
@@ -235,7 +235,7 @@ pub use table::is_relocating;
 ///
 /// The assignment is judged as **exported**. There is no line to read an
 /// `export` from, and the exported reading is the stricter one: it is the one
-/// in which [`Kind::Anchor`]'s exemption does not apply, so a verdict of
+/// in which `Kind::Anchor`'s exemption does not apply, so a verdict of
 /// [`Verdict::Allowed`] here holds wherever the assignment is written.
 #[must_use]
 pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
@@ -335,7 +335,7 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// `HISTFILESIZE` and the rest of `ACTS_ON_ASSIGNMENT` — may not be
 /// assigned, and is refused as [`Reason::ReservedName`]. Nor may it be
 /// referred to, with one exception: `$HOME`, and the `~` that stands for it,
-/// resolve against the root set's home ([`Scope::lookup`]). That exception is
+/// resolve against the root set's home (`Scope::lookup`). That exception is
 /// the mechanism every value written against the home is judged through, and
 /// it is exactly why `HOME` may not be *assigned*: a fragment that moved it
 /// would move `~` with it, and the guard would judge against a home no shell
@@ -343,8 +343,8 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 ///
 /// **What is judged.** Every accepted assignment, exported or not, since
 /// assigning a name the environment already exports changes what every child
-/// sees. A name [`EMITTABLE`](table::EMITTABLE) does not list is [`Reason::NotEmittable`]. For
-/// one it lists, the value as a shell gives it is judged for the [`Kind`] the
+/// sees. A name `EMITTABLE` does not list is [`Reason::NotEmittable`]. For
+/// one it lists, the value as a shell gives it is judged for the `Kind` the
 /// table records:
 ///
 /// * a **location** needs a declared root, and every `:`-entry must be
@@ -366,7 +366,7 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// * a **search list** has every entry absolute and outside bx's own
 ///   directories, its inherited self standing in for itself;
 /// * a **socket** is an absolute path outside bx's own directories;
-/// * a **setting** holds a value of its [`Setting`](table::Setting) shape.
+/// * a **setting** holds a value of its `Setting` shape.
 ///
 /// No path of any kind may have a `..` component ([`Reason::ParentComponent`]),
 /// hold a character other than an ASCII letter or digit, `.`, `_`, `-`, `+`
@@ -398,7 +398,7 @@ pub fn check(name: &str, value: &str, roots: &RootSet) -> Verdict {
 /// either is refused.
 ///
 /// **Purity.** Nothing is read from the process environment and nothing is
-/// read from disk. `$HOME` comes from `roots`, never from [`std::env`], and the
+/// read from disk. `$HOME` comes from `roots`, never from [`std::env`](mod@std::env), and the
 /// roots are held in declaration order, so this is a pure function of
 /// `(content, roots)`. That is what lets `plan` call it without becoming
 /// machine-dependent (invariant 3).
@@ -417,7 +417,7 @@ pub fn scan_with(content: &str, roots: &RootSet) -> Vec<Violation> {
 /// manager reads into the environment of everything it starts.
 ///
 /// The grammar and the judgement are [`scan_with`]'s. Only whether a line is
-/// exported differs, and that is what [`Kind::Anchor`]'s one exemption turns
+/// exported differs, and that is what `Kind::Anchor`'s one exemption turns
 /// on.
 #[must_use]
 pub fn scan_exported(content: &str, roots: &RootSet) -> Vec<Violation> {

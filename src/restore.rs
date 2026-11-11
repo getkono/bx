@@ -631,7 +631,7 @@ pub fn restore(
 ///
 /// `git` is asked about it. A clone is not a write a journal can roll back —
 /// its bytes are git's, not bx's — so it is removed outside the session, under
-/// the same lock and before the session opens, by [`remove_clone`]. Every
+/// the same lock and before the session opens, by `remove_clone`. Every
 /// other target is restored through the session as above. The results are in
 /// the order of `targets`.
 pub fn restore_undeclared_with(

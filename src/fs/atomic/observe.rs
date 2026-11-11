@@ -126,7 +126,7 @@ pub struct Parent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParentState {
     /// A directory, at this mode. A symlinked parent reports the mode of the
-    /// directory it resolves to — see [`observe_parent`].
+    /// directory it resolves to — see `observe_parent`.
     Present(Mode),
     /// Nothing is on the path at all. bx would create it at this mode.
     Absent(Mode),

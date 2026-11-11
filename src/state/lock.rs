@@ -73,7 +73,7 @@ impl Holder {
     /// Whoever holds `dir`'s lock, as far as the lock file's body says.
     ///
     /// Read-only and best effort: an absent, unopenable or malformed lock file
-    /// is [`Holder::unknown`], exactly as it is on
+    /// is `Holder::unknown`, exactly as it is on
     /// [`ExclusiveLock::acquire`]'s refusal path, and nothing is created,
     /// narrowed or written.
     ///
@@ -321,7 +321,7 @@ impl SharedLock {
     /// guards' `Drop` does, so no copy of the descriptor keeps it held.
     ///
     /// A missing lock file, or a state directory that is not there, is
-    /// [`Probe::Absent`]: no writer holds a lock that does not exist, because a
+    /// `Probe::Absent`: no writer holds a lock that does not exist, because a
     /// writer creates it before it locks it.
     ///
     /// # Decision 36: three gaps here are named rather than closed

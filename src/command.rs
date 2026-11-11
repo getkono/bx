@@ -454,7 +454,7 @@ impl UpdateMode {
     }
 }
 
-/// `bx update`: everything [`sync`] does, and move followed externals to their
+/// `bx update`: everything [`sync`](fn@sync) does, and move followed externals to their
 /// branches' new commits.
 ///
 /// [`UpdateMode::Update`] first brings the config repo level with its
@@ -528,7 +528,7 @@ fn update_with(
     run::scoped(env, names, Scope::Followed, yes, out, git, ask)
 }
 
-/// `bx upgrade`: everything [`update`] does, and move each pinned external to
+/// `bx upgrade`: everything [`update`](fn@update) does, and move each pinned external to
 /// its newest release; then say whether bx itself has a newer release.
 ///
 /// The followed externals are looked at and locked exactly as `bx update`
@@ -562,7 +562,7 @@ fn update_with(
 ///
 /// # Errors
 ///
-/// As [`update`], with [`update::Error::NotExternal`] for a name that is no
+/// As [`update`](fn@update), with [`update::Error::NotExternal`] for a name that is no
 /// external's path, [`update::Error::LayerEdited`] for a committed layer to
 /// rewrite that holds changes nobody committed, and [`update::Error::Pin`]
 /// for a layer that cannot be rewritten.

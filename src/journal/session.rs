@@ -1246,7 +1246,7 @@ impl Session {
     /// ledger, and unlink the journal last.
     ///
     /// The directories released targets claimed are settled only after the
-    /// `End` frame is durable: see [`Session::settle_claims`]. Until then no
+    /// `End` frame is durable: see `Session::settle_claims`. Until then no
     /// directory a removal claimed is removed, so a crash before `End` rolls
     /// the session back into the very directories it found, at the modes they
     /// had — never into one re-created at the default mode. A crash between

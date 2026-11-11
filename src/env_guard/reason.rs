@@ -40,7 +40,7 @@ pub enum Reason {
     /// It assigns a name the shell manages itself — `HOME`, `RANDOM`, zsh's
     /// tied `path` — or acts on when it is assigned; or it *refers* to one of
     /// them other than `HOME`, which resolves against the root set's home
-    /// instead ([`Scope::lookup`](super::scope::Scope::lookup)).
+    /// instead (`Scope::lookup`).
     #[error("assigns or refers to a name the shell manages itself")]
     ReservedName,
     /// It assigns a variable no bx generator declares, whatever the value: the
@@ -82,7 +82,7 @@ pub enum Reason {
     /// beneath a root is approved, and `<value>/../..` is the root's own
     /// parent, outside every root. A tool that derives a path **two or more
     /// levels above its value is not modelled**, and bx knows of none.
-    /// [`Kind::Location`](super::table::Kind::Location) states the same bound, and
+    /// `Kind::Location` states the same bound, and
     /// `the_rule_covers_one_level_above_a_location_and_no_more` pins it.
     ///
     /// Every other reason outranks it, at any entry and in a location's whole
@@ -148,7 +148,7 @@ pub enum Reason {
     /// after a line the guard refused, after which nothing assigned is known.
     #[error("refers to a variable whose assignment the guard could not read")]
     UnreadableReference,
-    /// Its expansion grows past [`MAX_EXPANDED_LEN`](super::lex::MAX_EXPANDED_LEN).
+    /// Its expansion grows past `MAX_EXPANDED_LEN`.
     #[error("expands past the guard's length bound")]
     ExpansionTooLong,
 }

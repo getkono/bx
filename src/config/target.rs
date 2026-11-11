@@ -49,7 +49,7 @@
 //! A target under a directory only one OS reads — `~/.config/systemd/user`
 //! and `~/.config/environment.d` on Linux, `~/Library` on macOS — must be
 //! kept to that OS by its own `when` or its module's, or the layer is refused
-//! as it loads, on every OS. See [`refuse_ungated_platform`]. A path that
+//! as it loads, on every OS. See `refuse_ungated_platform`. A path that
 //! reaches such a directory only once a `{{name}}` in it is answered is judged
 //! again after substitution, by the same gates: a committed `default` leading
 //! there fails the load, and an account's answer blocks the target.
@@ -172,7 +172,7 @@ pub struct Target {
     /// Where the entry was written.
     pub origin: Origin,
     /// The conditions that keep it to this machine: its own `when` and its
-    /// module's, which [`refuse_ungated_platform`] reads again once a
+    /// module's, which `refuse_ungated_platform` reads again once a
     /// `{{name}}` in its path is answered.
     ///
     /// Empty as parsed, where both stay on the layer for [`super::layers::gate`]

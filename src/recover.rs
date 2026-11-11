@@ -94,8 +94,6 @@ use std::path::PathBuf;
 use crate::fs::{self, remove};
 use crate::journal::{self, SessionKind};
 use crate::paths::Portable;
-#[cfg(test)]
-use crate::report::{Action, Exit};
 
 mod entry;
 #[cfg(test)]
@@ -174,15 +172,6 @@ pub enum Standing {
     Unreachable,
 }
 
-impl Standing {
-    /// Whether recovery can act on this on its own.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_resolvable(self) -> bool {
-        matches!(self, Self::Prior | Self::Written)
-    }
-}
-
 impl std::fmt::Display for Standing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -212,26 +201,6 @@ pub struct Unfinished {
 }
 
 impl Unfinished {
-    /// One action for this target, as the tests' [`Interrupted::actions`] and
-    /// [`Interrupted::exit`] read it.
-    ///
-    /// Not the row `plan` shows: `plan` reports each write as the row recovery
-    /// would make of it, which is a modify or unchanged where recovery can
-    /// act, and a conflict only where it cannot (see the module
-    /// documentation).
-    ///
-    /// Always [`Action::Conflict`], and deliberately not a sixth variant. Its
-    /// documented meaning — *something bx does not currently own is in the way,
-    /// reported and skipped, never overwritten* — is exactly the situation, and
-    /// [`Action::needs_attention`] makes [`Exit::from_actions`] yield
-    /// [`Exit::Pending`], which is the right signal for "a human has to look".
-    /// [`Exit::Error`] would be wrong: nothing is going wrong now.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn action(&self) -> Action {
-        Action::Conflict
-    }
-
     /// One line naming the file and what is wrong with it.
     #[must_use]
     pub fn describe(&self) -> String {
@@ -279,32 +248,6 @@ impl Interrupted {
     /// The writes recovery cannot resolve on its own.
     pub fn blocked(&self) -> impl Iterator<Item = &Unfinished> {
         self.unfinished.iter().filter(|write| !write.resolvable)
-    }
-
-    /// The tests' blanket view: [`Unfinished::action`] per target, which is
-    /// not the row `plan` shows for it.
-    #[cfg(test)]
-    #[must_use]
-    pub fn actions(&self) -> Vec<Action> {
-        self.unfinished.iter().map(Unfinished::action).collect()
-    }
-
-    /// The process status a read-only command exits with, as the tests compute
-    /// it from [`Interrupted::actions`]; the commands themselves exit through
-    /// [`crate::plan::exit`], which gives [`Exit::Pending`] for any interrupted
-    /// session.
-    ///
-    /// [`Exit::Pending`] whenever anything was interrupted — including a session
-    /// with no writes in it, because the machine is still not converged and
-    /// somebody has to run a writing command.
-    #[cfg(test)]
-    #[must_use]
-    pub fn exit(&self) -> Exit {
-        if self.unfinished.is_empty() {
-            Exit::Pending
-        } else {
-            Exit::from_actions(&self.actions())
-        }
     }
 }
 

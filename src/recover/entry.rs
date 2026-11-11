@@ -475,7 +475,7 @@ mod tests {
         let report = pending(&state).expect("pending").expect("reported");
         assert!(report.unreadable);
         assert!(report.unfinished.is_empty());
-        assert_eq!(report.exit(), Exit::Pending);
+        assert_eq!(plan_exit(&report), Exit::Pending);
         assert_eq!(
             std::fs::read(state.journal()).expect("still in place"),
             b"not a journal",
@@ -506,7 +506,7 @@ mod tests {
             .expect("an empty journal is still a session");
         assert!(interruption.unfinished.is_empty());
         assert!(!interruption.complete);
-        assert_eq!(interruption.exit(), Exit::Pending);
+        assert_eq!(plan_exit(&interruption), Exit::Pending);
         assert!(state.journal().is_file(), "left exactly where it was");
         assert!(!StateDir::quarantine(&state.journal()).exists());
     }
@@ -1208,7 +1208,7 @@ mod tests {
                 unfinished: Vec::new(),
             },
         );
-        assert_eq!(report.exit(), Exit::Pending);
+        assert_eq!(plan_exit(&report), Exit::Pending);
         assert_eq!(
             std::fs::read(state.journal()).expect("left in place"),
             b"GARBAGE!"

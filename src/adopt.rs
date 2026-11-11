@@ -1420,8 +1420,8 @@ fn undeclare(
 /// deleted by hand is still handed back. [`restore::restore_with`] decides and
 /// restores each; each one it released is then removed from every layer
 /// declaring it. A conflict is left declared and untouched, and a tree is
-/// handed back whole or not at all ([`hold_trees`]). A file nothing declares
-/// ([`Context::undeclared`]) that was edited since bx wrote it is not a
+/// handed back whole or not at all (`hold_trees`). A file nothing declares
+/// (`Context::undeclared`) that was edited since bx wrote it is not a
 /// conflict: it is kept exactly as it is and forgotten, as `apply` releases
 /// it. Nothing to do is an empty result, which is what makes a second `rm` a
 /// no-op.

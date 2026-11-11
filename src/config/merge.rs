@@ -42,7 +42,7 @@
 //! written, and `profile = "default"` makes them one. Failing the load would
 //! name a committed file the account cannot edit and take every unrelated
 //! target with it, so instead both entries are kept and recorded as a
-//! [`Conflict`], and resolution blocks each one, naming both lines and the
+//! `Conflict`, and resolution blocks each one, naming both lines and the
 //! answer's. A later layer's full entry for the file settles it; a later
 //! toggle does not, and leaves the conflict recorded. When a toggle among
 //! the statements cannot be shown to name a declared target for every answer —
@@ -54,9 +54,9 @@
 //!
 //! # Shapes the written form does not decide
 //!
-//! This is what `written_form`, `one_path_as_written` and `Root`, in
-//! [`written_form`], point at. It is here, in the tree, rather than in a review
-//! thread, so that a maintainer changing the reduction reads the limitation
+//! This is what `written_form`, `one_path_as_written` and `Root`, in the
+//! `written_form` module, point at. It is here, in the tree, rather than in a
+//! review thread, so that a maintainer changing the reduction reads the limitation
 //! beside the code it limits, and so that it outlives whatever tracker entry
 //! carried it.
 //!
@@ -68,7 +68,7 @@
 //!
 //! **What does not hold.** The form does not recognise every pair that names
 //! one file for every answer. When it misses one, a layer that spells the same
-//! file twice loads `Ok` and the file is blocked as a [`Conflict`] that no
+//! file twice loads `Ok` and the file is blocked as a `Conflict` that no
 //! answer clears. Because the form cannot anchor such a toggle to a declared
 //! spelling, the conflict's hint names the toggles to remove rather than an
 //! answer to change. **No general rule is claimed
@@ -83,7 +83,7 @@
 //! registered spelling differs between them, and nothing here depends on
 //! which. A toggle names a key by the spelling it reaches and is held to none
 //! of those rules, so that is the route by which one of these pairs becomes a
-//! [`Conflict`]. The two halves are executed at different widths, deliberately:
+//! `Conflict`. The two halves are executed at different widths, deliberately:
 //! `no_registered_pair_reaches_the_comparison_as_full_entries` asserts the
 //! full-entry refusal for **every** entry in `UNDECIDED`, since that half
 //! generalises and a new entry must satisfy it too, while
@@ -165,7 +165,7 @@ use super::{Config, Error, Layer, LayerKind};
 /// The toggle vocabulary, defined in [`super::toggle`] where a layer is
 /// parsed, and named here too, where the merge applies it.
 pub use super::toggle::{Section, Toggle};
-/// The list merge, defined in [`merged`] and named here too, where every keyed
+/// The list merge, defined in `merged` and named here too, where every keyed
 /// list section is folded.
 pub use merged::Merged;
 /// A file one layer names twice because of this account's answers, defined in
@@ -190,7 +190,7 @@ use target_key::{Clash, TargetKey};
 /// in, when two enabled
 /// plugins claim the terminal slot ([`plugin::check_terminal`]), or for any
 /// defect [`ResolvedValues::resolve`] reports. The same collision with an answer in it
-/// is not an error; it is carried to [`super::resolve`] as a [`Conflict`].
+/// is not an error; it is carried to [`super::resolve`] as a `Conflict`.
 pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut values: Merged<ValueDecl> = Merged::default();
     let mut assignments: Vec<ValueAssignment> = Vec::new();

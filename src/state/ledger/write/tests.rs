@@ -414,7 +414,7 @@ fn a_re_record_keeps_or_adopts_the_prior_in_every_cell_of_the_matrix() {
         reachable.dedup();
         assert_eq!(reachable, blobs, "{cell}: every blob is indexed");
         assert_eq!(entry.written, ContentHash::of(BX_V2), "{cell}: written");
-        // Review round 5: a replaced `Absent` is history, not nothing.
+        // A replaced `Absent` is history, not nothing.
         assert_eq!(
             entry.superseded_absent,
             matches!((stored, incoming), (Stored::Absent, Incoming::UserChanged)),
@@ -474,9 +474,9 @@ fn recording_the_same_prior_bytes_twice_writes_the_blob_once() {
 
 #[test]
 fn a_prior_that_cannot_be_stored_leaves_every_entry_and_the_saved_ledger_unchanged() {
-    // r3 round 1 (C7): a failing blob write inside `record` and
-    // `adopt_current_as_prior` was never reached, so the promise that
-    // the entry is left unchanged was untested.
+    // A failing blob write inside `record` and `adopt_current_as_prior` is
+    // reached nowhere else, and it is what tests the promise that the entry
+    // is left unchanged.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -594,10 +594,10 @@ fn a_truncated_blob_is_repaired_by_the_next_record_of_those_bytes() {
 
 #[test]
 fn a_decoy_link_at_a_blob_name_is_refused_and_a_decoy_hard_link_replaced_never_trusted() {
-    // Review round 3: `blob_len` followed a symlink, so a link at
-    // `restore/<digest>` to any file of the same length made `record`
+    // A `blob_len` that followed a symlink would let a link at
+    // `restore/<digest>` to any file of the same length make `record`
     // return Ok with none of the user's bytes on disk — found only at rm,
-    // as RestoreCorrupt. A second hard link was trusted the same way.
+    // as RestoreCorrupt. A second hard link would be trusted the same way.
     //
     // Stack integration with #8: the writer refuses to replace a symlink
     // anywhere (`fs::Error::Symlink`), state files included. So a symlink
@@ -657,11 +657,11 @@ fn a_decoy_link_at_a_blob_name_is_refused_and_a_decoy_hard_link_replaced_never_t
 
 #[test]
 fn a_restore_blob_that_is_not_bxs_own_file_is_refused_rather_than_read() {
-    // r4 round 1 (D5): the read side used plain `std::fs::read`, which
-    // follows links and accepts any file type — precisely the entries the
-    // write side's `blob_len` refuses to trust. A FIFO there blocked
-    // `bx rm` forever inside the read, with no timeout and no diagnostic;
-    // a link to an unbounded source allocated until the process died.
+    // Plain `std::fs::read` on the read side would follow links and accept
+    // any file type — precisely the entries the write side's `blob_len`
+    // refuses to trust. A FIFO there would block `bx rm` forever inside the
+    // read, with no timeout and no diagnostic; a link to an unbounded source
+    // would allocate until the process died.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -711,11 +711,11 @@ fn a_restore_blob_that_is_not_bxs_own_file_is_refused_rather_than_read() {
 
 #[test]
 fn a_hard_linked_restore_blob_is_still_restored() {
-    // r4 round 2 (CL6): the read side repeated the write side's
-    // `st_nlink == 1` test, where it can only reject. A hard-linking
-    // deduplicator or backup tool run over `$HOME` raises `nlink` on an
-    // intact blob, and `bx rm` then refused to restore the user's own
-    // prior bytes though they were present and verifiable. Integrity is
+    // The read side does not repeat the write side's `st_nlink == 1` test,
+    // where it could only reject. A hard-linking deduplicator or backup tool
+    // run over `$HOME` raises `nlink` on an intact blob, and `bx rm` would
+    // then refuse to restore the user's own prior bytes though they are
+    // present and verifiable. Integrity is
     // settled by the digest; `nlink` says nothing about it.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
@@ -743,12 +743,12 @@ fn a_hard_linked_restore_blob_is_still_restored() {
 
 #[test]
 fn a_restore_blob_of_the_wrong_length_is_refused_before_it_is_read() {
-    // r4 round 2 (D3): the read was an unbounded `read_to_end` although
-    // the reference already held the expected length and the descriptor
-    // had been `fstat`ed. A regular, single-linked file of any size at
-    // `restore/<digest>` was allocated whole before the digest could
-    // reject it — the "allocate until the process is killed" failure the
-    // function's own preamble claims to close.
+    // The reference already holds the expected length and the descriptor
+    // has been `fstat`ed, so the read is bounded: unbounded, a regular,
+    // single-linked file of any size at `restore/<digest>` would be
+    // allocated whole before the digest could reject it — the "allocate until
+    // the process is killed" failure the function's own preamble claims to
+    // close.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -772,7 +772,7 @@ fn a_restore_blob_of_the_wrong_length_is_refused_before_it_is_read() {
 
 #[test]
 fn a_directory_at_a_blob_name_fails_the_write_rather_than_being_skipped() {
-    // r4 round 2 (COV7): `restore::store_bytes` with something at the blob name that
+    // `restore::store_bytes` with something at the blob name that
     // `blob_len` will not measure — so the skip does not fire — and that
     // the rename cannot replace. `a_restore_directory_that_cannot_be_
     // created_is_reported` covers `ensure_dir` failing, which is a
@@ -867,9 +867,9 @@ fn an_unreadable_restore_blob_is_reported() {
 
 #[test]
 fn record_refuses_a_path_the_next_open_under_the_same_home_would_refuse() {
-    // Review round 4's falsifier: `record` accepted `/<home>/.gitconfig`
-    // built through `Portable::try_from`, `save` wrote it, and every later
-    // `open` under that home refused the ledger, with no way back.
+    // Were `record` to accept `/<home>/.gitconfig` built through
+    // `Portable::try_from`, `save` would write it, and every later `open`
+    // under that home would refuse the ledger, with no way back.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -969,9 +969,8 @@ fn check_record_refuses_exactly_what_record_refuses_and_stores_nothing() {
 
 #[test]
 fn accepting_a_changed_shared_file_converges_and_keeps_the_first_original() {
-    // Review round 4: `PriorConflict` fires on any edit outside bx's
-    // region, its message named no remedy, and re-recording converged
-    // nowhere.
+    // `PriorConflict` fires on any edit outside bx's region, so its message
+    // has to name a remedy, and re-recording has to converge.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let region = Mechanism::Region { comment: '#' };
@@ -1050,11 +1049,11 @@ fn accepting_a_changed_shared_file_converges_and_keeps_the_first_original() {
 
 #[test]
 fn accepting_a_file_bx_created_keeps_that_there_was_no_file_before_bx() {
-    // Review round 5: `supersede` kept only `RestoreRef`s, so accepting a
-    // file whose stored prior was `Absent` dropped that fact. bx creates
-    // `~/.zshrc` holding only its include line, the user adds an alias,
-    // and after accepting the entry read exactly like a file the user had
-    // all along — while the conflict message said the original was kept.
+    // A `supersede` that kept only `RestoreRef`s would drop the fact that
+    // an accepted file's stored prior was `Absent`. bx creates `~/.zshrc`
+    // holding only its include line, the user adds an alias, and after
+    // accepting the entry would read exactly like a file the user had all
+    // along — while the conflict message said the original was kept.
     let include = Mechanism::Include {
         line: "source ~/.local/state/bx/shell/init.zsh".to_string(),
     };
@@ -1121,9 +1120,8 @@ fn accepting_a_file_bx_created_keeps_that_there_was_no_file_before_bx() {
 
 #[test]
 fn a_prior_conflict_says_plainly_what_accepting_leaves_behind() {
-    // Review round 5: accepting a region or include file makes `bx rm`
-    // write bx's stale lines back, unmanaged, and the message did not say
-    // so.
+    // Accepting a region or include file makes `bx rm` write bx's stale
+    // lines back, unmanaged, and the message has to say so.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let region = Mechanism::Region { comment: '#' };
@@ -1158,9 +1156,9 @@ fn a_prior_conflict_says_plainly_what_accepting_leaves_behind() {
 
 #[test]
 fn a_lock_file_replaced_while_held_stops_every_write_through_the_ledger() {
-    // Review round 5: an outside `mv` of the lock file while it was held
-    // let a second bx lock a new file, and `record` and `save` never looked
-    // again. The refusal also named the same path twice.
+    // An outside `mv` of the lock file while it is held lets a second bx
+    // lock a new file, so `record` and `save` look again. The refusal names
+    // the path once, not twice.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -1199,10 +1197,10 @@ fn a_lock_file_replaced_while_held_stops_every_write_through_the_ledger() {
 
 #[test]
 fn a_changed_shared_file_is_a_conflict_not_a_prior_holding_bxs_own_lines() {
-    // Review round 3. Region BX1, the user adds a line outside it, and the
-    // next apply hands `record` the whole file. Adopting it stored BX1's
-    // region as the user's original, and `bx rm` then wrote bx's stale
-    // region back into the user's file.
+    // Region BX1, the user adds a line outside it, and the next apply hands
+    // `record` the whole file. Adopting it would store BX1's region as the
+    // user's original, and `bx rm` would then write bx's stale region back
+    // into the user's file.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let original = b"user line 1\n";
@@ -1336,8 +1334,8 @@ fn saving_the_ledger_twice_produces_identical_bytes() {
     //
     // The closure *builds* a view rather than cloning one. A clone carries
     // the original's hasher and its table layout, so two clones of one
-    // `HashMap` iterate identically and a hash-ordered payload passed the
-    // assertion this call exists to fail (r4 round 2, D1/COV2). Sixty-four
+    // `HashMap` iterate identically and a hash-ordered payload would pass
+    // the assertion this call exists to fail. Sixty-four
     // keys, not two, because two independently built hash maps of two keys
     // agree half the time.
     store::assert_saves_identically(KIND, VERSION, || {
@@ -1364,9 +1362,9 @@ fn saving_the_ledger_twice_produces_identical_bytes() {
 
 #[test]
 fn re_adopting_the_stored_prior_leaves_it_the_prior_and_not_history() {
-    // r4 round 1 (COV7): the one path where `supersede`'s push-then-retain
-    // has to cancel out — the bytes being adopted are the exact bytes
-    // already stored as the prior — was reached by no test. Without the
+    // The one path where `supersede`'s push-then-retain has to cancel out
+    // — the bytes being adopted are the exact bytes already stored as the
+    // prior — is reached by no other test. Without the
     // `retain`, the blob would be both the prior and a superseded entry,
     // and `bx rm` would index one snapshot twice.
     let home = guarded_home();
@@ -1398,8 +1396,8 @@ fn re_adopting_the_stored_prior_leaves_it_the_prior_and_not_history() {
 
 #[test]
 fn a_restore_directory_that_cannot_be_created_is_reported() {
-    // r4 round 1 (COV7): `Ledger::store_restore`'s `Error::CreateDir` arm — the
-    // `ensure_dir` of `restore/` failing — was reached by no test.
+    // `Ledger::store_restore`'s `Error::CreateDir` arm — the `ensure_dir` of
+    // `restore/` failing — is reached by no other test.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -1461,14 +1459,14 @@ fn directories_bx_created_are_recorded_deepest_first() {
 
 #[test]
 fn a_first_record_normalises_the_directories_it_is_handed() {
-    // r4 round 1 (COV3, CL8): a FIRST record stored `created_dirs`
-    // verbatim, trusting `with_created_dirs`'s documented "deepest first"
-    // and validating it nowhere, while every re-record sorted and
-    // deduplicated. A caller handing them over shallowest-first had the
-    // fault silently corrected from the second apply on and not the first,
-    // so `bx rm` left a directory behind for a target applied exactly
-    // once. The test that was here handed in an already-sorted list and
-    // asserted round-trip equality, so it passed identically either way.
+    // A FIRST record that stored `created_dirs` verbatim, trusting
+    // `with_created_dirs`'s documented "deepest first", would differ from
+    // every re-record, which sorts and deduplicates. A caller handing them
+    // over shallowest-first would have the fault silently corrected from
+    // the second apply on and not the first, so `bx rm` would leave a
+    // directory behind for a target applied exactly once. An already-sorted
+    // list asserted for round-trip equality passes identically either way,
+    // so the list handed in here is not sorted.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
@@ -1568,11 +1566,11 @@ fn nothing_outside_the_state_directory_is_created() {
     fingerprints.set("activation:rustup", Fingerprint::hashed(b"v1"));
     fingerprints.save(&dir, &lock).expect("save");
 
-    // r4 round 1 (D3): this asserted `starts_with(home/".local")`, two
-    // components shallower than the state directory, so it admitted the
-    // whole of `~/.local` — `~/.local/share/bx-cache`, `~/.local/bin`, or
-    // another tool's `~/.local/state/<tool>` — while its name and the
-    // body's claim both say "the state directory". The two XDG ancestors
+    // Not `starts_with(home/".local")`: two components shallower than the
+    // state directory, that admits the whole of `~/.local` —
+    // `~/.local/share/bx-cache`, `~/.local/bin`, or another tool's
+    // `~/.local/state/<tool>` — while this test's name and the body's claim
+    // both say "the state directory". The two XDG ancestors
     // `ensure_dir` creates are the sole exception, and they are named
     // rather than admitted by prefix.
     let ancestors = [home.child(".local"), home.child(".local/state")];

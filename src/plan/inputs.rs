@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_malformed_layer_is_a_config_error_not_a_missing_repo() {
-        // P42R1-COV3. Only a missing repo becomes `RepoMissing`; everything
+        // Only a missing repo becomes `RepoMissing`; everything
         // else the configuration refuses stays the configuration's error.
         let home = guarded_home();
         seed(home.path(), "[[target]\npath = \n");

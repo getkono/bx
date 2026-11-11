@@ -94,8 +94,7 @@ pub(crate) fn store_bytes(
 /// O_NONBLOCK`, the descriptor must be a regular file, and the read is
 /// bounded by `reference.len`.
 ///
-/// The write side's `st_nlink == 1` test is **not** repeated here (r4
-/// round 2, CL6). A second hard link changes nothing about availability,
+/// The write side's `st_nlink == 1` test is **not** repeated here. A second hard link changes nothing about availability,
 /// and content integrity is settled by the digest recomputed below — bytes
 /// that hash to `reference.digest` are the user's prior bytes whoever else
 /// has a name for them. Refusing them would make an ordinary hard-linking
@@ -154,13 +153,12 @@ pub fn read(dir: &StateDir, reference: &RestoreRef) -> Result<Vec<u8>, Error> {
         return Err(not_a_file());
     }
     // The recorded length bounds the read. `reference.len` is written by
-    // `store_bytes` and, until now, read by nothing: a regular,
-    // single-linked file of any size at `restore/<digest>` — left by an
-    // interrupted write, or put there by anything with access to
-    // `restore/` — was allocated whole before the digest below could
-    // reject it, which is the "allocate until the process is killed"
-    // failure this function's own preamble claims to close (r4 round 2,
-    // D3 and COV7). Different length means different bytes, so this is the
+    // `store_bytes`: without this check a regular, single-linked file of
+    // any size at `restore/<digest>` — left by an interrupted write, or put
+    // there by anything with access to `restore/` — would be allocated
+    // whole before the digest below could reject it, which is the
+    // "allocate until the process is killed" failure this function's own
+    // preamble claims to close. Different length means different bytes, so this is the
     // refusal the digest would make, made before the allocation.
     if !u64::try_from(stat.st_size).is_ok_and(|size| size == reference.len) {
         return Err(Error::RestoreCorrupt {

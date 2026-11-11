@@ -821,8 +821,8 @@ fn t11_a_mode_only_drift_is_a_journalled_modify_that_converges() {
 
 #[test]
 fn decision_22_a_mode_the_user_changed_on_a_file_bx_owns_is_a_conflict() {
-    // P42R1-D7. A user's chmod narrowing a file bx owns was re-widened:
-    // ownership compared the digest only.
+    // Ownership that compares the digest only re-widens a user's chmod
+    // narrowing a file bx owns.
     let home = guarded_home();
     own(home.path(), ".a", b"token\n", Mechanism::Own);
     std::fs::set_permissions(home.child(".a"), std::fs::Permissions::from_mode(0o600))
@@ -866,8 +866,8 @@ fn inputs_for_mode(home: &GuardedHome, mode: &str) -> Inputs {
 
 #[test]
 fn decision_23_a_create_names_every_directory_apply_creates_with_its_mode() {
-    // P42R1-D8. `apply` creates a target's missing parents, and no row
-    // said so, so plan did not announce every write apply made.
+    // `apply` creates a target's missing parents, so a row must say so, or
+    // plan would not announce every write apply makes.
     let home = guarded_home();
     let inputs = inputs(
         &home,
@@ -1504,7 +1504,7 @@ fn t13_an_apply_killed_at_any_journal_phase_recovers_to_the_clean_apply() {
 
 #[test]
 fn decision_34_a_declined_apply_over_a_finished_session_reports_pending_like_plan() {
-    // P42R2-D4, end to end, alongside decision_18's A2. A session whose
+    // End to end, alongside decision_18's A2. A session whose
     // writes all landed but whose ledger save did not: the journal is
     // sealed with an End frame, so `pending` reports it complete and every
     // row is Unchanged — recording a write touches no file.
@@ -1645,7 +1645,7 @@ fn every_state_path(state: &StateDir) -> Vec<PathBuf> {
 
 #[test]
 fn decision_33_a_fifo_at_any_file_under_the_state_directory_is_refused_without_waiting() {
-    // P42R2-D3 and P42R2-COV3. The guard used to name three files — the
+    // The guard used to name three files — the
     // ledger, the fingerprints and the journal — and the three tests that
     // exercised it mirrored that same list, so neither could find what the
     // list had missed: `bx plan` also reads <state>/restore/<digest>
@@ -1819,7 +1819,7 @@ fn t15_apply_refuses_a_held_state_directory_and_plan_reports_it_running() {
     let inputs = inputs(&home, &inline("~/.a", "x\\n"));
     let held = ExclusiveLock::acquire(inputs.state()).expect("the lock");
 
-    // P42R2-D5. The refusal comes before anything else the run would do.
+    // The refusal comes before anything else the run would do.
     // It used to come from `Session::open`, at the end: every target was
     // decided against a state directory the running apply was concurrently
     // changing, the whole plan was rendered, and the user was asked to
@@ -1943,7 +1943,7 @@ fn t20_exit_follows_the_mode_and_whether_apply_wrote() {
     assert_eq!(exit(&report_of(&[Unchanged]), Mode::Plan), Exit::Converged);
     assert_eq!(exit(&report_of(&[Create]), Mode::Plan), Exit::Pending);
 
-    // P42R2-D4 and P42R2-COV2. The table used to ask the interrupted report
+    // The table used to ask the interrupted report
     // under Mode::Plan only, and the unasked Mode::Apply cell was the wrong
     // one: a declined apply over a session that wrote everything but did
     // not record it has nothing but Unchanged rows, so it fell through to
@@ -1970,8 +1970,8 @@ fn t20_exit_follows_the_mode_and_whether_apply_wrote() {
         assert_eq!(exit(&recovered, Mode::Apply), Exit::Pending, "{complete}");
     }
 
-    // P42R2-D5. A run against another apply's held state directory decided
-    // its rows against a directory that apply is concurrently changing.
+    // A run against another apply's held state directory decides its rows
+    // against a directory that apply is concurrently changing.
     // Mode::Apply never reaches here — `run` refuses first — and a plan
     // that does must not contradict its own banner by reporting converged.
     let mut running = report_of(&[Unchanged]);

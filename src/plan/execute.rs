@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn a_progress_bar_asked_for_draws_on_the_terminal() {
-        // P42R1-COV1. `progress(3, true)` draws on standard error, which is a
+        // `progress(3, true)` draws on standard error, which is a
         // pipe under the test runner, so indicatif reports it hidden whatever
         // the branch chose; the branch is pinned through a terminal that is one.
         let seen = Terminal::default();

@@ -444,7 +444,7 @@ fn the_intent_is_synced_before_a_removal_unlinks_the_destination() {
 
 #[test]
 fn a_request_whose_destination_is_not_where_its_target_renders_is_refused() {
-    // Review round 3, item 2. The loader refuses such a journal, so a
+    // The loader refuses such a journal, so a
     // session that wrote one would leave an interruption nothing recovers.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
@@ -519,8 +519,8 @@ fn a_failed_append_poisons_the_session() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_failed_removal_intent_append_poisons_the_session_and_unlinks_nothing() {
-    // r3 coverage C7. The write path's failed append is pinned above; the
-    // removal's was not.
+    // The write path's failed append is pinned above; this pins the
+    // removal's.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let (portable, dest) = target(home.path(), ".conf");
@@ -614,11 +614,11 @@ fn holds_a_temporary_file(dir: &Path) -> bool {
 
 #[test]
 fn a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on() {
-    // r3 round 2, P9R4-D3. The directory lost write permission between
-    // the Intent and the publish, so the publish failed and left the
-    // temporary file the Intent names. Recovery could not unlink it and
-    // returned an Io error on every writing run, while `pending` called
-    // the write resolvable.
+    // The directory loses write permission between the Intent and the
+    // publish, so the publish fails and leaves the temporary file the
+    // Intent names. Recovery cannot unlink it, and returning an Io error
+    // for that would fail every writing run while `pending` called the
+    // write resolvable.
     use std::os::unix::fs::PermissionsExt as _;
 
     fn lose_write(dest: &Path) {
@@ -694,7 +694,7 @@ fn a_named_temp_recovery_cannot_unlink_is_left_and_the_rollback_goes_on() {
 
 #[test]
 fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
-    // Stack integration of #7's round 3: `Ledger::record` refuses a changed
+    // `Ledger::record` refuses a changed
     // file bx shares through a region with `PriorConflict`. The session
     // asked only after the rename, so the refusal arrived with bx's new
     // region already written over the user's edit.
@@ -776,7 +776,7 @@ fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
 
 #[test]
 fn an_edit_between_fill_and_publish_is_kept_and_recovery_rolls_nothing_back_over_it() {
-    // Stack integration of #8's round 3: `publish` re-checks the destination
+    // `publish` re-checks the destination
     // and returns `fs::Error::Changed` before the rename. Inside a session
     // that poisons like any publish error, keeps the edit, and leaves
     // recovery nothing to put back over it.
@@ -836,7 +836,7 @@ fn an_edit_between_fill_and_publish_is_kept_and_recovery_rolls_nothing_back_over
 
 #[test]
 fn an_edit_between_plan_and_the_sessions_stage_is_kept_poisons_and_recovery_touches_nothing() {
-    // Stack integration of #8's round 4: `stage` decides on the observation
+    // `stage` decides on the observation
     // plan compared, and a request carries it. An edit that lands after
     // plan and before the session stages is refused before anything is
     // staged, stored, announced or published.
@@ -900,7 +900,7 @@ fn an_edit_between_plan_and_the_sessions_stage_is_kept_poisons_and_recovery_touc
 
 #[test]
 fn a_session_keeps_one_set_of_the_directories_its_writes_created() {
-    // Stack integration of #8's round 4: a directory target applied after a
+    // A directory target applied after a
     // write beneath it is the `Create` plan announced only when both were
     // given one `fs::CreatedDirs`. The session holds that set for its life.
     let home = guarded_home();
@@ -933,7 +933,7 @@ fn a_session_keeps_one_set_of_the_directories_its_writes_created() {
 
 #[test]
 fn a_scope_entry_the_loader_would_refuse_is_refused_before_the_journal_exists() {
-    // r3 round 3, D1. `refusal` puts every `Begin.scope` entry through
+    // `refusal` puts every `Begin.scope` entry through
     // `check_against(home)` and refuses the *whole* journal when one
     // fails, so a session that wrote one could never be rolled back: the
     // next load reads `Unreadable`, `recover::resolve` returns `Nothing`,
@@ -1097,13 +1097,13 @@ fn umask_child() {
 
 #[test]
 fn a_directory_bx_will_not_remove_is_made_at_the_accounts_umask() {
-    // r3 round 6, D1/COV4/CL1/CL2. The path r3 round 5 made succeed
-    // created the user's own home through `fs::stage`, which `chmod`s past
+    // A write whose home is missing must not create the user's own home
+    // through `fs::stage`, which `chmod`s past
     // the `umask` on purpose — the right rule for a directory bx owns and
     // will remove again, and the wrong one for a directory bx neither
     // claims nor ever removes. `crate::state::dir::ensure_dir` already
     // documents the opposite rule for exactly this category of directory,
-    // so bx's two ancestor-making paths disagreed.
+    // and bx's two ancestor-making paths must agree.
     //
     // `umask(2)` is process-global and this suite runs in parallel, so the
     // umask is set for a child rather than here: `sh -c 'umask 077; exec …'`,
@@ -1138,7 +1138,7 @@ fn entry_created_dirs(state: &StateDir, home: &Path, portable: &Portable) -> Vec
 
 #[test]
 fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touched() {
-    // Stack integration of #7's round 4: a caller holding a `Ledger` gets
+    // A caller holding a `Ledger` gets
     // its home check. `Session::admit` puts the target, spelled as the
     // request spells it, through the same `check_against` that
     // `Ledger::check_record` applies, before anything is observed, so a
@@ -1194,7 +1194,7 @@ fn a_target_spelled_absolutely_under_the_home_is_refused_before_anything_is_touc
 
 #[test]
 fn a_hard_linked_decoy_at_a_blob_name_is_replaced_before_an_intent_names_it() {
-    // Stack integration of #7's round 3: a same-length file at
+    // A same-length file at
     // `restore/<digest>` that is a second hard link is not a blob bx wrote,
     // and the ledger's store stopped trusting one. The journal's own copy of
     // the length check still did, so an Intent named a blob holding the
@@ -1302,7 +1302,6 @@ fn a_failed_removal_keeps_the_ledger_entry_and_poisons_the_session() {
 
 #[test]
 fn a_damaged_ledger_that_cannot_be_moved_aside_stops_a_session_before_its_journal() {
-    // Stack integration of #8 @62de0aa, which carries #7's r3 round 1:
     // `Ledger::open` refuses a damaged ledger it cannot move aside with
     // `state::Error::CannotQuarantine` instead of resetting it. A session
     // opened over one must stop there, before its journal exists, so no
@@ -1344,9 +1343,9 @@ fn a_damaged_ledger_that_cannot_be_moved_aside_stops_a_session_before_its_journa
 
 #[test]
 fn an_edit_between_a_removals_intent_and_its_unlink_is_kept_and_recovery_touches_nothing() {
-    // Review round 5, item 1. `remove` observed, made the snapshot and the
-    // Intent durable, and unlinked with no second look, so an editor's save
-    // in that window was destroyed (18 of 300 racing runs).
+    // A `remove` that observed, made the snapshot and the Intent durable,
+    // and unlinked with no second look would destroy an editor's save in
+    // that window (18 of 300 racing runs did).
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let (portable, dest) = target(home.path(), ".conf");
@@ -1420,8 +1419,8 @@ fn an_edit_between_a_removals_intent_and_its_unlink_is_kept_and_recovery_touches
 
 #[test]
 fn a_removal_names_how_its_destination_moved_since_plan() {
-    // r3 coverage C2, extended for r3 coverage COV5: the third detail and
-    // the `planned.path != now.path` branch had no case. That branch is
+    // The third detail and the `planned.path != now.path` branch each need
+    // a case of their own. That branch is
     // the one that stops a removal running against an observation of a
     // different file.
     let home = guarded_home();
@@ -1506,7 +1505,8 @@ fn a_removal_names_how_its_destination_moved_since_plan() {
 
 #[test]
 fn a_directory_that_cannot_be_removed_for_another_reason_is_an_error() {
-    // Coverage review round 5, non-blocking.
+    // Only a directory that is gone or not empty is left quietly; any other
+    // `rmdir` failure is returned.
     let dir = tempfile::tempdir().expect("a tempdir");
     let parent = dir.path().join("locked");
     let child = parent.join("made");
@@ -1529,9 +1529,9 @@ fn a_directory_that_cannot_be_removed_for_another_reason_is_an_error() {
 
 #[test]
 fn a_claimed_directory_that_is_no_longer_a_directory_is_left_and_the_walk_goes_on() {
-    // r3 round 1, D1. `rmdir` on a symlink or a file is ENOTDIR, which was
-    // an error: `rm` unlinked the file through the link and then failed,
-    // and a rollback failed the same way on every run.
+    // `rmdir` on a symlink or a file is ENOTDIR. Treated as an error, `rm`
+    // would unlink the file through the link and then fail, and a rollback
+    // would fail the same way on every run.
     let dir = tempfile::tempdir().expect("a tempdir");
 
     // A claimed directory the user replaced with a link to an empty one.
@@ -1565,10 +1565,10 @@ fn a_claimed_directory_that_is_no_longer_a_directory_is_left_and_the_walk_goes_o
 
 #[test]
 fn a_removal_naming_a_directory_that_is_not_its_parent_is_refused_before_anything_is_touched() {
-    // r3 round 1, D2. The session checked a removal's destination but not
-    // its created directories, so it pruned an empty directory of the user's
-    // and wrote an Intent the loader refuses: the journal was then set
-    // aside, and the removed file was never put back.
+    // A session that checked a removal's destination but not its created
+    // directories would prune an empty directory of the user's and write an
+    // Intent the loader refuses: the journal would then be set aside, and
+    // the removed file never put back.
     let guard = guarded_home();
     for case in [
         "an unrelated directory",
@@ -1638,9 +1638,9 @@ fn a_removal_naming_a_directory_that_is_not_its_parent_is_refused_before_anythin
 
 #[test]
 fn a_claim_that_cannot_be_made_portable_is_an_error_not_dropped() {
-    // r3 coverage C3. No admitted removal and no believed journal reaches
-    // this since D2: every claim is a parent of a destination rendered
-    // under an absolute UTF-8 home, and every forgotten claim is a stored
+    // No admitted removal and no believed journal reaches this: every claim
+    // is a parent of a destination rendered under an absolute UTF-8 home,
+    // which the session checks, and every forgotten claim is a stored
     // `Portable` rendered under it. Pinned at the function, with a home
     // `Portable::from_path` refuses, so a claim is never silently lost.
     use std::os::unix::ffi::OsStrExt as _;
@@ -1682,8 +1682,8 @@ fn a_claim_that_cannot_be_made_portable_is_an_error_not_dropped() {
 
 #[test]
 fn a_claim_the_heir_holds_is_not_recorded_again_and_a_refused_record_is_an_error() {
-    // r3 round 2, P9R4-CV2. Neither the skip for a claim the heir already
-    // holds nor a `record` the ledger refuses was reached. The ledger's
+    // Both the skip for a claim the heir already holds and a `record` the
+    // ledger refuses need a case to reach them. The ledger's
     // lock file is replaced, so every `record` through it is refused with
     // WrongLock: the skip is the only way the first case can succeed, and
     // the second must say so rather than drop the claim.
@@ -1740,11 +1740,11 @@ fn a_claim_the_heir_holds_is_not_recorded_again_and_a_refused_record_is_an_error
 
 #[test]
 fn a_released_write_hands_on_the_directories_its_entry_claimed() {
-    // r3 round 3, D2 and CL2. `Session::write`'s released arm dropped the
-    // entry `forget` returns, and with it the entry's `created_dirs`, while
-    // `Session::remove` and `Session::forget` both carry theirs on. A
-    // directory bx made then had no claimant at all: no later `rm` could
-    // remove it, and recovery's rebuild could not either.
+    // `Session::write`'s released arm must carry on the `created_dirs` of
+    // the entry `forget` returns, as `Session::remove` and
+    // `Session::forget` both do. Dropped, a directory bx made would have no
+    // claimant at all: no later `rm` could remove it, and recovery's
+    // rebuild could not either.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let dir = home.child(".config/app");
@@ -1828,7 +1828,7 @@ fn a_released_write_hands_on_the_directories_its_entry_claimed() {
 
 #[test]
 fn a_prior_already_in_the_restore_store_is_not_written_again() {
-    // r3 coverage COV2. The skip arm keeps a repeat write from replacing a
+    // The skip arm keeps a repeat write from replacing a
     // blob another entry's prior or superseded snapshot already points at,
     // and keeps every `apply` from churning `restore/`. Only the rewrite
     // side was pinned; a mutant that always wrote passed the suite.
@@ -1869,7 +1869,7 @@ fn a_prior_already_in_the_restore_store_is_not_written_again() {
 
 #[test]
 fn a_ledger_that_refuses_after_a_publish_poisons_the_session_and_is_rolled_back() {
-    // r3 coverage COV8. The sharpest of `Session::write`'s error paths past
+    // The sharpest of `Session::write`'s error paths past
     // the point of no return: the destination is published, the Intent is
     // durable, no `Done` follows, and the ledger refuses. Recovery must
     // roll a landed write back from a journal with no `Done`, and the
@@ -1933,9 +1933,8 @@ fn a_ledger_that_refuses_after_a_publish_poisons_the_session_and_is_rolled_back(
 
 #[test]
 fn a_home_the_loader_would_refuse_never_reaches_a_begin_frame() {
-    // r3 round 4. The round-1 panel noted that `Session::open_locked`
-    // checks `Begin.scope` against the home but never checks the home
-    // itself, and declined to report it. It is not merely inert: the
+    // `Session::open_locked` checks `Begin.scope` against the home but
+    // never checks the home itself. That is not merely inert: the
     // session never opens. `Ledger::open` applies the same rule the loader
     // applies to `Begin.home` — absolute, and UTF-8 — and it runs *before*
     // `Journal::create`, so no header naming such a home is ever written.
@@ -1964,7 +1963,7 @@ fn a_home_the_loader_would_refuse_never_reaches_a_begin_frame() {
 
 #[test]
 fn a_session_counts_every_write_it_published() {
-    // Coverage review round 5, non-blocking.
+    // `written` is the count `finish` reports, so it must count every write.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let mut session = apply_session(&state, home.path());

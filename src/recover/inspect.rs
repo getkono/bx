@@ -793,9 +793,9 @@ mod tests {
 
     #[test]
     fn a_rebuild_over_a_ledger_at_the_same_digest_and_another_mode_records_the_mode() {
-        // r3 coverage COV6. `decide`'s already-saved skip is "the stored entry
-        // is at the intent's `after` digest *and mode*". No fixture differed
-        // in mode alone, so deleting the mode conjunct passed: a terminated
+        // `decide`'s already-saved skip is "the stored entry is at the
+        // intent's `after` digest *and mode*". Without a fixture that differs
+        // in mode alone, deleting the mode conjunct passes: a terminated
         // journal whose write changed only the mode, over a ledger at that
         // digest at the old mode, would be skipped and the mode change lost.
         //
@@ -863,8 +863,8 @@ mod tests {
 
     #[test]
     fn a_blocked_targets_note_names_both_states_it_could_legitimately_hold() {
-        // r3 coverage COV7. `note`'s "held {digest}" and "was to be removed"
-        // arms were never asserted, and they are the whole operator-facing
+        // `note`'s "held {digest}" and "was to be removed" arms are asserted
+        // here because they are the whole operator-facing
         // surface of a blocked recovery: the file, both legitimate digests,
         // and `abandon` as the way out.
         let home = guarded_home();
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn a_prior_snapshot_that_cannot_be_read_stops_recovery_as_an_error() {
-        // r3 coverage C10. A missing or corrupt snapshot is a verdict; any
+        // A missing or corrupt snapshot is a verdict; any
         // other failure to read one is an error, for the report and the
         // recovery alike, and nothing is changed.
         let home = guarded_home();
@@ -991,7 +991,7 @@ mod tests {
 
     #[test]
     fn a_terminated_journal_with_no_header_has_no_home_to_rebuild_against() {
-        // r3 coverage C12. The loader refuses a journal whose first frame is
+        // The loader refuses a journal whose first frame is
         // not its header, so no journal on disk reaches this. Pinned on a
         // hand-built value, so such a journal can only be refused, never rebuilt.
         let path = Path::new("/nonexistent/journal.mpk");
@@ -1156,8 +1156,8 @@ mod tests {
 
     #[test]
     fn every_standing_renders_a_sentence() {
-        // r3 coverage COV7. Non-empty was all this asserted, so any of the six
-        // could have been swapped for another and the suite stayed green.
+        // Asserting only non-empty would let any of the six be swapped for
+        // another with the suite still green.
         // Each reads as the predicate of a sentence whose subject is the path,
         // which is how `note` and `unreachable` both use it.
         for (standing, sentence) in [
@@ -1179,9 +1179,9 @@ mod tests {
 
     #[test]
     fn a_target_written_twice_in_one_session_is_refused_so_report_and_recovery_agree() {
-        // Review round 3, item 4. The second write used to land: the report then
-        // judged the first intent against the second write's bytes and said
-        // blocked, while the reverse-order rollback undid both and succeeded.
+        // Were the second write to land, the report would judge the first
+        // intent against the second write's bytes and say blocked, while the
+        // reverse-order rollback undid both and succeeded.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let dest = home.child(".conf");
@@ -1214,7 +1214,7 @@ mod tests {
 
     #[test]
     fn a_rebuild_that_would_adopt_a_changed_shared_file_is_blocked_and_keeps_the_prior() {
-        // Stack integration of #7's round 3: `record` refuses a changed Region
+        // `record` refuses a changed Region
         // or Include file with `PriorConflict`. A rebuild must give that one
         // verdict from `pending` and `recover` — a blocked write — and never
         // lose or replace the stored prior.
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn a_rebuild_whose_created_directory_cannot_be_made_portable_is_an_error() {
-        // r3 coverage C3. The loader refuses a journal whose created directory
+        // The loader refuses a journal whose created directory
         // is not a parent of its destination below its UTF-8 home, so no
         // journal on disk reaches this. Pinned at `decide`, so such a directory
         // is never dropped from a rebuilt entry.
@@ -1337,10 +1337,10 @@ mod tests {
 
     #[test]
     fn an_interrupted_removal_whose_parent_no_longer_resolves_is_blocked_not_an_error() {
-        // r3 round 2, P9R4-D4. The destination under a dangling link read as
-        // absent, so `pending` called the removal's rollback resolvable, and
-        // every recovery then failed writing through the link with
-        // UnusableParent, never naming `abandon`.
+        // Read as absent, the destination under a dangling link would make
+        // `pending` call the removal's rollback resolvable, and every recovery
+        // would then fail writing through the link with UnusableParent, never
+        // naming `abandon`.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let mut session = apply_session(&state, home.path());
@@ -1429,8 +1429,8 @@ mod tests {
 
     #[test]
     fn a_created_file_changed_after_the_crash_is_blocked_saying_it_did_not_exist() {
-        // r3 round 2, P9R4-CV3. `note`'s wording for a write that created its
-        // file was never reached. A created file that is gone again reads as
+        // `note`'s wording for a write that created its file, which nothing
+        // else reaches. A created file that is gone again reads as
         // `Prior`, so only an edit and a replacement block such a write.
         fn edited(dest: &Path) {
             plant_file(dest, "edited after the crash\n", Mode::DEFAULT_FILE);

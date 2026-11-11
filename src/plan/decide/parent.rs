@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn decision_24_a_file_whose_existing_parent_denies_its_owner_write_is_a_conflict() {
-        // P42R2-D1 and P42R2-COV1. The parent is on disk at a mode that denies
+        // The parent is on disk at a mode that denies
         // its owner write, and NO directory target declares it — the case the
         // declared-mode rule this replaces could not see, and the one that
         // occurs in real homes. At 5d1bba7 `plan` printed `Create` with no note

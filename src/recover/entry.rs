@@ -144,8 +144,7 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 /// [`journal::Error::InProgress`] naming a journal that belongs to a live run
 /// rather than to an interruption. Handing the guard to
 /// [`journal::Session::open_locked`] makes that error mean what it says: there
-/// was an interruption this run could not resolve. See `r3 round 3`
-/// decision 3.
+/// was an interruption this run could not resolve.
 ///
 /// Only the guard comes back. The recovery's [`Outcome`] is logged by
 /// [`resolve`] and not returned: no writing command has a channel to report it
@@ -338,7 +337,7 @@ mod tests {
 
     #[test]
     fn a_writing_command_holds_one_lock_across_its_recovery_and_its_session() {
-        // r3 round 3, CL3. A recovery followed by `Session::open` drops
+        // A recovery followed by `Session::open` drops
         // the state directory between the two, so a second bx could win it and
         // this one's session would refuse with `InProgress` naming a journal
         // that belongs to a live run rather than to an interruption.
@@ -356,10 +355,9 @@ mod tests {
         // What it does *not* establish is that a writing command uses the
         // pair: nothing in the type system says so, and `restore` being the
         // only writing command at this revision is what makes it true today.
-        // What narrows it is that `lock_for_writing` is now the only call that
-        // refuses a blocked recovery — `before_writing`, which did the same
-        // and released the lock, had no caller but a test and is gone
-        // (`r3 round 5`, CL1).
+        // What narrows it is that `lock_for_writing` is the only call that
+        // refuses a blocked recovery, so no other path refuses one and then
+        // releases the lock.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let dest = home.child(".conf");
@@ -582,10 +580,10 @@ mod tests {
 
     #[test]
     fn a_journal_whose_paths_are_not_its_targets_is_set_aside_and_touches_nothing() {
-        // Review round 3, item 2. Each of these was believed: rollback acted on
-        // the stored destination, temporary file and created directories with
-        // nothing tying them to the intent's target, and a journal with no
-        // header was checked against nothing at all.
+        // Believing any of these would let rollback act on a stored
+        // destination, temporary file or created directory that nothing ties
+        // to the intent's target, or check a journal with no header against
+        // nothing at all.
         let guard = guarded_home();
         let evil = b"EVIL\n";
         let reference = RestoreRef {
@@ -696,7 +694,7 @@ mod tests {
 
     #[test]
     fn recovery_under_another_spelling_of_the_home_refuses_and_moves_nothing() {
-        // Stack integration of #7's round 3: a ledger storing a path the home
+        // A ledger storing a path the home
         // cannot use is `Error::ForeignPath`, never a reset. A terminated
         // journal's rebuild opens the ledger under the lock with the journal's
         // home, so it must stop there with the ledger and the journal in place.
@@ -775,7 +773,7 @@ mod tests {
 
     #[test]
     fn a_rollback_over_a_ledger_from_a_newer_bx_reads_only_the_journal_and_renames_nothing() {
-        // Stack integration of #7's round 4: a ledger a newer bx wrote is
+        // A ledger a newer bx wrote is
         // `Error::FutureVersion` and is never quarantined. An unterminated
         // journal is rolled back from the journal and the restore blobs alone,
         // so the rollback still completes; the next command that opens the
@@ -837,7 +835,7 @@ mod tests {
 
     #[test]
     fn a_terminated_journal_over_a_ledger_from_a_newer_bx_stops_and_quarantines_nothing() {
-        // Stack integration of #7's round 4: a terminated journal's bookkeeping
+        // A terminated journal's bookkeeping
         // writes the ledger, so it opens it, and a newer format stops the report,
         // the recovery and every writing command, with nothing moved.
         let home = guarded_home();
@@ -871,7 +869,7 @@ mod tests {
 
     #[test]
     fn a_damaged_ledger_is_only_reported_without_the_lock_and_quarantined_under_it() {
-        // Stack integration of #7's round 3: a lockless read returns
+        // A lockless read returns
         // `Health::Damaged` and moves nothing; only the lock holder quarantines.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -915,7 +913,6 @@ mod tests {
 
     #[test]
     fn a_damaged_ledger_that_cannot_be_moved_aside_stops_recovery_and_keeps_the_journal() {
-        // Stack integration of #8 @62de0aa, which carries #7's r3 round 1:
         // `Ledger::open` refuses a damaged ledger it cannot move aside with
         // `state::Error::CannotQuarantine`. A terminated journal's bookkeeping
         // opens the ledger, so recovery must stop there: the ledger keeps its
@@ -973,9 +970,9 @@ mod tests {
 
     #[test]
     fn two_successive_torn_journals_are_both_rolled_back_and_kept_and_bx_writes_afterwards() {
-        // #9's round-3 review: the set-aside name was checked before the
-        // rollback, so a second torn journal blocked recover, rm, abandon and
-        // every session while the machine stayed half-applied. Recovery rolls
+        // Checking the set-aside name before the rollback would let a second
+        // torn journal block recover, rm, abandon and every session while the
+        // machine stayed half-applied. Recovery rolls
         // back first and sets the journal aside last, under the next free name.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1078,9 +1075,8 @@ mod tests {
 
     #[test]
     fn abandoning_twice_keeps_both_set_aside_journals() {
-        // Review round 3, item 5. The set-aside name was fixed, and the second
-        // abandon renamed its journal over the first. Round 3 refused the
-        // second abandon instead; since #7's numbered names integrated, it
+        // A fixed set-aside name would let the second abandon rename its
+        // journal over the first. With numbered names the second abandon
         // succeeds and takes the next free name, and both journals survive.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
@@ -1119,9 +1115,9 @@ mod tests {
 
     #[test]
     fn a_damaged_frame_length_never_loses_the_journal() {
-        // Review round 3, item 3. A length byte flipped in either frame read as
-        // a torn tail: recovery rolled back nothing and unlinked the journal,
-        // leaving the user's original only as a blob nothing named.
+        // A length byte flipped in either frame must not read as a torn tail:
+        // recovery would roll back nothing and unlink the journal, leaving the
+        // user's original only as a blob nothing named.
         let guard = guarded_home();
         for (case, frame) in [("the first frame", 0), ("a later frame", 1)] {
             let home = guard.child(case.replace(' ', "-"));
@@ -1156,8 +1152,8 @@ mod tests {
 
     #[test]
     fn a_byte_flipped_inside_a_frame_is_not_believed() {
-        // Review round 3, item 3. Without a checksum this still decoded, as the
-        // mode the rollback then put the user's original back at.
+        // Without a checksum this still decodes, as the mode the rollback
+        // would then put the user's original back at.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let (dest, mut bytes) = interrupted_modify(&state, home.path());
@@ -1191,9 +1187,9 @@ mod tests {
 
     #[test]
     fn an_unreadable_journal_is_reported_by_plan_and_set_aside_by_the_next_session() {
-        // Review round 4, item 2. `pending` said there was no session, and the
-        // only word of the journal was a warning below the default log level,
-        // so `plan` exited clean over a journal the next `apply` then set aside.
+        // Were `pending` to say there is no session, the only word of the
+        // journal would be a warning below the default log level, and `plan`
+        // would exit clean over a journal the next `apply` then set aside.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         state.ensure().expect("ensure");
@@ -1230,10 +1226,10 @@ mod tests {
 
     #[test]
     fn a_zero_filled_tail_after_whole_frames_is_rolled_back_then_kept() {
-        // Review round 4, item 1. A power loss that zero-fills the unsynced last
-        // frame left bytes that fail its checksum. Round 3 read that as damage:
-        // the journal was set aside with nothing rolled back, so `.a` kept bx's
-        // bytes, the ledger had no entry for it, and `rm` called it unmanaged.
+        // A power loss that zero-fills the unsynced last frame leaves bytes
+        // that fail its checksum. Read as damage, the journal would be set
+        // aside with nothing rolled back, so `.a` kept bx's bytes, the ledger
+        // had no entry for it, and `rm` called it unmanaged.
         let guard = guarded_home();
         for (case, zeroed_done_of_a) in [("the Intent of .b", false), ("the Done of .a", true)] {
             let home = guard.child(case.replace(' ', "-"));
@@ -1299,9 +1295,10 @@ mod tests {
 
     #[test]
     fn a_torn_journal_whose_first_set_aside_name_is_taken_is_recovered_and_kept_beside_it() {
-        // Round 3 refused this recovery until the user moved the earlier file.
-        // With #7's numbered names nothing is in the way: the rollback runs and
-        // the torn journal takes the next free name, the earlier file intact.
+        // A fixed set-aside name would refuse this recovery until the user
+        // moved the earlier file. With numbered names nothing is in the way:
+        // the rollback runs and the torn journal takes the next free name,
+        // the earlier file intact.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let (dest, mut bytes) = interrupted_modify(&state, home.path());
@@ -1328,10 +1325,10 @@ mod tests {
 
     #[test]
     fn a_stale_whole_frame_from_an_earlier_journal_in_the_tail_still_rolls_back_the_prefix() {
-        // Review round 5, item 3. After a power loss the unsynced tail can hold
-        // blocks of an earlier, deleted journal. A whole frame from it validated,
-        // so the damaged last frame was read as mid-log damage: the journal was
-        // set aside as unreadable and the half-applied `.a` was never rolled back.
+        // After a power loss the unsynced tail can hold blocks of an earlier,
+        // deleted journal. A whole frame from it validates, so the damaged last
+        // frame could read as mid-log damage: the journal set aside as
+        // unreadable and the half-applied `.a` never rolled back.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let (a, b) = (home.child(".a"), home.child(".b"));
@@ -1386,9 +1383,9 @@ mod tests {
 
     #[test]
     fn a_journal_a_newer_bx_wrote_is_refused_and_nothing_is_set_aside_or_rolled_back() {
-        // Review round 5, item 2. A newer format byte read as damage: the next
-        // session set the journal aside with nothing rolled back, discarding a
-        // newer bx's interrupted session.
+        // A newer format byte must not read as damage: the next session would
+        // set the journal aside with nothing rolled back, discarding a newer
+        // bx's interrupted session.
         let home = guarded_home();
         let state = StateDir::resolve(home.path());
         let a = home.child(".a");

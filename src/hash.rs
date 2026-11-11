@@ -129,9 +129,8 @@ impl ContentHash {
 /// A table lookup rather than `char::from_digit(..).unwrap_or('0')`: the
 /// callers only ever pass four bits, so the fallback was unreachable by
 /// construction — which is another way of saying no test could reach it and a
-/// mutant changing the character it produced survived the whole suite
-/// (r4 round 1, COV7). Indexing a 16-entry table with four bits has no arm to
-/// leave unreached.
+/// mutant changing the character it produced survived the whole suite.
+/// Indexing a 16-entry table with four bits has no arm to leave unreached.
 fn nibble(value: u8) -> char {
     char::from(b"0123456789abcdef"[usize::from(value & 0x0f)])
 }
@@ -181,8 +180,7 @@ impl<'de> Deserialize<'de> for ContentHash {
 /// serde's default forwards to [`Visitor::visit_bytes`], which is where the
 /// length check lives — so an override was a second copy of nothing, reachable
 /// through no decode path in the crate and pinnable by no test: a mutant
-/// returning a zero digest from it survived the whole suite (r4 round 1,
-/// COV7).
+/// returning a zero digest from it survived the whole suite.
 struct ContentHashVisitor;
 
 impl Visitor<'_> for ContentHashVisitor {
@@ -257,7 +255,7 @@ mod tests {
 
     #[test]
     fn every_hex_character_is_the_one_chmod_and_ls_would_show() {
-        // r4 round 1 (COV7): `nibble`'s fallback was unreachable by
+        // `nibble`'s fallback was unreachable by
         // construction, so a mutant changing the character it produced
         // survived the whole suite — and the digests the tests compare against
         // exercise only the sixteen characters between them by luck. Pin all
@@ -282,7 +280,7 @@ mod tests {
 
     #[test]
     fn a_digest_decodes_from_a_stream_as_well_as_a_slice() {
-        // r4 round 1 (COV7): the crate decodes only from slices, so nothing
+        // The crate decodes only from slices, so nothing
         // pinned what a stream does — including that the length check still
         // applies there. It reaches `visit_bytes` too, which is why the
         // `visit_byte_buf` override this visitor used to carry was unreachable
@@ -316,8 +314,8 @@ mod tests {
 
     #[test]
     fn a_bad_low_nibble_after_a_good_high_one_is_rejected() {
-        // r3 round 1 (C9): every earlier bad pair failed on its high nibble,
-        // so the low nibble's check was never reached on its own.
+        // Every other bad pair fails on its high nibble, so without this the
+        // low nibble's check is never reached on its own.
         let low = format!("0z{}", "0".repeat(62));
         assert_eq!(ContentHash::from_hex(&low), None);
         let last = format!("{}0z", "0".repeat(62));
@@ -380,9 +378,9 @@ mod tests {
 
     #[test]
     fn digests_order_by_their_bytes() {
-        // r4 round 2 (COV3): this sorted the array and asserted it was sorted,
-        // which holds for any total order — a reversed `Ord` included — so the
-        // impl was executed and constrained by nothing. The expected
+        // Sorting the array and asserting it is sorted holds for any total
+        // order — a reversed `Ord` included — so it would execute the impl
+        // and constrain nothing. The expected
         // permutation is asserted instead, against the digests' own bytes.
         let (a, b, c) = (
             ContentHash::of(b"a"),

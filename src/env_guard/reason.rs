@@ -91,7 +91,7 @@ pub enum Reason {
     /// is judged for being a root. Nothing is asked of a location's whole value
     /// after that, because nothing asked there could refuse: once no entry is a
     /// root itself, the whole value and its parent lie inside the root the
-    /// first entry lies beneath (#47 round 3).
+    /// first entry lies beneath.
     #[error("is a declared root itself, and its tool may write beside it, outside every root")]
     DeclaredRootItself,
     /// Empty, a bare word, a URL, or a relative path, where a path that can be
@@ -202,7 +202,7 @@ mod tests {
     /// That is why `the_reasons_render_as_sentences` walks a chain instead of
     /// asserting a list of variants: a list can be short by one and still
     /// compile, and that is exactly how `InsideConfigRepo` came to be the one
-    /// message no test asserted (round-2 note COV2) under an earlier repair
+    /// message no test asserted, under an earlier repair
     /// that had claimed every message was pinned. A list of *n* things that
     /// was a list of *n - 1* last time is evidence the list is the wrong
     /// shape.
@@ -319,7 +319,7 @@ mod tests {
     ///
     /// The exhaustive `match` in [`sentence_and_next`] forces a new [`Reason`]
     /// to be given a *sentence*. It does not force the variant to be any arm's
-    /// `next`, and round 3 proved exactly that: a variant added with an
+    /// `next`, and that has happened: a variant added with an
     /// `#[error]` and a terminating arm, chained from nothing, left the suite
     /// green because the count it was checked against was the hand-written
     /// `20`. **A mechanism built to replace a list must not contain a list**,
@@ -370,7 +370,7 @@ mod tests {
     /// The same census, over any source text.
     ///
     /// Split out from [`declared_reasons`] for one reason: **the census had no
-    /// defender**. Round 5 measured that deleting both the comment strip and
+    /// defender**. Deleting both the comment strip and
     /// the whole cross-check below left the suite at 567 passed, 0 failed —
     /// and that is the structural reason this one defect has now recurred
     /// three times. Every generation was a better mechanism than the last, and
@@ -395,7 +395,7 @@ mod tests {
             .map(|line| line.trim())
             // A trailing `// note` is legal, `cargo fmt` keeps it, and reading
             // the line without dropping it hid `ProbeVariant, // note` from
-            // round 4's probe entirely.
+            // the census entirely.
             .map(|line| line.split("//").next().unwrap_or(line).trim())
             .filter_map(|line| line.strip_suffix(','))
             // A variant is `Name,` or `Name(Type),`. Doc comments, `#[error]`
@@ -421,8 +421,8 @@ mod tests {
         // lines. Two counts from one source: a variant that hides from the
         // name scrape has to hide from the message count as well.
         //
-        // **What that does and does not buy, stated exactly.** Round 5 found
-        // generation five: `#[error ("probe")]` — a space before the paren —
+        // **What that does and does not buy, stated exactly.** A fifth
+        // generation got past it: `#[error ("probe")]` — a space before the paren —
         // with `ProbeVariant /* note */,` moved *both* counts together, and
         // the claim written here, that nothing hiding a message attribute
         // still compiles, was false. It compiles. The whitespace is tolerated
@@ -469,7 +469,7 @@ mod tests {
 
     #[test]
     fn the_census_reads_past_a_trailing_comment() {
-        // Round 4's probe, now inside the suite. Deleting the `//` strip in
+        // A reviewer's out-of-tree probe, now inside the suite. Deleting the `//` strip in
         // `reasons_declared_in` makes this fail: the variant stops being
         // counted as a name while its message is still counted, so the
         // cross-check fires.
@@ -480,7 +480,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a variant the scrape cannot see")]
     fn the_census_refuses_a_declaration_it_cannot_account_for() {
-        // Round 4's probe C: a block comment, which the `//` strip does not
+        // A block comment, which the `//` strip does not
         // touch, so the name scrape cannot see the variant at all. Only the
         // cross-count catches it — deleting the cross-check makes this fail,
         // which is what the census lacked for three generations.
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a variant the scrape cannot see")]
     fn the_census_sees_a_message_attribute_however_it_is_spaced() {
-        // Round 5's generation five: `#[error (` moved both counts together,
+        // The fifth generation: `#[error (` moved both counts together,
         // so the cross-check agreed with itself and the variant hid. The
         // message count tolerates the space now, so the counts disagree and
         // the hidden variant is named.

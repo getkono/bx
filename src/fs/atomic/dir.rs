@@ -1494,7 +1494,7 @@ mod tests {
         // spelling below names one directory to the kernel, and now to this set.
         //
         // What this pins is `DirKey::of`'s normalisation. It is not a test of
-        // `Path`'s component-wise `Ord`: measured at r4 round 2, a key holding
+        // `Path`'s component-wise `Ord`: measured, a key holding
         // raw `OsStr` bytes passes this as long as it normalises, and fails
         // only when it does neither.
         let home = guarded_home();

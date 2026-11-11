@@ -234,7 +234,7 @@ pub enum Damage {
 /// impl and both of its arms in [`judge`] were branches no input could take and
 /// no test could pin, and the `Loss::Permanent` guard it carried was a second
 /// copy of the one on the decode path with nothing able to establish the two
-/// agreed (r4 round 2, D8).
+/// agreed.
 #[derive(Debug)]
 pub(crate) enum Rejected {
     /// The rows the check rejected, which it has already removed from the
@@ -253,10 +253,10 @@ pub(crate) enum Rejected {
     /// reset. A `debug_assert` in [`judge`] holds a `check` to it.
     ///
     /// **A `check` therefore cannot report whole-file damage** — the variant
-    /// that could was deleted in r4 round 2 (D8) because nothing constructed
-    /// it, and this is the consequence, recorded rather than left to be
-    /// discovered (r4 round 3, CL1). Clearing the value and returning a
-    /// non-row `Damage` here is not a way round it: the `debug_assert` refuses
+    /// that could was deleted because nothing constructed it, and this is the
+    /// consequence, recorded rather than left to be discovered. Clearing the
+    /// value and returning a non-row `Damage` here is not a way round it: the
+    /// `debug_assert` refuses
     /// exactly that, because `is_partial` would then say the rows named are
     /// the whole loss when nothing was named and everything was lost. A check
     /// that genuinely needs it — one that can tell the whole file is
@@ -282,10 +282,10 @@ impl Damage {
     ///
     /// A `true` here does **not** promise the value is non-empty: a file whose
     /// every row was damaged keeps none. It promises that what the rows name
-    /// is the whole of what was lost (r4 round 2, D2 and CL4) — which is why a
-    /// `check` that finds two kinds of row damage at once reports one and acts
-    /// on only that one, leaving the other for the next load
-    /// (r4 round 3, D1).
+    /// is the whole of what was lost — which is why a `check` that finds two
+    /// kinds of row damage at once reports one and acts on only that one,
+    /// leaving the other for the next load: acting on both while naming one
+    /// would make that promise false.
     ///
     /// What a row costs is the variant's own business: a
     /// [`Damage::KeyMismatch`] row costs its whole entry, and a
@@ -360,7 +360,7 @@ impl std::fmt::Display for Damage {
 /// value then holds every row that checked out. [`Damage::is_partial`] is what
 /// tells the two apart, and `health.damage().is_some_and(Damage::is_partial)`
 /// is the question a `plan` or a `doctor` has to ask before it tells a user
-/// that nothing bx wrote survived (r4 round 2, D2 and CL4).
+/// that nothing bx wrote survived.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
     /// There was no file. The value is the empty default, and nothing is wrong.
@@ -452,7 +452,7 @@ pub struct Loaded<T> {
     ///
     /// The cause travels with it: `EACCES` is a `chmod` the user can make, and
     /// `EIO` or `EMFILE` are not, and a caller that only logs would otherwise
-    /// have to say "could not be listed" and stop there (r4 round 2, CL5).
+    /// have to say "could not be listed" and stop there.
     pub unlisted: Option<Unlisted>,
 }
 
@@ -638,8 +638,8 @@ fn judge<T: DeserializeOwned + Default>(
             // is not a directory — a plain file at `~/.local/state/bx`, say.
             // "reading ~/.local/state/bx/ledger.mpk: Not a directory" names a
             // file inside a file and no remedy, while `Error::NotADirectory`
-            // says exactly the right thing and, until now, was raised only from
-            // `ensure_dir` — which a lockless read never calls (r4 round 2, D5).
+            // says exactly the right thing and is otherwise raised only from
+            // `ensure_dir` — which a lockless read never calls.
             if source.raw_os_error() == Some(rustix::io::Errno::NOTDIR.raw_os_error())
                 && let Some(blocking) = not_a_directory_above(path)
             {
@@ -912,8 +912,7 @@ fn degrade<T>(
 ///
 /// The check is `#[cfg(test)]` **at its call site**, so what it binds is
 /// *every save a test makes* — not every payload type. A payload type whose
-/// tests read and check but never save is not reached by it at all
-/// (r4 round 4, CL3, correcting a stronger claim this paragraph used to make).
+/// tests read and check but never save is not reached by it at all.
 /// [`assert_saves_identically`] is what such a type's test module still has to
 /// call, and the two together are the obligation.
 ///
@@ -929,7 +928,7 @@ fn degrade<T>(
 ///   `HashSet` is in hash order, and two independent builds of it differ — a
 ///   real Invariant 3 breach — but a `Vec` decodes in its stored order and
 ///   re-encodes identically, so no number of re-encodings here can see it. A
-///   64-element case was accepted 20 saves out of 20 (r4 round 4, D1).
+///   64-element case was measured accepted 20 saves out of 20.
 ///   [`assert_saves_identically`] catches it, because it builds twice, and
 ///   `the_two_construction_assertion_refuses_an_order_dependent_sequence`
 ///   pins that it does. This is the class that makes the second mechanism
@@ -942,7 +941,7 @@ fn degrade<T>(
 /// stated here, once, rather than delegated: this function's list used to send
 /// sequences to [`assert_saves_identically`] while that function's list sent
 /// default-left fields back here, so a reader following either arrived at the
-/// other and the intersection was named nowhere (r4 round 5, COV3).
+/// other and the intersection was named nowhere.
 ///
 /// It **is** reachable and it **does** break Invariant 3: a `Vec` drained from
 /// a `HashSet` differs between two runs, and leaving it at its default in the
@@ -999,7 +998,7 @@ pub(crate) fn save<T: Serialize + DeserializeOwned>(
 /// How many times [`reencodes_identically`] decodes and re-encodes.
 ///
 /// One decode is not enough, and saying it was is what made [`save`]'s
-/// documented catch boundary false (r4 round 4, D1). A `HashMap` of *n* keys
+/// documented catch boundary false. A `HashMap` of *n* keys
 /// built twice iterates the same way often enough to matter at small *n*:
 /// measured over 3000 independent constructions per size, two builds are
 /// **detected as differing** 0/3000 times at one key, 1321/3000 at two,
@@ -1064,7 +1063,7 @@ fn reencodes_identically<T: Serialize + DeserializeOwned>(
 /// byte-identical guarantee rests on each of them choosing `BTreeMap`, and
 /// `save` can impose no bound that says so: `Serialize` says nothing about
 /// iteration order. A shared assertion is what a later payload type has to
-/// pass rather than remember (r4 round 1, CL9).
+/// pass rather than remember.
 ///
 /// `make` is called twice, rather than one value being saved twice, and that
 /// is what gives the assertion its teeth. One `HashMap` iterates the same way
@@ -1077,25 +1076,25 @@ fn reencodes_identically<T: Serialize + DeserializeOwned>(
 /// must construct, never clone. `HashMap::clone` copies the hasher and the
 /// bucket layout along with the contents, so two clones of one value iterate
 /// identically and a hash-ordered payload passes — which is exactly how both
-/// real call sites defeated this assertion when they read `|| value.clone()`
-/// (r4 round 2, D1). Build enough keys, too: two independently built maps are
-/// detected as differing 1321 times in 3000 at two keys, 2746 at four, and
-/// 3000 at eight and sixteen (r4 round 4), so a fixture below eight keys is
-/// a flaky assertion rather than a strong one.
+/// real call sites defeated this assertion when they read `|| value.clone()`.
+/// Build enough keys, too: two independently built maps are measured as
+/// differing 1321 times in 3000 at two keys, 2746 at four, and 3000 at eight
+/// and sixteen (see [`REENCODES`]), so a fixture below eight keys is a flaky
+/// assertion rather than a strong one.
 ///
 /// # What this does *not* establish, and what does
 ///
 /// It proves nothing about a field `make` leaves empty. A constructor that
 /// builds the fields it knew about and leaves a newly added `HashMap` at its
 /// default satisfies this assertion while saying nothing about it — the third
-/// way a call site has satisfied the obligation vacuously (r4 round 3, D3).
+/// way a call site has satisfied the obligation vacuously.
 /// For a **map**, [`save`]'s own re-encoding check covers it the moment
 /// anything populates the field. For a **sequence**, nothing does: a
 /// default-left order-dependent sequence is caught by neither mechanism, is a
 /// real Invariant 3 breach, and is stated in full under [`save`]'s heading
 /// "The one class neither mechanism catches" — which is the single place it is
-/// written down, because two lists delegating to each other is how it went
-/// unnamed until r4 round 5 (COV3).
+/// written down, because two lists delegating to each other is how it once
+/// went unnamed.
 ///
 /// What this adds, and the reason it stays rather than being subsumed: `save`'s
 /// check works on **one** value, and this works on **two independently built**
@@ -1106,7 +1105,7 @@ fn reencodes_identically<T: Serialize + DeserializeOwned>(
 /// Each mechanism has a test that fails when **only that one** is removed:
 /// `a_hash_ordered_payload_is_refused_by_saves_own_check` for `save`'s, and
 /// `the_two_construction_assertion_refuses_an_order_dependent_sequence` for
-/// this one (r4 round 4, COV1).
+/// this one.
 ///
 /// [`save`] itself is called, rather than the encoder, so the property pinned
 /// is the one the file on disk has.
@@ -1137,7 +1136,7 @@ pub(crate) fn assert_saves_identically<T: Serialize + DeserializeOwned>(
 /// Beside [`assert_saves_identically`] and for the same reason: the harness
 /// was private to `store.rs`'s own test module, so the `tracing::warn!` in
 /// `dir::tighten` and the one in `lock::open_lock_file` could be deleted
-/// whole and the suite stayed green (r4 round 2, COV1).
+/// whole and the suite stayed green.
 #[cfg(test)]
 pub(crate) mod capture {
     /// A `tracing` sink that keeps what was written to it.
@@ -1147,7 +1146,7 @@ pub(crate) mod capture {
     /// zero times: the enabled-check ran, found no subscriber, and the body
     /// never did. Deleting a warning whose text the module documentation and
     /// `state/mod.rs` both state as part of the contract left the whole suite
-    /// green (r4 round 1, COV2).
+    /// green.
     struct Sink;
 
     thread_local! {

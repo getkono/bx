@@ -3,12 +3,11 @@
 
 /// `text` with its comments removed, line by line, carrying block state.
 ///
-/// Written because a `//`-prefix test is not comment handling: round 5
-/// found that the tripwire below both **missed** a caller after a block
-/// comment opened and **false-positived** on the module's name inside one.
-/// That is the same blind spot the `Reason` census had, reappearing in the
-/// round's other new mechanism — so it is fixed the same way, with a test
-/// that fails when it is removed.
+/// Written because a `//`-prefix test is not comment handling: with one, the
+/// tripwire below both **missed** a caller after a block comment opened and
+/// **false-positived** on the module's name inside one. That is the same
+/// blind spot the `Reason` census had, reappearing in another mechanism —
+/// so it is fixed the same way, with a test that fails when it is removed.
 ///
 /// It skips string literals — escaped, raw, byte and spanning lines — and
 /// char literals, keeping their text as code, so a `//` or `/*` inside one
@@ -191,8 +190,8 @@ fn comments_are_stripped_however_they_are_written() {
 /// Whether `code` names this module in a position a Rust path can use.
 ///
 /// `env_guard::…`, `use …env_guard;`, `use …env_guard as g;` and
-/// `use …{env_guard, …}` — every way a path reaches in, the alias round-5
-/// note D1 found included. A bare mention in prose is not one of them, and
+/// `use …{env_guard, …}` — every way a path reaches in, the alias
+/// included. A bare mention in prose is not one of them, and
 /// matching bare names reported a diagnostic string in `config::values` as
 /// a caller.
 fn names_the_guard(code: &str) -> bool {
@@ -246,9 +245,9 @@ fn every_site_that_reaches_the_guard_is_known() {
     // that gave `Gen` its variants closed the exemption for an exported
     // anchor first, so that fact no longer caps anything and is not held.
     //
-    // Round-4 note COV3: that was prose, and prose is the same shape as
-    // the premise the exemption itself is criticised for. Round-5 note D1:
-    // the first version searched for `env_guard::` after a `//` test, so
+    // Held as prose, that fact would be the same shape as the premise the
+    // exemption itself is criticised for, so it is a census. An earlier
+    // version searched for `env_guard::` after a `//` test, so
     // `use crate::env_guard as guard;` followed by `guard::scan("")` — a
     // real caller — passed it. It searches for the module's *name* now, in
     // comment-free code, which catches the alias at its `use` line.

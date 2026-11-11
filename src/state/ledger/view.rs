@@ -140,14 +140,14 @@ impl LedgerView {
     /// [`check_created_dirs`] refuses one on the way in, so a stored one is
     /// not something bx wrote; left in place it would be sorted among real
     /// ancestors by a depth that says nothing about it, and `bx rm` would
-    /// remove a directory it never created for that target. The rule was
-    /// enforced on the write path and nowhere on the load path, which is the
-    /// half that faces untrusted bytes (r4 round 2, D9).
+    /// remove a directory it never created for that target. The rule is
+    /// enforced on the load path as well as the write path, because the load
+    /// path is the half that faces untrusted bytes.
     ///
     /// Dropping the whole entry for it would take the user's displaced bytes
     /// out of the index — the one thing recomputation cannot rebuild — to be
     /// rid of a bad directory name, which is a larger degradation than the
-    /// damage and is what decision 52 forbids (r4 round 3, D2 and CL4).
+    /// damage and is what decision 52 forbids.
     ///
     /// # One damage is reported, and it is the whole of what was lost
     ///
@@ -160,8 +160,7 @@ impl LedgerView {
     /// a [`Ledger::save`], which warns, or the next load, which reports
     /// [`crate::state::Damage::UnrelatedCreatedDirs`]. Two passes to converge on a
     /// tampered file, and every report along the way is true. Acting on both while
-    /// naming one was the round-2 shape, and it made `is_partial`'s promise
-    /// false (r4 round 3, D1).
+    /// naming one would make `is_partial`'s promise false.
     ///
     /// **What that costs, and where it is paid.** Between the two loads the
     /// returned value holds a row bx has not yet reported anything about, and
@@ -169,10 +168,10 @@ impl LedgerView {
     /// happens. So **every** write refuses to carry it: [`Ledger::record`]
     /// through `merge_created_dirs`, before the entry is handed back, and
     /// [`Ledger::save`] before the bytes reach the file. bx therefore never
-    /// writes a file it would go on to call damaged. Round 4 put the rule on
-    /// `record` alone and said that was the whole exposure; it was not —
-    /// opening a ledger and saving it without re-recording that row wrote the
-    /// stray out, and the reread reported it (r4 round 5, D1 and CL1). The
+    /// writes a file it would go on to call damaged. The rule on `record`
+    /// alone would not be the whole exposure — opening a ledger and saving it
+    /// without re-recording that row would write the stray out, and the
+    /// reread would report it. The
     /// exposure that remains is the returned value itself, in memory, for the
     /// life of one run. `bx rm`, which removes the directories `created_dirs`
     /// names, opens the ledger through this same load, so it acts only on a
@@ -232,7 +231,7 @@ impl LedgerView {
         // not the entry. The entry's prior is the user's displaced bytes and
         // the one thing recomputation cannot rebuild; dropping it to be rid of
         // a bad directory name would be a larger degradation than the damage,
-        // which is exactly what decision 52 forbids (r4 round 3, D2/CL4).
+        // which is exactly what decision 52 forbids.
         let stray = self.strip_unrelated_created_dirs();
         if !stray.is_empty() {
             return Err(Rejected::PartialDamage(
@@ -249,7 +248,7 @@ impl LedgerView {
     /// The one statement of the rule on the value, so that the load path,
     /// which reports it as [`crate::state::Damage::UnrelatedCreatedDirs`], and the
     /// write path, which refuses to put it on disk, cannot disagree about what
-    /// a stray is (r4 round 5, D1).
+    /// a stray is.
     pub(super) fn strip_unrelated_created_dirs(&mut self) -> Vec<(String, String)> {
         let mut stray = Vec::new();
         for entry in self.entries.values_mut() {
@@ -395,9 +394,9 @@ mod tests {
 
     #[test]
     fn a_flipped_version_bit_names_a_way_out_and_says_the_version_looks_damaged() {
-        // Review round 5: one flipped bit in the envelope's version byte made
-        // an intact ledger `FutureVersion` forever, and the only remedy named
-        // — run a newer bx — does not exist.
+        // One flipped bit in the envelope's version byte must not make an
+        // intact ledger `FutureVersion` forever, naming as the only remedy a
+        // newer bx that does not exist.
         #[derive(Serialize)]
         struct Newer<T> {
             kind: &'static str,
@@ -464,7 +463,7 @@ mod tests {
 
     #[test]
     fn a_ledger_link_that_loops_or_runs_through_a_file_is_still_refused() {
-        // Review round 5 made those degrade for the cache. The ledger is the
+        // For the cache those degrade to recomputation. The ledger is the
         // file nothing rebuilds, so it refuses, as for a link to nothing.
         for looped in [true, false] {
             let home = guarded_home();
@@ -519,10 +518,10 @@ mod tests {
 
     #[test]
     fn a_damaged_ledger_that_cannot_be_moved_aside_stops_bx_and_is_never_saved_over() {
-        // r3 round 1 (L1b): `Ledger::open` reported `Health::Reset` when the
-        // rename failed, a caller that kept only the value saved, and the save
-        // replaced the damaged ledger — possibly the only index to the user's
-        // restore blobs — that `Reset` said had been kept.
+        // Were `Ledger::open` to report `Health::Reset` when the rename
+        // fails, a caller that kept only the value would save, and the save
+        // would replace the damaged ledger — possibly the only index to the
+        // user's restore blobs — that `Reset` said had been kept.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
             // `state::store`'s 255-byte-name test pins the same rule for root.
@@ -540,7 +539,7 @@ mod tests {
         std::fs::set_permissions(dir.root(), std::fs::Permissions::from_mode(0o700))
             .expect("restore");
         // What a caller that keeps only the value does next. `save` takes
-        // `&mut self` since r4 round 5, so the value is moved out of the
+        // `&mut self`, so the value is moved out of the
         // result and the error is kept beside it.
         let err = match result {
             Ok(loaded) => {
@@ -571,8 +570,8 @@ mod tests {
 
     #[test]
     fn a_dangling_ledger_symlink_stops_bx_instead_of_reading_as_fresh() {
-        // Review round 3: a `ledger.mpk` link to storage that is not mounted
-        // read as `Health::Fresh`, and the next save replaced the link.
+        // A `ledger.mpk` link to storage that is not mounted must not read as
+        // `Health::Fresh`, or the next save replaces the link.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let far = home.child("unmounted/ledger.mpk");
@@ -592,10 +591,10 @@ mod tests {
 
     #[test]
     fn a_ledger_from_a_newer_bx_is_refused_and_left_exactly_where_it_is() {
-        // Review round 4: a newer format version was damage, so after a
-        // rollback to an older bx `Ledger::open` moved an intact ledger aside,
-        // the next apply recorded bx's output as every prior, and each rollback
-        // added another `.corrupt.N`.
+        // A newer format version is not damage: read as damage, after a
+        // rollback to an older bx `Ledger::open` would move an intact ledger
+        // aside, the next apply would record bx's output as every prior, and
+        // each rollback would add another `.corrupt.N`.
         #[derive(Serialize)]
         struct Newer<T> {
             kind: &'static str,
@@ -650,8 +649,8 @@ mod tests {
 
     #[test]
     fn a_lockless_view_of_a_damaged_ledger_leaves_it_for_the_lock_holder() {
-        // Review round 3: `LedgerView::read` renamed by path with no lock, so a
-        // writer's save between the read and the rename lost its ledger.
+        // A `LedgerView::read` that renamed by path with no lock would lose a
+        // writer's ledger saved between the read and the rename.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
@@ -676,9 +675,9 @@ mod tests {
 
     #[test]
     fn a_lock_on_another_state_directory_opens_nothing_and_quarantines_nothing() {
-        // Review round 4: `Ledger::open` and `Fingerprints::open` accepted any
-        // `ExclusiveLock`, so A's lock quarantined B's damaged ledger while B's
-        // own bx, holding B's lock, could be saving it.
+        // Were `Ledger::open` and `Fingerprints::open` to accept any
+        // `ExclusiveLock`, A's lock would quarantine B's damaged ledger while
+        // B's own bx, holding B's lock, could be saving it.
         let a = guarded_home();
         let b = guarded_home();
         let (dir_a, lock_a) = locked(&a);
@@ -712,9 +711,9 @@ mod tests {
 
     #[test]
     fn a_quarantine_orphaned_by_a_crash_before_the_save_stays_visible() {
-        // Review round 4's falsifier: `Ledger::open` quarantined a damaged
-        // ledger, bx stopped before `save`, and the next reader and writer saw
-        // `Health::Fresh` with the `.corrupt` file reported nowhere.
+        // `Ledger::open` quarantines a damaged ledger and bx stops before
+        // `save`: the next reader and writer must not see `Health::Fresh`
+        // with the `.corrupt` file reported nowhere.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         std::fs::write(dir.ledger(), b"not messagepack").expect("seed");
@@ -757,7 +756,7 @@ mod tests {
         // Decision R3-1 of #4: `/…/home/.gitconfig` decodes, because a decoder
         // has no home, and on this account it is a second key for
         // `~/.gitconfig`. The loader is where the home is, so the loader
-        // refuses — and, since review round 3, renames nothing.
+        // refuses — and renames nothing.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let key = absolute_under(&home, ".gitconfig");
@@ -792,12 +791,12 @@ mod tests {
 
     #[test]
     fn a_home_spelled_through_an_alias_stops_bx_and_leaves_the_ledger_in_place() {
-        // Review round 3's falsifier. An apply under one spelling of the home —
-        // `/var/home/me`, reached through a `/home/me` alias — records a target
-        // named by the other spelling as an absolute path. The next run, under
-        // the other spelling, folds that path into its home. That used to
-        // quarantine a good ledger, after which the next apply recorded bx's own
-        // output as every prior.
+        // An apply under one spelling of the home — `/var/home/me`, reached
+        // through a `/home/me` alias — records a target named by the other
+        // spelling as an absolute path. The next run, under the other
+        // spelling, folds that path into its home. Quarantining the ledger
+        // then would set a good one aside, after which the next apply would
+        // record bx's own output as every prior.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let alias = home.child("alias");
@@ -957,14 +956,14 @@ mod tests {
 
     #[test]
     fn a_mismatched_row_costs_its_own_target_and_no_other() {
-        // r4 round 1 (CL7): one `KeyMismatch` row rejected the whole ledger, so
-        // a single corrupted key in a ledger of fifty targets cost the restore
-        // index for all fifty — and left their blobs in `restore/` with
+        // Were one `KeyMismatch` row to reject the whole ledger, a single
+        // corrupted key in a ledger of fifty targets would cost the restore
+        // index for all fifty — and leave their blobs in `restore/` with
         // nothing naming them. The ledger is the one state file recomputation
         // cannot rebuild, so the degradation has to be as small as the damage.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
-        // r4 round 2 (COV5): the rows are seeded *out* of storage order, so
+        // The rows are seeded *out* of storage order, so
         // "in the order the file stores them" — what `rows`' own documentation
         // promises, and what the rendered damage message shows a user — is
         // constrained rather than satisfied by an accident of the fixture.
@@ -1011,9 +1010,9 @@ mod tests {
 
     #[test]
     fn an_entry_stored_under_a_key_that_is_not_its_path_is_damage() {
-        // Review round 3: `check_paths` never compared the two, so an entry for
-        // `~/.bbbb` filed under `~/.aaaa` loaded, and `get(~/.aaaa)` answered
-        // with another target's record.
+        // `check_paths` compares the two: otherwise an entry for `~/.bbbb`
+        // filed under `~/.aaaa` loads, and `get(~/.aaaa)` answers with
+        // another target's record.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let seeded = seed_mismatched(&dir, target("~/.aaaa"), target("~/.bbbb"));
@@ -1057,9 +1056,9 @@ mod tests {
 
     #[test]
     fn a_stored_created_dir_that_is_not_above_its_target_is_damage() {
-        // r4 round 2 (D9): `check_created_dirs` enforced the ancestor rule on
-        // the write path and nothing enforced it on the load path, so a
-        // tampered or corrupted `ledger.mpk` could carry a directory that is
+        // `check_created_dirs` enforces the ancestor rule on the write path
+        // only; without the load path's check a tampered or corrupted
+        // `ledger.mpk` could carry a directory that is
         // not above its target. `merge_created_dirs` then sorts it among real
         // ancestors by a depth that means nothing about it, and `bx rm` would
         // remove a directory it never created for that target.
@@ -1073,8 +1072,8 @@ mod tests {
             (target("~/.config/other/y.conf"), vec![target("~/.conf")]),
             // Two strays around a real ancestor, seeded out of sorted order:
             // the rows for one target come back in the entry's own list order,
-            // which round 2's COV5 pinned for `KeyMismatch.rows` and the
-            // per-directory retain reopened here (r4 round 4, COV4).
+            // the same order `KeyMismatch.rows` is held to, which a
+            // per-directory retain could otherwise break here.
             (
                 target("~/.cache/z"),
                 vec![
@@ -1116,7 +1115,7 @@ mod tests {
         let view = LedgerView::read(&dir, home.path()).expect("read");
         assert_eq!(view.health, Health::Damaged(damage.clone()));
         assert!(damage.is_partial(), "the rows named are the whole loss");
-        // r4 round 3 (D2, CL4): the entry is **kept** and only the directory is
+        // The entry is **kept** and only the directory is
         // dropped. Losing the entry would take the user's displaced bytes out
         // of the index to be rid of a bad directory name.
         let kept: Vec<_> = view.value.iter().map(|(path, _)| path.as_str()).collect();
@@ -1163,13 +1162,12 @@ mod tests {
 
     #[test]
     fn recording_through_a_partially_damaged_survivor_never_writes_the_stray_back() {
-        // r4 round 4 (D2, COV2): round 3 made a key-mismatch load leave a
-        // stray `created_dirs` entry in a surviving row, for the next load to
-        // strip. Nothing recorded through such a survivor, and `record` merged
+        // A key-mismatch load leaves a stray `created_dirs` entry in a
+        // surviving row, for the next load to strip. Were `record` to merge
         // the stored list **past** `check_created_dirs` — which validates the
-        // incoming entry only — so bx wrote the stray back and the next read
-        // reported `UnrelatedCreatedDirs` on a file bx had just written. A
-        // file bx produces and then refuses.
+        // incoming entry only — bx would write the stray back and the next
+        // read would report `UnrelatedCreatedDirs` on a file bx had just
+        // written. A file bx produces and then refuses.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut entries = BTreeMap::new();
@@ -1254,11 +1252,11 @@ mod tests {
 
     #[test]
     fn a_ledger_damaged_both_ways_reports_and_acts_on_the_graver_only() {
-        // r4 round 3 (D1, COV1): with both kinds of row damage present the
-        // round-2 code dropped both row sets and named only the key mismatch,
-        // which makes `Damage::is_partial`'s promise — that what the rows name
-        // is the whole of what was lost — false. And no test staged both, so
-        // the "graver of the two" selection was reached by nothing.
+        // With both kinds of row damage present, dropping both row sets and
+        // naming only the key mismatch would make `Damage::is_partial`'s
+        // promise — that what the rows name is the whole of what was lost —
+        // false. Only a test staging both reaches the "graver of the two"
+        // selection.
         let home = guarded_home();
         let (dir, lock) = locked(&home);
         let mut entries = BTreeMap::new();
@@ -1320,11 +1318,11 @@ mod tests {
         ));
         let mut ledger = opened.value;
 
-        // r4 round 5 (D1): the save the caller makes **strips the stray** and
-        // warns, rather than writing it out for a second load to find. Round 4
-        // put that rule on `record` only, so a save without a re-record of
-        // that row put the stray on disk and the reread reported it — bx
-        // writing a file it then called damaged.
+        // The save the caller makes **strips the stray** and warns, rather
+        // than writing it out for a second load to find. With that rule on
+        // `record` only, a save without a re-record of that row would put the
+        // stray on disk and the reread would report it — bx writing a file it
+        // then called damaged.
         let (saved, said) = crate::state::store::capture::capturing(|| ledger.save());
         saved.expect("save the survivors");
         assert!(said.contains("is not above"), "{said}");

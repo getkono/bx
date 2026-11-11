@@ -406,9 +406,9 @@ impl Ledger {
         self.check_lock()?;
         // The entry is fetched **once**, mutably, and the blob is stored
         // through the directory rather than through `&self`. Fetching it again
-        // after the store — which a `&self` store forced — left an `if let
-        // Some(..)` whose `else` no input could take, so a mutant emptying the
-        // body survived the suite (r4 round 2, COV7).
+        // after the store — which a `&self` store would force — leaves an `if
+        // let Some(..)` whose `else` no input can take, so a mutant emptying
+        // the body would survive the suite.
         let Ledger { view, dir, .. } = &mut *self;
         let Some(entry) = view.entries.get_mut(path) else {
             return Ok(None);
@@ -435,8 +435,8 @@ impl Ledger {
     ///
     /// Takes the directory rather than `&self` so that a caller holding a
     /// `&mut` borrow of the entries can still store a blob: see
-    /// `Ledger::adopt_current_as_prior`, where the re-fetch that borrow
-    /// used to force was a branch no input could take (r4 round 2, COV7).
+    /// `Ledger::adopt_current_as_prior`, where the re-fetch a `&self` store
+    /// would force is a branch no input can take.
     fn store_prior(dir: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
         match prior {
             PriorBytes::Absent => Ok(Prior::Absent),
@@ -486,9 +486,8 @@ impl Ledger {
     /// [`merge_created_dirs`] does the same on the `record` path, and both are
     /// needed rather than one: `record` hands the entry back to its caller
     /// before any save, so a caller acting on what it returns must not see a
-    /// stray either. "The write path" means **every** write, which is what
-    /// this round settled (r4 round 5, D1 and CL1) — the previous round put
-    /// the rule on `record` alone and claimed it covered the whole exposure.
+    /// stray either. "The write path" means **every** write: the rule on
+    /// `record` alone would not cover the whole exposure.
     pub fn save(&mut self) -> Result<(), Error> {
         self.check_lock()?;
         for (target, dir) in self.view.strip_unrelated_created_dirs() {
@@ -615,12 +614,12 @@ fn supersede(existing: &LedgerEntry, adopted: &RestoreRef) -> History {
 ///
 /// [`check_created_dirs`] refuses a stray in the entry the caller hands over,
 /// before anything is stored. It says nothing about the list already in the
-/// ledger — and since r4 round 3 that list can hold a stray: a load that found
+/// ledger — and that list can hold a stray: a load that found
 /// a key mismatch reports and acts on that alone, and leaves a stray
 /// `created_dirs` entry in a surviving row for the next load to strip. Merging
 /// it through would write it back, and the next read would report
 /// `UnrelatedCreatedDirs` **on a file bx had just written** — bx producing a
-/// file it refuses (r4 round 4, D2).
+/// file it refuses.
 ///
 /// So a stored directory that is not above `target` is dropped here, with a
 /// warning: the load that let it through already quarantined the file it came

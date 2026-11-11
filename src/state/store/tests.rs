@@ -138,19 +138,18 @@ fn saving_the_same_value_twice_produces_identical_bytes() {
 }
 
 // The determinism obligation is carried by two mechanisms, and each of the
-// three tests below fails when *only its own* mechanism is removed. Until
-// r4 round 4 one test stood for both: its 128-key `HashMap` payload tripped
-// inside `save` before the helper's comparison ran, so neutering either
-// mechanism alone left the suite green and only their disjunction was
-// tested (r4 round 4, COV1).
+// three tests below fails when *only its own* mechanism is removed. One test
+// cannot stand for both: a 128-key `HashMap` payload trips inside `save`
+// before the helper's comparison runs, so neutering either mechanism alone
+// would leave the suite green and only their disjunction would be tested.
 
 #[test]
 fn the_re_encode_count_is_what_makes_detection_certain() {
-    // r4 round 5 (COV1): `REENCODES` was a constant nothing defended. The
-    // suite was green at `REENCODES = 1`, where a two-key `HashMap` is
-    // missed 56% of the time — so the intermittency the previous round
-    // removed was one edit from coming back, and the 300/300 measurement
-    // that justified 32 lived in a report rather than in the suite.
+    // `REENCODES` is otherwise a constant nothing defends. Without this the
+    // suite is green at `REENCODES = 1`, where a two-key `HashMap` is
+    // missed 56% of the time — so the intermittency the count removes would
+    // be one edit from coming back, and the measurement that justifies 32
+    // would live outside the suite.
     //
     // This measures instead of restating. Each trial encodes a freshly
     // built two-key map — the worst case, and the only size where one
@@ -209,7 +208,7 @@ fn the_two_construction_assertion_refuses_an_order_dependent_sequence() {
     // identically, so no number of re-encodings inside `save` can see it —
     // while two builds of it are two different orders, which is the
     // Invariant 3 breach. This is the class that makes the second
-    // mechanism necessary rather than redundant (r4 round 4, D1).
+    // mechanism necessary rather than redundant.
     #[derive(Serialize, Deserialize)]
     struct Ordered {
         order: Vec<String>,
@@ -226,11 +225,11 @@ fn the_two_construction_assertion_refuses_an_order_dependent_sequence() {
 #[test]
 #[should_panic(expected = "does not decode the bytes it just encoded")]
 fn a_payload_whose_encoding_it_cannot_read_back_is_refused() {
-    // r4 round 4 (COV3): the decode arm of `save`'s own check was reached
-    // by nothing, so a mutant turning the panic into a silent `return`
-    // survived. A type whose `Serialize` and `Deserialize` disagree is what
-    // reaches it, and it is a real condition: `load` would refuse the file
-    // the save is about to write.
+    // Nothing else reaches the decode arm of `save`'s own check, so without
+    // this a mutant turning the panic into a silent `return` survives. A type
+    // whose `Serialize` and `Deserialize` disagree is what reaches it, and it
+    // is a real condition: `load` would refuse the file the save is about to
+    // write.
     struct Mismatched;
     impl Serialize for Mismatched {
         fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -274,9 +273,9 @@ fn reshaped(version: u16) -> Vec<u8> {
 
 #[test]
 fn a_newer_version_is_judged_before_its_payload_is_decoded() {
-    // Review round 4: the payload was decoded before the version was
-    // looked at, so a newer format with a changed payload read as
-    // `Malformed` — damage — whatever the file's loss.
+    // Decoding the payload before looking at the version would make a newer
+    // format with a changed payload read as `Malformed` — damage — whatever
+    // the file's loss.
     let (_dir, path) = state_file();
     std::fs::write(&path, reshaped(VERSION + 1)).expect("seed");
     let loaded: Loaded<Value> = locked_load(&path).expect("load");
@@ -296,11 +295,11 @@ fn a_newer_version_is_judged_before_its_payload_is_decoded() {
 
 #[test]
 fn a_newer_version_of_a_permanent_file_is_refused_and_nothing_is_renamed() {
-    // Review round 4: after a rollback to an older bx, an intact ledger
-    // was moved aside as damage, even under the lock.
+    // After a rollback to an older bx, an intact ledger must not be moved
+    // aside as damage, even under the lock.
     let (dir, path) = state_file();
     let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
-    // Review round 5: whether the rest of the file reads as this format is
+    // Whether the rest of the file reads as this format is
     // reported, so the message can say the version itself may be damaged.
     for (seed, readable) in [
         (encoded(KIND, VERSION + 1, &sample()), true),
@@ -338,8 +337,8 @@ fn a_newer_version_of_a_permanent_file_is_refused_and_nothing_is_renamed() {
 
 #[test]
 fn every_damage_says_what_is_wrong_with_the_file() {
-    // r3 round 1 (C4): two of the six texts were never asserted, and
-    // the others only in part, so an empty rendering survived mutation.
+    // Every text is asserted in full: one asserted in part, or not at all,
+    // lets an empty rendering survive mutation.
     let cases = [
         (Damage::Malformed, "it is not valid MessagePack"),
         (
@@ -508,9 +507,9 @@ fn saving_over_a_symlinked_state_file_refuses_and_touches_neither_end() {
 
 #[test]
 fn successive_quarantines_keep_every_earlier_one() {
-    // Review round 3: a fixed `<name>.corrupt` was renamed over, so a
-    // second damaged ledger destroyed the first — which may be the only
-    // index there is to the user's restore blobs.
+    // A fixed `<name>.corrupt` would be renamed over, so a second damaged
+    // ledger would destroy the first — which may be the only index there
+    // is to the user's restore blobs.
     let (dir, path) = state_file();
     for body in [&b"first"[..], b"second", b"third"] {
         std::fs::write(&path, body).expect("seed");
@@ -532,9 +531,9 @@ fn successive_quarantines_keep_every_earlier_one() {
 
 #[test]
 fn a_new_quarantine_takes_the_number_after_the_highest_and_never_refills_a_gap() {
-    // Review round 5: `move_aside` took the lowest free number, so once a
-    // human deleted `.corrupt` the next quarantine refilled it, and
-    // `Loaded::quarantined` listed the newest first.
+    // Were `move_aside` to take the lowest free number, then once a human
+    // deleted `.corrupt` the next quarantine would refill it, and
+    // `Loaded::quarantined` would list the newest first.
     let (_dir, path) = state_file();
     for body in [&b"first"[..], b"second", b"third"] {
         std::fs::write(&path, body).expect("seed");
@@ -572,9 +571,9 @@ fn a_new_quarantine_takes_the_number_after_the_highest_and_never_refills_a_gap()
 
 #[test]
 fn a_quarantine_number_with_no_successor_does_not_block_the_next_quarantine() {
-    // r3 round 1 (L1a): with `v.mpk.corrupt.18446744073709551615` present,
-    // the number after the highest overflowed, nothing was moved aside,
-    // and the load still said the file had been quarantined.
+    // With `v.mpk.corrupt.18446744073709551615` present, the number after
+    // the highest overflows; the file must still be moved aside, or the
+    // load would say it had been quarantined when it had not.
     let (_dir, path) = state_file();
     let crafted = StateDir::quarantine_nth(&path, u64::MAX);
     std::fs::write(&crafted, b"crafted").expect("seed");
@@ -591,10 +590,10 @@ fn a_quarantine_number_with_no_successor_does_not_block_the_next_quarantine() {
 
 #[test]
 fn once_the_top_quarantine_number_is_present_gaps_are_refilled_and_the_last_is_not_the_newest() {
-    // r3 round 2 (P7R4-D1): the docs still said the quarantines listed are
-    // in the order they were made, the last the newest, and that bx never
-    // makes `<name>.corrupt.<u64::MAX>`. Both stop being true once the top
-    // number is present; the docs now say so, and this pins what they say.
+    // That the quarantines listed are in the order they were made, the last
+    // the newest, and that bx never makes `<name>.corrupt.<u64::MAX>`, both
+    // stop being true once the top number is present; the docs say so, and
+    // this pins what they say.
     let nth = StateDir::quarantine_nth;
 
     // A crafted top number, three quarantines, the first removed by a
@@ -660,8 +659,8 @@ fn once_the_top_quarantine_number_is_present_gaps_are_refilled_and_the_last_is_n
 
 #[test]
 fn a_quarantine_left_by_an_earlier_run_is_reported_on_every_load() {
-    // Review round 4: a quarantine followed by a crash before the save left
-    // the next reader and writer looking at `Health::Fresh`, with the
+    // A quarantine followed by a crash before the save must not leave the
+    // next reader and writer looking at `Health::Fresh`, with the
     // `.corrupt` file orphaned and reported nowhere.
     let (dir, path) = state_file();
     let first = StateDir::quarantine(&path);
@@ -675,8 +674,8 @@ fn a_quarantine_left_by_an_earlier_run_is_reported_on_every_load() {
     )
     .expect("a missing directory lists nothing");
     assert!(absent.quarantined.is_empty());
-    // r4 round 2 (COV4): "no directory, so none — *known*" is the whole
-    // distinction `unlisted` exists to draw, and nothing pinned it here.
+    // "No directory, so none — *known*" is the whole distinction
+    // `unlisted` exists to draw, and this is where it is pinned.
     // It holds because `numbered`'s `NotFound` arm returns an empty list
     // rather than a listing failure; without that this would be `Some`,
     // and an empty `quarantined` beside it would mean nothing is known.
@@ -724,13 +723,13 @@ fn a_quarantine_left_by_an_earlier_run_is_reported_on_every_load() {
 
 #[test]
 fn a_state_directory_that_cannot_be_listed_leaves_the_quarantines_unknown() {
-    // r4 round 1 (D8): the listing failure was returned as `Error::Read`,
-    // whose documented meaning is "the file's bytes were never seen" — and
-    // whose path was the directory, not the state file a caller matches
-    // on. It also discarded a quarantine `judge` had already completed,
-    // and a persistently unlistable directory (0300: searchable and
-    // writable, not readable) failed every `LedgerView::read` and
-    // `Fingerprints::read` with no remedy, though each file read perfectly.
+    // A listing failure is not `Error::Read`, whose documented meaning is
+    // "the file's bytes were never seen" — and whose path would be the
+    // directory, not the state file a caller matches on. That would also
+    // discard a quarantine `judge` had already completed, and a
+    // persistently unlistable directory (0300: searchable and writable, not
+    // readable) would fail every `LedgerView::read` and
+    // `Fingerprints::read` with no remedy, though each file reads perfectly.
     if rustix::process::geteuid().is_root() {
         // Mode bits deny nothing to root, so the condition cannot be staged.
         crate::testing::skip_unconstructible("root ignores the permission bits");
@@ -757,8 +756,8 @@ fn a_state_directory_that_cannot_be_listed_leaves_the_quarantines_unknown() {
         .clone()
         .expect("the directory it could not list");
     assert_eq!(unlisted.path, root);
-    // r4 round 2 (CL5): the cause used to be logged and dropped, so a
-    // caller could not tell a remediable `chmod` from a failing disk.
+    // The cause travels with it, so a caller can tell a remediable `chmod`
+    // from a failing disk.
     assert_eq!(unlisted.kind, std::io::ErrorKind::PermissionDenied);
     assert!(unlisted.cause.contains("Permission denied"), "{unlisted:?}");
     assert!(
@@ -775,11 +774,10 @@ fn a_state_directory_that_cannot_be_listed_leaves_the_quarantines_unknown() {
 
 #[test]
 fn a_damaged_file_is_reported_through_tracing_whether_or_not_it_is_moved() {
-    // r4 round 1 (COV2): neither `tracing::warn!` body in this module had
-    // ever been executed, because no library test installed a subscriber.
-    // Both texts are stated as part of the contract — by this module's
-    // `load` doc and by `state/mod.rs` — and deleting either macro passed
-    // the entire suite.
+    // Without an installed subscriber, neither `tracing::warn!` body in
+    // this module is ever executed. Both texts are stated as part of the
+    // contract — by this module's `load` doc and by `state/mod.rs` — so
+    // deleting either macro must fail a test.
     let (_dir, path) = state_file();
     std::fs::write(&path, b"garbage").expect("seed");
 
@@ -812,9 +810,9 @@ fn a_damaged_file_is_reported_through_tracing_whether_or_not_it_is_moved() {
 
 #[test]
 fn a_save_that_cannot_be_written_is_reported_naming_the_directory() {
-    // r4 round 1 (COV7): `save`'s `Error::Write` propagation from
-    // `write_atomically` was reached by no test at all — region count
-    // zero — so the whole arm could be replaced by `Ok(())` undetected.
+    // Nothing else reaches `save`'s `Error::Write` propagation from
+    // `write_atomically`, so without this the whole arm could be replaced
+    // by `Ok(())` undetected.
     if rustix::process::geteuid().is_root() {
         // Mode bits deny nothing to root, so the condition cannot be staged.
         crate::testing::skip_unconstructible("root ignores the permission bits");
@@ -825,7 +823,7 @@ fn a_save_that_cannot_be_written_is_reported_naming_the_directory() {
     // through a link — see `dir::tighten` — so this is the one shape it
     // leaves unwritable, and the atomic write's temporary file cannot be
     // created in it. An unlinked `0500` would be set back to `0700` and
-    // the write would succeed (r4 round 2, CL3).
+    // the write would succeed.
     let real = dir.path().join("real");
     std::fs::create_dir(&real).expect("real");
     std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o500)).expect("chmod");
@@ -848,13 +846,12 @@ fn a_save_that_cannot_be_written_is_reported_naming_the_directory() {
 
 #[test]
 fn a_file_where_the_state_directory_should_be_is_named_as_such_on_a_lockless_read() {
-    // r4 round 2 (D5): `LedgerView::read` and `Fingerprints::read` never
-    // call `ensure`, so the only code that raised `Error::NotADirectory`
-    // was out of reach on the read path. With a plain file at
-    // `~/.local/state/bx`, the read failed `ENOTDIR` and reported
+    // `LedgerView::read` and `Fingerprints::read` never call `ensure`, so
+    // `ensure`'s `Error::NotADirectory` is out of reach on the read path.
+    // With a plain file at `~/.local/state/bx`, the read must not report
     // "reading ~/.local/state/bx/ledger.mpk: Not a directory" — a file
-    // inside a file, with no remedy — while the right error existed and
-    // said exactly the right thing.
+    // inside a file, with no remedy — when the right error exists and
+    // says exactly the right thing.
     let dir = tempfile::tempdir().expect("tempdir");
     let blocking = dir.path().join("bx");
     std::fs::write(&blocking, b"not a directory").expect("seed");
@@ -904,9 +901,9 @@ fn a_lockless_reader_reports_damage_and_moves_nothing() {
 
 #[test]
 fn a_writer_saving_inside_a_lockless_readers_window_keeps_its_file() {
-    // Review round 3's falsifier: the reader has read and judged the bytes,
-    // a writer saves a fresh file, and the reader then acts on the path.
-    // A rename by path there moved the writer's fresh file aside.
+    // The reader has read and judged the bytes, a writer saves a fresh
+    // file, and the reader then acts on the path. A rename by path there
+    // would move the writer's fresh file aside.
     let (dir, path) = state_file();
     save(&path, KIND, VERSION, &Value::new()).expect("seed");
 
@@ -934,9 +931,9 @@ fn a_writer_saving_inside_a_lockless_readers_window_keeps_its_file() {
 #[cfg_attr(not(debug_assertions), ignore = "the guard is a debug_assert")]
 #[should_panic(expected = "`Damage::is_partial` accepts")]
 fn a_check_reporting_whole_file_damage_as_partial_is_refused() {
-    // r4 round 3 (COV2): the guard that holds `Rejected::PartialDamage` to
-    // row-shaped damage was reached by no test, so the body's claim that
-    // the two "cannot drift" rested on an assertion nothing exercised.
+    // Nothing else reaches the guard that holds `Rejected::PartialDamage`
+    // to row-shaped damage, so the claim that the two "cannot drift" would
+    // rest on an assertion nothing exercised.
     // `Damage::Malformed` is what `decode` produces for a whole file, and
     // a check answering with it would make `is_partial` say the rows named
     // are the whole loss when nothing was named.
@@ -1129,9 +1126,9 @@ fn an_intact_file_that_cannot_be_read_is_left_exactly_where_it_is() {
 
 #[test]
 fn a_file_that_cannot_be_moved_aside_is_refused_and_left_in_place() {
-    // r3 round 1 (L1b): a failed move aside was logged and reported as
+    // A failed move aside must not be logged and reported as
     // `Health::Reset` — "has been quarantined" — with the damaged file
-    // still at its name, so the next save overwrote the bytes that
+    // still at its name, or the next save overwrites the bytes that
     // `Reset` and the module both promise are kept.
     let dir = tempfile::tempdir().expect("tempdir");
     let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");

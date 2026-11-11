@@ -306,8 +306,8 @@ impl StateDir {
 /// earlier, and "creating ~/.local/state/bx: Permission denied" names neither
 /// the directory that is in the way nor the `umask` that made it. So an
 /// `EACCES` or `EPERM` is turned into [`Error::UnwritableAncestor`], which
-/// names the ancestor, its mode, and the `chmod` that clears it (r4 round 2,
-/// D4). The ancestor mode itself is left alone: it is shared with every other
+/// names the ancestor, its mode, and the `chmod` that clears it. The ancestor
+/// mode itself is left alone: it is shared with every other
 /// XDG-aware tool and is not bx's to widen behind the user's `umask`.
 pub(crate) fn ensure_dir(path: &Path, mode: Mode) -> Result<(), Error> {
     let create_failed = |source: std::io::Error| {
@@ -513,7 +513,7 @@ pub(crate) mod noreplace_seam {
 /// empty list there would be a guess. The `io::Error` is handed back rather
 /// than wrapped, because the only caller reports the *kind* as well as the
 /// text — `EACCES` is a `chmod` the user can make and `EIO` is not — and
-/// wrapping it here threw that away (r4 round 2, CL5).
+/// wrapping it here would throw that away.
 pub(crate) fn quarantines(path: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
     Ok(numbered(path)?
         .into_iter()
@@ -625,8 +625,8 @@ fn open_beyond_owner(mode: Mode) -> bool {
 /// # One component, and why that is the whole question
 ///
 /// Only the immediate parent of the resolved file is judged, not the whole
-/// ancestor chain, and that is conservative in **both** directions (r4 round 2,
-/// CL9). Traversal needs search permission on every component, so a parent
+/// ancestor chain, and that is conservative in **both** directions.
+/// Traversal needs search permission on every component, so a parent
 /// another account cannot search makes the file unreachable whatever the
 /// components above it are: the early `Ok` cannot be wrong. And a parent that
 /// others *can* search is only assumed reachable — an ancestor above it may
@@ -726,8 +726,8 @@ pub(crate) fn check_owner(path: &Path, uid: u32) -> Result<(), Error> {
 /// the owner bits — and a state directory left at `0500`, by a crash between
 /// the `mkdir` and the `chmod` below, by an exotic `umask`, or by the user's
 /// own hand, makes every later write fail `EACCES` with no repair and no
-/// diagnostic. Two rules for the same question was the round-1 defect on the
-/// lock file; one rule for both is the answer (r4 round 2, CL3).
+/// diagnostic. Two rules for the same question would leave the lock file
+/// unrepaired where the directory is repaired; one rule answers both.
 ///
 /// Narrowing and widening are sanctioned by different arguments, and both
 /// hold here. Narrowing is the privacy argument below. Widening is not bx
@@ -938,10 +938,9 @@ mod tests {
 
     #[test]
     fn repairing_a_directorys_mode_says_so_through_tracing() {
-        // r4 round 2 (COV1): round 1's repair reached `store.rs` only. No test
-        // in the repository installed a subscriber reachable from here, so
-        // this warning's argument expressions ran zero times and deleting the
-        // macro whole left the suite green — and this is the only signal a
+        // Without a subscriber installed reachable from here, this warning's
+        // argument expressions run zero times and deleting the macro whole
+        // leaves the suite green — and this is the only signal a
         // user gets that bx narrowed a directory they own, which is what
         // decision 50 was sanctioned on.
         let (_home, dir) = guarded_state();
@@ -1019,9 +1018,9 @@ mod tests {
 
     #[test]
     fn a_directory_mkdir_refuses_is_reported_naming_it() {
-        // r3 round 1 (C6): every earlier failure was in the ancestors, so a
-        // `mkdir` of the directory itself failing was never reached, and
-        // reading it as success survived mutation.
+        // Every other failure staged here is in the ancestors, so without this
+        // a `mkdir` of the directory itself failing is never reached, and
+        // reading it as success survives mutation.
         let dir = tempfile::tempdir().expect("tempdir");
         let long = dir.path().join("d".repeat(256));
         let err = ensure_dir(&long, Mode::PRIVATE_DIR).expect_err("a 256-byte name");
@@ -1037,10 +1036,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_shared_directory_that_refuses_to_be_narrowed_is_reported_naming_it() {
-        // r3 round 2b (P7R4-COV3): `tighten`'s `chmod` failing was never
-        // reached. procfs refuses every mode change on a process's own
-        // directory, to root as well, and that directory is `0555`: shared, so
-        // `tighten` tries to narrow it, and nothing about it can change.
+        // `tighten`'s `chmod` failing is reached nowhere else. procfs refuses
+        // every mode change on a process's own directory, to root as well, and
+        // that directory is `0555`: shared, so `tighten` tries to narrow it,
+        // and nothing about it can change.
         let own = std::fs::canonicalize("/proc/self").expect("this process's /proc directory");
         let found = mode_of(&own);
         assert!(found.is_shared(), "{own:?} is {found}");
@@ -1084,9 +1083,9 @@ mod tests {
 
     #[test]
     fn without_rename_noreplace_the_fallback_skips_a_taken_name_and_replaces_no_quarantine() {
-        // Coverage review, round 5: the check-then-rename fallback for a
-        // filesystem that rejects `RENAME_NOREPLACE` with `EINVAL` never ran,
-        // and both mutants of its occupied-name guard survived. The listing
+        // The check-then-rename fallback for a filesystem that rejects
+        // `RENAME_NOREPLACE` with `EINVAL` runs nowhere else, and without this
+        // both mutants of its occupied-name guard survive. The listing
         // already counts every occupied name, so the guard matters only for a
         // name taken between the listing and the rename: the seam reports
         // `EINVAL` for every rename, and takes the first candidate it is
@@ -1174,9 +1173,9 @@ mod tests {
 
     #[test]
     fn a_quarantine_number_that_cannot_be_followed_leaves_the_lowest_free_one() {
-        // r3 round 1 (L1a): a crafted top number, `<name>.corrupt.<u64::MAX>`,
-        // left no number after the highest, so every later quarantine of the
-        // file failed with "no free quarantine name".
+        // A crafted top number, `<name>.corrupt.<u64::MAX>`, leaves no number
+        // after the highest; taking the next one after it would fail every
+        // later quarantine of the file with "no free quarantine name".
         let dir = tempfile::tempdir().expect("tempdir");
         let lock = ExclusiveLock::acquire(&StateDir::new(dir.path().to_path_buf())).expect("lock");
         let path = dir.path().join("v.mpk");
@@ -1196,9 +1195,8 @@ mod tests {
 
     #[test]
     fn another_directorys_lock_moves_nothing_aside() {
-        // Review round 4: `move_aside` ignored which directory its lock
-        // guarded, so A's lock quarantined B's ledger while B's own bx could be
-        // saving it.
+        // `move_aside` must check which directory its lock guards: otherwise
+        // A's lock quarantines B's ledger while B's own bx could be saving it.
         let a = guarded_home();
         let b = guarded_home();
         let lock_a = ExclusiveLock::acquire(&StateDir::resolve(a.path())).expect("A's lock");
@@ -1219,8 +1217,8 @@ mod tests {
 
     #[test]
     fn a_linked_state_directory_is_refused_for_read_or_write_beyond_its_owner_and_nothing_else() {
-        // Review round 4: the refusal counted execute bits, so a `0711` target
-        // was refused as "readable beyond its owner", which is untrue.
+        // Execute bits are not read access: counting them would refuse a
+        // `0711` target as "readable beyond its owner", which is untrue.
         fn link_to(mode: u32) -> (crate::testing::GuardedHome, PathBuf, StateDir) {
             let home = guarded_home();
             let target = home.child("elsewhere");
@@ -1262,9 +1260,9 @@ mod tests {
 
     #[test]
     fn a_linked_state_directory_others_can_search_is_refused_while_local_toml_is_not_private() {
-        // Review round 5: a linked `0711` directory was accepted on the ground
-        // that every file in it is `0600`, but `local.toml` is hand-written and
-        // has a name anyone knows; an unlinked `0711` directory is narrowed.
+        // A linked `0711` directory is not safe on the ground that every file
+        // in it is `0600`: `local.toml` is hand-written and has a name anyone
+        // knows. An unlinked `0711` directory is narrowed.
         fn linked(
             dir_mode: u32,
             local: Option<u32>,
@@ -1361,9 +1359,9 @@ mod tests {
 
     #[test]
     fn a_linked_local_toml_is_judged_where_the_file_is() {
-        // r3 round 1 (L2): the file a `local.toml` link names was judged by
-        // its mode alone, so a `0644` file in a `0700` directory no other
-        // account can reach was refused.
+        // The file a `local.toml` link names is judged with its directory:
+        // judged by its mode alone, a `0644` file in a `0700` directory no
+        // other account can reach would be refused.
         for (layers_mode, exposed) in [
             (0o700, false),
             (0o500, false),
@@ -1408,9 +1406,9 @@ mod tests {
     #[test]
     fn an_exposed_local_toml_behind_a_private_ancestor_is_refused_without_claiming_anyone_can_open_it()
      {
-        // r3 round 2b (decision 47): the refusal judges only the linked
-        // directory and the file, which is conservative; but its message said
-        // "anyone who knows its name can open it", which is false when an
+        // Decision 47: the refusal judges only the linked directory and the
+        // file, which is conservative; so its message cannot say "anyone who
+        // knows its name can open it", which is false when an
         // ancestor no other account can search stands in the way.
         let home = guarded_home();
         let private = home.child("private");
@@ -1461,9 +1459,9 @@ mod tests {
 
     #[test]
     fn a_local_toml_link_that_leads_to_no_file_exposes_nothing() {
-        // r3 round 1 (L2): `metadata` followed the link, so one that loops or
-        // runs through a file was `Error::Read` from every `ensure`, lock and
-        // save, and one to a directory was judged by the directory's mode. The
+        // A `metadata` that followed the link would make one that loops or
+        // runs through a file an `Error::Read` from every `ensure`, lock and
+        // save, and judge one to a directory by the directory's mode. The
         // layer loader reports a looping or dangling `local.toml` itself.
         for case in ["loop", "dangling", "through a file", "a directory"] {
             let (home, _target, dir) = linked_state(0o711);
@@ -1498,8 +1496,8 @@ mod tests {
 
     #[test]
     fn a_local_toml_that_cannot_be_examined_is_an_error_naming_it() {
-        // r3 round 1 (C1): a failure other than "no such file" was unreached,
-        // and reading it as "no file" survived mutation.
+        // A failure other than "no such file" is reached nowhere else, and
+        // without this reading it as "no file" survives mutation.
         if rustix::process::geteuid().is_root() {
             // Mode bits deny nothing to root, so the condition cannot be staged.
             crate::testing::skip_unconstructible("root ignores the permission bits");
@@ -1563,8 +1561,8 @@ mod tests {
 
     #[test]
     fn a_linked_local_toml_whose_real_path_cannot_be_resolved_is_an_error_naming_it() {
-        // r3 round 2b (P7R4-COV2): resolving a linked `local.toml` to find the
-        // directory that holds it failing was never reached. A link the kernel
+        // Resolving a linked `local.toml` to find the directory that holds it
+        // failing is reached nowhere else. A link the kernel
         // follows, to a file whose real path is longer than `PATH_MAX`, can be
         // examined but not resolved.
         //
@@ -1671,11 +1669,10 @@ mod tests {
 
     #[test]
     fn a_state_directory_owned_by_another_account_is_refused_naming_both_uids() {
-        // r4 round 1 (CL5): the module established "this is ours" from file
-        // type, link-ness, nlink and mode, and never from the owner, so a
-        // `~/.local/state/bx` owned by another uid at 0700 was accepted as
-        // bx's own — and bx would write the user's displaced private bytes
-        // into a directory that account controls.
+        // "This is ours" needs the owner as well as file type, link-ness,
+        // nlink and mode: without it a `~/.local/state/bx` owned by another
+        // uid at 0700 is accepted as bx's own — and bx would write the user's
+        // displaced private bytes into a directory that account controls.
         let ours = rustix::process::geteuid().as_raw();
         assert!(check_owner(Path::new("/s/bx"), ours).is_ok(), "our own");
 
@@ -1689,17 +1686,16 @@ mod tests {
         );
         assert!(err.to_string().contains("Move it aside"), "{err}");
 
-        // r4 round 2 (COV6): the call site used to be reached only when this
-        // process was unprivileged, so on a root runner nothing exercised
-        // `tighten`'s `check_owner` at all and a mutant deleting the call
-        // survived there. Root is the case that can *stage* a foreign owner
+        // Reached only when this process is unprivileged, the call site would
+        // go unexercised on a root runner, and a mutant deleting `tighten`'s
+        // `check_owner` call would survive there. Root is the case that can *stage* a foreign owner
         // rather than the case that cannot, so it gets its own staging.
         //
         // **CI does not take that arm.** `.github/workflows/ci.yml` runs on
         // `ubuntu-latest`, unprivileged, so CI runs the `else` below; the root
         // arm is for a root container or a CI image that ever changes. It is
         // recorded as such in the pull request body rather than left to imply
-        // coverage CI does not have (r4 round 3, D4 and COV3).
+        // coverage CI does not have.
         let home = guarded_home();
         let (foreign, owner) = if rustix::process::geteuid().is_root() {
             // `/` is this process's own directory now, so one is made and
@@ -1710,7 +1706,7 @@ mod tests {
             // A rootless user namespace maps one uid and leaves 65534
             // unmapped, so `chown` fails `EINVAL` there. Nothing can be
             // staged then, and a panic would report an environment as a
-            // defect — so the test steps aside instead (r4 round 3, D4).
+            // defect — so the test steps aside instead.
             if rustix::fs::chown(&made, Some(nobody), None).is_err() {
                 return;
             }
@@ -1733,8 +1729,8 @@ mod tests {
 
     #[test]
     fn a_state_directory_that_is_a_link_to_nowhere_names_the_link_and_its_target() {
-        // r4 round 1 (D6): `tighten`'s `metadata` follows the link, so a
-        // dangling one was reported as `Error::Read{ENOENT}` — "reading
+        // `tighten`'s `metadata` follows the link, so a dangling one would be
+        // reported as `Error::Read{ENOENT}` — "reading
         // ~/.local/state/bx: No such file or directory" — which is untrue of a
         // path the user can see, and names no remedy. Reachable whenever the
         // state directory is a link to storage that is not mounted.
@@ -1769,8 +1765,8 @@ mod tests {
 
     #[test]
     fn a_symlinked_state_directory_onto_a_shared_directory_is_refused_not_chmodded() {
-        // Review round 3: `tighten` followed the link and narrowed the
-        // directory it named — one bx did not create, and may share with others.
+        // `tighten` must not follow the link and narrow the directory it
+        // names — one bx did not create, and may share with others.
         let home = guarded_home();
         let shared = home.child("shared");
         std::fs::create_dir_all(&shared).expect("shared");

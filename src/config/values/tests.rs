@@ -473,11 +473,17 @@ fn an_email_needs_one_at_and_no_whitespace() {
 fn an_ssh_key_must_carry_a_known_algorithm_prefix() {
     let ed25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyMaterial00000000000000";
     assert_eq!(check(ValueKind::SshKey, ed25519).unwrap(), ed25519);
-    assert!(check(ValueKind::SshKey, &format!("{ed25519} a comment")).is_ok());
-    assert!(check(ValueKind::SshKey, "ssh-rsa AAAAB3NzaC1yc2E=").is_ok());
-    assert!(check(ValueKind::SshKey, "ecdsa-sha2-nistp256 AAAAE2Vj").is_ok());
-    assert!(
-        check(ValueKind::SshKey, "sk-ssh-ed25519@openssh.com AAAAGnNr").is_ok(),
+    let commented = format!("{ed25519} a comment");
+    assert_eq!(
+        check(ValueKind::SshKey, &commented).as_deref(),
+        Ok(commented.as_str())
+    );
+    for key in ["ssh-rsa AAAAB3NzaC1yc2E=", "ecdsa-sha2-nistp256 AAAAE2Vj"] {
+        assert_eq!(check(ValueKind::SshKey, key).as_deref(), Ok(key));
+    }
+    assert_eq!(
+        check(ValueKind::SshKey, "sk-ssh-ed25519@openssh.com AAAAGnNr").as_deref(),
+        Ok("sk-ssh-ed25519@openssh.com AAAAGnNr"),
         "a FIDO-backed key is matched by its `sk-` prefix"
     );
 
@@ -579,7 +585,11 @@ fn a_key_blob_may_carry_every_base64_symbol() {
     // Each symbol on its own, so neither can hide behind the other.
     for blob in ["AAAA+AAAA", "AAAA/AAAA"] {
         let key = format!("ssh-ed25519 {blob}");
-        assert!(check(ValueKind::SshKey, &key).is_ok(), "{key}");
+        assert_eq!(
+            check(ValueKind::SshKey, &key).as_deref(),
+            Ok(key.as_str()),
+            "{key}"
+        );
     }
 }
 

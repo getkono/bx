@@ -464,6 +464,27 @@ ffxbALZN3JpDBBEk8TeZk55mo+jjJlOtAf63Q=
     }
 
     #[test]
+    fn an_identity_file_with_two_keys_decrypts_a_secret_for_the_second() {
+        let home = guarded_home();
+        let first = age::x25519::Identity::generate();
+        let second = age::x25519::Identity::generate();
+        let spelled = |key: &age::x25519::Identity| {
+            age::secrecy::ExposeSecret::expose_secret(&key.to_string()).to_string()
+        };
+        let file = home.write(
+            "id",
+            &format!(
+                "# first\n{}\n# second\n{}\n",
+                spelled(&first),
+                spelled(&second)
+            ),
+        );
+        let ciphertext = encrypt_to(&second.to_public().to_string(), b"second\n");
+
+        assert_eq!(never(&ciphertext, &file).as_deref(), Ok(&b"second\n"[..]));
+    }
+
+    #[test]
     fn an_unlocked_ssh_key_decrypts_without_asking() {
         let home = guarded_home();
         let file = home.write("id", SSH_KEY);

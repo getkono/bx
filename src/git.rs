@@ -322,8 +322,11 @@ fn bounded(
     };
     let stdout = read(child.stdout.take().map(|s| Box::new(s) as _));
     let stderr = read(child.stderr.take().map(|s| Box::new(s) as _));
-    // Whether the command has exited, leaving it unreaped.
-    let exited = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    // Whether the command has exited, leaving it unreaped. `union`, not `|`,
+    // for the reason `state::restore::read` gives.
+    let exited = WaitIdOptions::EXITED
+        .union(WaitIdOptions::NOHANG)
+        .union(WaitIdOptions::NOWAIT);
     loop {
         match waitid(WaitId::Pid(group), exited) {
             Ok(Some(_)) => break,

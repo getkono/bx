@@ -828,11 +828,7 @@ mod tests {
 
     use std::os::unix::fs::PermissionsExt as _;
 
-    use crate::testing::{guarded_home, guarded_state};
-
-    fn mode_of(path: &Path) -> Mode {
-        Mode::from_bits(std::fs::metadata(path).expect("stat").permissions().mode())
-    }
+    use crate::testing::{guarded_home, guarded_state, mode_of};
 
     #[test]
     fn the_layout_matches_the_specification() {
@@ -920,7 +916,12 @@ mod tests {
         let created = names();
         let all = [dir.root().to_path_buf(), dir.restore(), dir.shell()];
         for path in &all {
-            assert_eq!(mode_of(path), Mode::PRIVATE_DIR, "{}", path.display());
+            assert_eq!(
+                mode_of(path),
+                Mode::PRIVATE_DIR.bits(),
+                "{}",
+                path.display()
+            );
         }
         for path in &all {
             for wrong in [0o500, 0o600, 0o750, 0o755, 0o770] {
@@ -929,7 +930,11 @@ mod tests {
                 dir.ensure().expect("again");
                 for path in &all {
                     let shown = path.display();
-                    assert_eq!(mode_of(path), Mode::PRIVATE_DIR, "{shown} from {wrong:04o}");
+                    assert_eq!(
+                        mode_of(path),
+                        Mode::PRIVATE_DIR.bits(),
+                        "{shown} from {wrong:04o}"
+                    );
                 }
             }
         }
@@ -1041,7 +1046,7 @@ mod tests {
         // that directory is `0555`: shared, so `tighten` tries to narrow it,
         // and nothing about it can change.
         let own = std::fs::canonicalize("/proc/self").expect("this process's /proc directory");
-        let found = mode_of(&own);
+        let found = Mode::from_bits(mode_of(&own));
         assert!(found.is_shared(), "{own:?} is {found}");
 
         let err = tighten(&own, Mode::PRIVATE_DIR).expect_err("procfs refuses the chmod");
@@ -1050,7 +1055,7 @@ mod tests {
                 if *path == own && source.raw_os_error() == Some(Errno::PERM.raw_os_error())),
             "got {err}",
         );
-        assert_eq!(mode_of(&own), found, "left as it was");
+        assert_eq!(mode_of(&own), found.bits(), "left as it was");
     }
 
     #[test]
@@ -1236,8 +1241,8 @@ mod tests {
             let (_home, target, dir) = link_to(mode);
             dir.ensure()
                 .unwrap_or_else(|e| panic!("{mode:04o} refused: {e}"));
-            assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
-            assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR);
+            assert_eq!(mode_of(&target), mode, "never chmodded");
+            assert_eq!(mode_of(&dir.restore()), Mode::PRIVATE_DIR.bits());
         }
 
         // Group or other read or write is refused — group included, whether or
@@ -1253,7 +1258,7 @@ mod tests {
             let message = err.to_string();
             assert!(message.contains(&format!("{mode:04o}")), "{message}");
             assert!(message.contains("read or write"), "{message}");
-            assert_eq!(mode_of(&target), Mode::from_bits(mode), "never chmodded");
+            assert_eq!(mode_of(&target), mode, "never chmodded");
             assert!(!target.join("restore").exists(), "nothing was put in it");
         }
     }
@@ -1314,14 +1319,10 @@ mod tests {
             ] {
                 assert!(message.contains(&needle), "missing {needle:?}: {message}");
             }
-            assert_eq!(
-                mode_of(&target),
-                Mode::from_bits(dir_mode),
-                "never chmodded"
-            );
+            assert_eq!(mode_of(&target), dir_mode, "never chmodded");
             assert_eq!(
                 mode_of(&target.join("local.toml")),
-                Mode::from_bits(file_mode),
+                file_mode,
                 "never chmodded",
             );
             assert!(!target.join("restore").exists(), "nothing was put in it");
@@ -1337,11 +1338,7 @@ mod tests {
             let (_home, target, dir) = linked(dir_mode, local);
             dir.ensure()
                 .unwrap_or_else(|e| panic!("{dir_mode:04o} with {local:?} refused: {e}"));
-            assert_eq!(
-                mode_of(&target),
-                Mode::from_bits(dir_mode),
-                "never chmodded"
-            );
+            assert_eq!(mode_of(&target), dir_mode, "never chmodded");
         }
     }
 
@@ -1399,7 +1396,7 @@ mod tests {
                 result.unwrap_or_else(|e| panic!("{layers_mode:04o}: refused: {e}"));
                 drop(ExclusiveLock::acquire(&dir).expect("acquire"));
             }
-            assert_eq!(mode_of(&real), Mode::from_bits(0o644), "never chmodded");
+            assert_eq!(mode_of(&real), 0o644, "never chmodded");
         }
     }
 
@@ -1452,8 +1449,8 @@ mod tests {
         ] {
             assert!(message.contains(&needle), "missing {needle:?}: {message}");
         }
-        assert_eq!(mode_of(&target), Mode::from_bits(0o711), "never chmodded");
-        assert_eq!(mode_of(&file), Mode::from_bits(0o644), "never chmodded");
+        assert_eq!(mode_of(&target), 0o711, "never chmodded");
+        assert_eq!(mode_of(&file), 0o644, "never chmodded");
         assert!(!target.join("restore").exists(), "nothing was put in it");
     }
 
@@ -1664,7 +1661,7 @@ mod tests {
         let dir = StateDir::resolve(home.path());
         dir.ensure().expect("ensure");
         assert!(real.join("restore").is_dir());
-        assert_eq!(mode_of(&real.join("restore")), Mode::PRIVATE_DIR);
+        assert_eq!(mode_of(&real.join("restore")), Mode::PRIVATE_DIR.bits());
     }
 
     #[test]
@@ -1785,7 +1782,7 @@ mod tests {
             "got {err}",
         );
         assert!(err.to_string().contains("chmod go-rw"), "{err}");
-        assert_eq!(mode_of(&shared), Mode::from_bits(0o755), "left as it was");
+        assert_eq!(mode_of(&shared), 0o755, "left as it was");
         assert!(!shared.join("restore").exists(), "nothing was put in it");
     }
 }

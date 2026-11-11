@@ -119,10 +119,11 @@ fn target(home: &GuardedHome) -> Portable {
 }
 
 fn rm(home: &GuardedHome) -> Vec<Restored> {
-    restore::restore_with(
+    restore::restore_undeclared_with(
         &StateDir::resolve(home.path()),
         home.path(),
         &[target(home)],
+        &std::collections::BTreeSet::new(),
         &git(home.path()),
     )
     .expect("rm")

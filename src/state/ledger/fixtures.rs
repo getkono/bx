@@ -1,7 +1,6 @@
 //! What the ledger tests share across its submodules: targets, entries and
 //! priors to record, and a locked state directory to record them in.
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::{Ledger, LedgerView, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef};
@@ -11,7 +10,7 @@ use crate::paths::Portable;
 use crate::state::dir::StateDir;
 use crate::state::lock::ExclusiveLock;
 use crate::state::restore;
-use crate::testing::GuardedHome;
+use crate::testing::{GuardedHome, mode_of};
 
 pub(super) fn target(name: &str) -> Portable {
     Portable::try_from(name.to_string()).expect("a portable path")
@@ -32,10 +31,6 @@ pub(super) fn entry(path: &str, body: &[u8]) -> NewEntry {
         Mechanism::Own,
         PriorBytes::Absent,
     )
-}
-
-pub(super) fn mode_of(path: &Path) -> Mode {
-    Mode::from_bits(std::fs::metadata(path).expect("stat").permissions().mode())
 }
 
 /// Bytes as a prior, at `mode`.
@@ -91,7 +86,7 @@ pub(super) fn apply(
     let observed = match std::fs::read(&dest) {
         Ok(bytes) => PriorBytes::Bytes {
             bytes,
-            mode: mode_of(&dest),
+            mode: Mode::from_bits(mode_of(&dest)),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => PriorBytes::Absent,
         Err(e) => panic!("observing {}: {e}", dest.display()),

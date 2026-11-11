@@ -104,9 +104,9 @@ impl Git {
     /// `git` on `PATH`, seeing `home` and git's own default for the config
     /// home.
     ///
-    /// For a caller that has the home and not the whole [`Env`]:
-    /// [`crate::restore::plan_restore`], whose checks on a checkout read only
-    /// that repository. `bx rm` itself asks through [`Git::new`].
+    /// For a test that has the home and not the whole [`Env`]. Every command
+    /// asks through [`Git::new`], and hands that `git` on to what it calls.
+    #[cfg(test)]
     #[must_use]
     pub fn at_home(home: &Path) -> Self {
         Self {

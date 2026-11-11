@@ -7,6 +7,8 @@ use crate::fs::Mode;
 use crate::journal::Intent;
 pub(super) use crate::journal::tests::interrupted;
 use crate::journal::tests::{intent, plant_file, target, write_to};
+use crate::recover::Interrupted;
+use crate::report::Exit;
 use crate::state::StateDir;
 
 /// An intent to create `rel` under `home`, as a session would journal it.
@@ -25,4 +27,14 @@ pub(super) fn interrupted_modify(state: &StateDir, home: &Path) -> (PathBuf, Vec
         vec![write_to(home, ".conf", "bx new\n", Mode::DEFAULT_FILE)],
     );
     (dest, std::fs::read(state.journal()).expect("the journal"))
+}
+
+/// What `bx plan` exits with over `interrupted` and nothing else, through
+/// the function every read-only command exits through.
+pub(super) fn plan_exit(interrupted: &Interrupted) -> Exit {
+    let report = crate::plan::Report {
+        interrupted: Some(interrupted.clone()),
+        ..crate::plan::Report::default()
+    };
+    crate::plan::exit(&report, crate::plan::Mode::Plan)
 }

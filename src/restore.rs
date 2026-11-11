@@ -42,14 +42,15 @@
 //! detected and rolled back by the same machinery as an interrupted `apply`.
 //! The one exception is a checkout bx cloned: its bytes are git's, so it is
 //! deleted outside the journal, before the session opens, and made crash-safe
-//! by the ledger alone ([`restore_with`] says how).
+//! by the ledger alone ([`restore_undeclared_with`] says how).
 //!
 //! # `plan` and `rm` share one function
 //!
-//! [`plan_restore`] decides what will happen to one target and writes nothing;
-//! [`restore_with`] calls it and then does exactly what it said. That is Invariant 7
-//! applied to the removal path: `rm` cannot do work its own preview did not
-//! announce.
+//! [`plan_restore_with`] and [`plan_restore_undeclared`] decide what will
+//! happen to one target and write nothing; [`restore_undeclared_with`] decides
+//! each target the same way and then does exactly what that said. That is
+//! Invariant 7 applied to the removal path: `rm` cannot do work its own
+//! preview did not announce.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -264,7 +265,7 @@ impl Restored {
 }
 
 /// Decide what `rm` will do to one target, reading the destination and writing
-/// nothing.
+/// nothing, and asking `git` about a checkout bx cloned.
 ///
 /// A destination that cannot be stat'd or read, or whose parent cannot be, is
 /// a [`Restoration::Conflict`], not an error: bx cannot compare it with what it
@@ -281,15 +282,6 @@ impl Restored {
 ///
 /// [`Error::Read`] for a destination path that cannot be observed at all: one
 /// with no parent, or with a `..` component.
-pub fn plan_restore(entry: &LedgerEntry, home: &Path) -> Result<Restoration, Error> {
-    plan_restore_with(entry, home, &Git::at_home(home))
-}
-
-/// [`plan_restore`], asking `git` about a checkout bx cloned.
-///
-/// # Errors
-///
-/// As [`plan_restore`].
 pub fn plan_restore_with(
     entry: &LedgerEntry,
     home: &Path,
@@ -307,7 +299,7 @@ pub fn plan_restore_with(
 ///
 /// # Errors
 ///
-/// As [`plan_restore`].
+/// As [`plan_restore_with`].
 pub fn plan_restore_undeclared(
     entry: &LedgerEntry,
     home: &Path,
@@ -425,7 +417,7 @@ fn plan(
     }
 }
 
-/// [`plan_restore`] for a directory target, from what was observed at `dest`.
+/// [`plan_restore_with`] for a directory target, from what was observed at `dest`.
 ///
 /// Only the directory is bx's, never what is inside it, so the undo is a mode
 /// or an empty directory's removal:
@@ -481,7 +473,7 @@ fn plan_restore_dir(
     }
 }
 
-/// [`plan_restore`] for a symlink target, from what was observed at `dest`.
+/// [`plan_restore_with`] for a symlink target, from what was observed at `dest`.
 ///
 /// The rules a file follows, with a link's text in place of its bytes. Only
 /// the link is bx's, never what it points at:
@@ -541,7 +533,7 @@ fn plan_restore_link(
     }
 }
 
-/// [`plan_restore`] for a git checkout bx cloned, from what was observed at
+/// [`plan_restore_with`] for a git checkout bx cloned, from what was observed at
 /// `dest`.
 ///
 /// The checkout is removed whole, and only when removing it loses nothing but
@@ -589,18 +581,25 @@ fn plan_restore_clone(
     }
 }
 
-/// [`restore_with`], asking the user's own `git` at `home`.
+/// [`restore_undeclared_with`] with every target still declared, asking the
+/// user's own `git` at `home`.
 #[cfg(test)]
 pub fn restore(
     state: &StateDir,
     home: &Path,
     targets: &[Portable],
 ) -> Result<Vec<Restored>, Error> {
-    restore_with(state, home, targets, &Git::at_home(home))
+    restore_undeclared_with(state, home, targets, &BTreeSet::new(), &Git::at_home(home))
 }
 
 /// Put back what bx displaced at each of `targets`, through a journalled
 /// session.
+///
+/// Each of `targets` that `undeclared` names is decided as
+/// [`plan_restore_undeclared`] does: a file nothing declares that was edited
+/// since bx wrote it is [`Restored::Kept`] — left exactly as it is and
+/// forgotten — rather than a conflict. Every other target is decided as
+/// [`plan_restore_with`] does.
 ///
 /// Resolves any interrupted session first — `rm` is a writing command — then
 /// opens a [`SessionKind::Restore`] session, so an `rm` interrupted halfway is
@@ -635,23 +634,6 @@ pub fn restore(
 /// the same lock and before the session opens, by [`remove_clone`]. Every
 /// other target is restored through the session as above. The results are in
 /// the order of `targets`.
-pub fn restore_with(
-    state: &StateDir,
-    home: &Path,
-    targets: &[Portable],
-    git: &Git,
-) -> Result<Vec<Restored>, Error> {
-    restore_undeclared_with(state, home, targets, &BTreeSet::new(), git)
-}
-
-/// [`restore_with`], deciding each of `targets` that `undeclared` names as
-/// [`plan_restore_undeclared`] does: a file nothing declares that was edited
-/// since bx wrote it is [`Restored::Kept`] — left exactly as it is and
-/// forgotten — rather than a conflict.
-///
-/// # Errors
-///
-/// As [`restore_with`].
 pub fn restore_undeclared_with(
     state: &StateDir,
     home: &Path,
@@ -687,7 +669,7 @@ pub fn restore_undeclared_with(
         } else {
             Declared::Yes
         };
-        done[at] = Some(restore_one(&mut session, &targets[at], declared)?);
+        done[at] = Some(restore_one(&mut session, &targets[at], declared, git)?);
     }
     session.finish()?;
     Ok(done.into_iter().flatten().collect())
@@ -764,11 +746,12 @@ pub(crate) fn remove_clone(
 }
 
 /// Restore one target inside an open session, as [`plan`] decides it for
-/// `declared`.
+/// `declared`, asking the `git` its caller was given.
 fn restore_one(
     session: &mut Session,
     target: &Portable,
     declared: Declared,
+    git: &Git,
 ) -> Result<Restored, Error> {
     let Some(entry) = session.ledger().get(target).cloned() else {
         return Ok(Restored::Unmanaged {
@@ -777,7 +760,7 @@ fn restore_one(
     };
 
     let home = session.home().to_path_buf();
-    match plan(&entry, &home, &Git::at_home(&home), declared)? {
+    match plan(&entry, &home, git, declared)? {
         Restoration::AlreadyGone { dest } => {
             session.forget(target);
             Ok(Restored::AlreadyGone {

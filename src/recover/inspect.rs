@@ -557,7 +557,7 @@ mod tests {
         SessionKind, Written,
     };
 
-    use crate::report::{Action, Exit};
+    use crate::report::Exit;
     use crate::state::{ContentHash, LedgerView, Mechanism, Prior, RestoreRef, StateDir};
     use crate::testing::guarded_home;
 
@@ -640,7 +640,7 @@ mod tests {
         };
         assert_eq!(conflicts.len(), 1);
         assert_eq!(conflicts[0].standing, Standing::Diverged);
-        assert_eq!(conflicts[0].action(), Action::Conflict);
+        assert!(!conflicts[0].resolvable, "{:?}", conflicts[0]);
         assert!(conflicts[0].note.contains("will not overwrite"));
         assert!(!outcome.is_clear());
         assert_eq!(
@@ -762,8 +762,15 @@ mod tests {
         plant_file(&home.child(".conf"), "edited\n", Mode::DEFAULT_FILE);
 
         let interruption = pending(&state).expect("pending").expect("interrupted");
-        assert_eq!(interruption.actions(), vec![Action::Conflict]);
-        assert_eq!(interruption.exit(), Exit::Pending);
+        assert_eq!(
+            interruption
+                .unfinished
+                .iter()
+                .map(|write| write.resolvable)
+                .collect::<Vec<_>>(),
+            vec![false],
+        );
+        assert_eq!(plan_exit(&interruption), Exit::Pending);
         assert_eq!(interruption.blocked().count(), 1);
         assert!(interruption.unfinished[0].describe().contains(".conf"));
         assert!(
@@ -781,7 +788,7 @@ mod tests {
         let interruption = pending(&state).expect("pending").expect("interrupted");
         assert!(interruption.unfinished.is_empty());
         assert_eq!(
-            interruption.exit(),
+            plan_exit(&interruption),
             Exit::Pending,
             "the machine is still not converged, so somebody has to look",
         );
@@ -1109,7 +1116,7 @@ mod tests {
         // one does cannot disagree, because the same function computes both.
         let reported = pending(&state).expect("pending").expect("interrupted");
         assert_eq!(reported.unfinished[0].standing, Standing::Written);
-        assert!(reported.unfinished[0].standing.is_resolvable());
+        assert!(reported.unfinished[0].resolvable);
         assert!(reported.unfinished[0].note.contains("rolls it back"));
         assert!(matches!(
             recover(&state).expect("recover"),
@@ -1363,7 +1370,12 @@ mod tests {
             dest,
             created_dirs,
             planned,
-        } = crate::restore::plan_restore(&entry, home.path()).expect("plan")
+        } = crate::restore::plan_restore_with(
+            &entry,
+            home.path(),
+            &crate::git::Git::at_home(home.path()),
+        )
+        .expect("plan")
         else {
             panic!("bx created it, so rm removes it");
         };
@@ -1473,15 +1485,56 @@ mod tests {
 
     #[test]
     fn only_a_destination_in_a_recorded_state_is_resolvable() {
-        for (standing, resolvable) in [
-            (Standing::Prior, true),
-            (Standing::Written, true),
-            (Standing::Vanished, false),
-            (Standing::Diverged, false),
-            (Standing::Foreign, false),
-            (Standing::Unreachable, false),
+        // A write to `~/.d/conf` that modified it and died, its destination
+        // then left in each standing. `resolvable` is what production reads:
+        // what blocks recovery, and what `plan` makes a conflict row of.
+        fn prior(dest: &Path) {
+            plant_file(dest, "old\n", Mode::DEFAULT_FILE);
+        }
+        fn written(_: &Path) {}
+        fn vanished(dest: &Path) {
+            std::fs::remove_file(dest).expect("rm");
+        }
+        fn diverged(dest: &Path) {
+            plant_file(dest, "edited after the crash\n", Mode::DEFAULT_FILE);
+        }
+        fn foreign(dest: &Path) {
+            std::fs::remove_file(dest).expect("rm");
+            std::fs::create_dir(dest).expect("a directory in its place");
+        }
+        fn unreachable(dest: &Path) {
+            let parent = dest.parent().expect("a parent");
+            std::fs::remove_dir_all(parent).expect("rm the parent");
+            std::os::unix::fs::symlink(parent.with_file_name("nowhere"), parent)
+                .expect("a dangling link in its place");
+        }
+
+        let guard = guarded_home();
+        for (name, change, standing, resolvable) in [
+            ("prior", prior as fn(&Path), Standing::Prior, true),
+            ("written", written, Standing::Written, true),
+            ("vanished", vanished, Standing::Vanished, false),
+            ("diverged", diverged, Standing::Diverged, false),
+            ("foreign", foreign, Standing::Foreign, false),
+            ("unreachable", unreachable, Standing::Unreachable, false),
         ] {
-            assert_eq!(standing.is_resolvable(), resolvable, "{standing:?}");
+            let home = guard.child(name);
+            let dest = home.join(".d/conf");
+            std::fs::create_dir_all(dest.parent().expect("a parent")).expect("the parent");
+            plant_file(&dest, "old\n", Mode::DEFAULT_FILE);
+            let state = StateDir::resolve(&home);
+            interrupted(
+                &state,
+                &home,
+                vec![write_to(&home, ".d/conf", "new\n", Mode::DEFAULT_FILE)],
+            );
+            change(&dest);
+
+            let report = pending(&state).expect("pending").expect("interrupted");
+            let write = &report.unfinished[0];
+            assert_eq!(write.standing, standing, "{name}");
+            assert_eq!(write.resolvable, resolvable, "{name}: {write:?}");
+            assert_eq!(report.blocked().count(), usize::from(!resolvable), "{name}");
         }
     }
 }

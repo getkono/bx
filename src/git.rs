@@ -44,7 +44,7 @@ const REPOSITORY_VARIABLES: &[&str] = &[
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// `git` could not be started at all.
-    #[error("running `git {args}`: {source}; bx sync needs git on PATH")]
+    #[error("running `git {args}`: {source}; bx needs git on PATH")]
     Spawn {
         /// The arguments it was given.
         args: String,
@@ -436,7 +436,10 @@ mod tests {
             .query(home.path(), &["status"])
             .expect_err("no such program");
         assert!(matches!(error, Error::Spawn { .. }), "{error:?}");
-        assert!(error.to_string().contains("needs git on PATH"), "{error}");
+        assert!(
+            error.to_string().ends_with("; bx needs git on PATH"),
+            "{error}"
+        );
     }
 
     #[test]

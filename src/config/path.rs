@@ -398,13 +398,13 @@ fn spelled(text: &str) -> Result<String, String> {
 ///
 /// - zsh: `path=(${path:#DIR})`, every element of the array tied to `PATH`
 ///   that is `DIR` dropped.
-/// - bash, which has no such array: [`BASH_REMOVAL`] around `DIR`, one line
+/// - bash, which has no such array: `BASH_REMOVAL` around `DIR`, one line
 ///   of five assignments to `PATH`. It doubles every `:` and wraps the list in
 ///   one more at each end, so each entry stands alone between its own two
 ///   colons; drops every `:DIR:`, which with no colon shared between two
 ///   entries takes out every copy, adjacent ones included; then collapses the
 ///   doubled colons and strips the two it added. `DIR` is double-quoted, so
-///   nothing in it is a glob, and each `/` in it is written [`BASH_SLASH`],
+///   nothing in it is a glob, and each `/` in it is written `BASH_SLASH`,
 ///   outside the quotes and escaped, so it does not end the pattern: bash
 ///   3.2, macOS's, ends it at a `/` even inside double quotes.
 ///
@@ -415,7 +415,7 @@ fn spelled(text: &str) -> Result<String, String> {
 /// missing returns 1, and a file sourced at startup returns the status of its
 /// last command, so a `zshenv` fragment ending on one would stop a shell
 /// running under `ERR_EXIT` (`zsh -e`) before its prompt. When the last line
-/// written is gated, the block closes with [`SETTLE`], which assigns `PATH`
+/// written is gated, the block closes with `SETTLE`, which assigns `PATH`
 /// its own value and returns 0.
 #[must_use]
 pub fn render(entries: &[PathEntry], shell: Shell) -> String {

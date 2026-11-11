@@ -189,7 +189,7 @@ pub fn load(path: &Path) -> Result<Loaded, Error> {
 /// appending to the journal while it is moved. A reader without it could rename
 /// a live journal out from under the session writing it, which is why [`load`]
 /// does not. A journal set aside earlier is never renamed over: see
-/// [`crate::state::StateDir::quarantine`].
+/// `crate::state::StateDir::quarantine`.
 ///
 /// # Errors
 ///

@@ -84,11 +84,11 @@ pub fn place(merged: &Config, values: &ResolvedValues) -> Result<Vec<Resolution<
 }
 
 /// Every target the shell declarations of `merged` place on `platform`:
-/// zsh's ([`place_envs`]), then bash's ([`super::bash::place`]).
+/// zsh's (`place_envs`), then bash's ([`super::bash::place`]).
 ///
 /// # Errors
 ///
-/// Whatever [`place_envs`] or [`super::bash::place`] returns.
+/// Whatever `place_envs` or [`super::bash::place`] returns.
 pub fn place_on(
     merged: &Config,
     values: &ResolvedValues,
@@ -425,7 +425,7 @@ fn fragment_target(place: Place, path: Portable, generator: Gen, origin: &Origin
 /// A header-only fragment for each place the placement graph no longer puts a
 /// variable in, but whose fragment bx wrote earlier.
 ///
-/// [`place_envs`] emits nothing for a place no enabled variable lands in, so a
+/// `place_envs` emits nothing for a place no enabled variable lands in, so a
 /// variable switched off, removed, or moved to another `kind` would otherwise
 /// leave the fragment bx wrote for it in place — `export EDITOR=…` still
 /// sourced by every shell, with no plan row saying so. `recorded` answers

@@ -147,7 +147,7 @@ fn resolved_or_blocked(state: &StateDir, lock: &ExclusiveLock) -> Result<Outcome
 /// was an interruption this run could not resolve.
 ///
 /// Only the guard comes back. The recovery's [`Outcome`] is logged by
-/// [`resolve`] and not returned: no writing command has a channel to report it
+/// `resolve` and not returned: no writing command has a channel to report it
 /// on yet, and a value every caller binds to `_` is a value the next reader has
 /// to work out the point of. A command layer that grows such a channel adds it
 /// back with a caller that reads it. Until then [`recover`] is the form that

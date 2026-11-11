@@ -658,7 +658,7 @@ pub enum Replay {
 /// When the config repo's branch has diverged from its upstream only by
 /// commits `bx update` and `bx upgrade` make, each with one parent — a lock
 /// commit, with [`SUBJECT`] and touching `bx.lock` alone, a carry of tracked
-/// copies, with [`sync::CARRIED_SUBJECT`] and not touching `bx.lock`, or a
+/// copies, with `sync::CARRIED_SUBJECT` and not touching `bx.lock`, or a
 /// pin commit, with [`crate::pin::SUBJECT`] and touching committed layers
 /// alone — replay them on
 /// top of the upstream, as `git rebase` does. Every lock and copy they held
@@ -1669,7 +1669,7 @@ pub fn finished(inputs: &crate::plan::Inputs) -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// As [`Stamps::set`] and [`Stamps::write`].
+/// As [`Stamps::set`] and `Stamps::write`.
 pub fn settled(state: &StateDir, ask: Option<Option<Interval>>, why: &str) -> Result<(), Error> {
     let stamps = Stamps::of(state);
     // Read before `set` moves it, as the hook reads it before it answers: the

@@ -31,7 +31,7 @@ pub const TEMP_PREFIX: &str = ".bx-";
 /// # What "the temporary file is removed" is worth
 ///
 /// This is the one place that statement is qualified, and every other mention
-/// of it in `fs::atomic` and in [`crate::fs::durable`] points here rather than
+/// of it in `fs::atomic` and in `crate::fs::durable` points here rather than
 /// repeating it, so there is one sentence to be right rather than six.
 ///
 /// Dropping a `Staged` or a [`Filled`] asks the kernel to unlink the `.bx-`

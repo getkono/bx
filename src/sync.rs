@@ -347,7 +347,7 @@ pub(crate) const CARRIED_SUBJECT: &str = "chore: carry tracked files back from b
 /// every copy committed: the session that writes them is rolled back whole,
 /// and a commit is one ref update.
 ///
-/// The message is [`CARRIED_SUBJECT`] and the repo-relative paths in byte
+/// The message is `CARRIED_SUBJECT` and the repo-relative paths in byte
 /// order, one per line: no host, account or time. The commit runs the user's
 /// own hooks and signing, like any commit they make.
 ///

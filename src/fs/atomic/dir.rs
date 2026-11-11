@@ -224,7 +224,7 @@ impl CreatedDirs {
 
     /// The mode a directory target in this apply declares for `path`, if any.
     ///
-    /// Answers for the same directory however it is spelled — see [`DirKey`].
+    /// Answers for the same directory however it is spelled — see `DirKey`.
     #[must_use]
     pub fn declared(&self, path: &Path) -> Option<Mode> {
         self.declared.get(&DirKey::of(path)).copied()

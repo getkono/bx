@@ -183,7 +183,7 @@ pub enum Error {
         #[source]
         source: rmp_serde::encode::Error,
     },
-    /// A record encoded to more than [`MAX_FRAME`] bytes.
+    /// A record encoded to more than `MAX_FRAME` bytes.
     #[error("a journal record of {len} bytes exceeds the {MAX_FRAME}-byte frame limit")]
     FrameTooLarge {
         /// How big it was.

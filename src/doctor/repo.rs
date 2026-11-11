@@ -17,7 +17,7 @@
 //! note says when that fetch was, from `FETCH_HEAD`'s modification time.
 //!
 //! For each followed external whose checkout the ledger records as bx's own
-//! finished clone, local work in it — what [`kept_by_rm`] would keep `bx rm`
+//! finished clone, local work in it — what `kept_by_rm` would keep `bx rm`
 //! from removing — is a finding.
 //!
 //! A config repo that is not a git repository at all (it holds no `.git`) is

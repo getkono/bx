@@ -93,7 +93,7 @@ use super::dir::{check_lock, ensure_dir, move_aside, quarantines};
 use super::lock::ExclusiveLock;
 use crate::fs::{Mode, write_atomically};
 
-/// The longest state file [`load`] reads: 256 MiB.
+/// The longest state file `load` reads: 256 MiB.
 ///
 /// Far beyond anything bx writes — the ledger indexes restore blobs rather
 /// than holding their bytes, and the fingerprint cache holds one hash per
@@ -145,7 +145,7 @@ pub(crate) enum Loss {
 /// Every variant but [`Damage::DanglingLink`], [`Damage::NotAFile`] and
 /// [`Damage::TooLarge`] is a decode failure: the bytes were read, and they are
 /// not a usable envelope. Those three are what is at the name rather than what
-/// is in it, and are damage only for a [`Loss::Recomputable`] file. A file
+/// is in it, and are damage only for a `Loss::Recomputable` file. A file
 /// that could not be read is not represented here — see [`Error::Read`] and the
 /// module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,7 +160,7 @@ pub enum Damage {
         found: String,
     },
     /// The envelope was written by a newer bx than this one. Only ever the
-    /// health of a [`Loss::Recomputable`] file; for the ledger this is
+    /// health of a `Loss::Recomputable` file; for the ledger this is
     /// [`Error::FutureVersion`].
     FutureVersion {
         /// The version on disk.
@@ -171,7 +171,7 @@ pub enum Damage {
     /// The file's path is a symbolic link that leads nowhere: to something
     /// that does not exist, round a loop of links, or through a file.
     ///
-    /// Only ever the health of a [`Loss::Recomputable`] file, where losing
+    /// Only ever the health of a `Loss::Recomputable` file, where losing
     /// what the link named costs a recomputation; for the ledger this is
     /// [`Error::DanglingLink`]. Nothing is read through the link, and the
     /// quarantine moves the link itself, never what it names.
@@ -180,7 +180,7 @@ pub enum Damage {
     /// not a regular file or a directory: a FIFO, a device or a socket. A
     /// directory is [`Error::Read`], as it always was.
     ///
-    /// Only ever the health of a [`Loss::Recomputable`] file; for the ledger
+    /// Only ever the health of a `Loss::Recomputable` file; for the ledger
     /// this is [`Error::StateNotAFile`]. Nothing is read from it — a FIFO
     /// would block the read until a writer appeared, and a link to
     /// `/dev/zero` would never end — and the quarantine moves the name, never
@@ -189,7 +189,7 @@ pub enum Damage {
     /// The file is longer than [`MAX_STATE_FILE`], a length no state file bx
     /// writes comes near.
     ///
-    /// Only ever the health of a [`Loss::Recomputable`] file; for the ledger
+    /// Only ever the health of a `Loss::Recomputable` file; for the ledger
     /// this is [`Error::StateTooLarge`]. At most one byte past the limit is
     /// read, so an oversized file costs a bounded allocation rather than
     /// whatever its length is.

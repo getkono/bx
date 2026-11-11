@@ -41,8 +41,13 @@ description = "Check formatting without modifying files (used by CI and pre-push
 run = "cargo fmt --check"
 
 [tasks.lint]
-description = "Lint with Clippy, treating warnings as errors"
-run = "cargo clippy --all-targets -- -D warnings"
+description = "Lint with Clippy and rustdoc, treating warnings as errors"
+# rustdoc's lints (a private or broken intra-doc link, an ambiguous one) are
+# not clippy's, so the docs are built too, and a warning there fails the task.
+run = [
+  "cargo clippy --all-targets -- -D warnings",
+  'RUSTDOCFLAGS="-D warnings" cargo doc --no-deps',
+]
 
 [tasks.lint-fix]
 description = "Lint and auto-fix where possible (used by the pre-commit hook)"

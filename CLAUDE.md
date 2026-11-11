@@ -120,7 +120,8 @@ reversibility, additivity, and crash-safety.
 Validate changes with `mise run`:
 
 - `format` / `format-check` — `cargo fmt`
-- `lint` / `lint-fix` — clippy, warnings as errors
+- `lint` / `lint-fix` — clippy, warnings as errors; `lint` also builds the
+  docs with rustdoc warnings denied, which `lint-fix` leaves out
 - `test` — the suite
 - `coverage` — ≥ 80% lines, `main.rs` excluded
 - `bench` — the 5 ms shell-startup budget

@@ -248,7 +248,7 @@ impl StateDir {
     /// `bx/restore/`, `bx/shell/` — are created at `0700` and set back to
     /// `0700` whenever they are found at anything else, because they hold
     /// `local.toml`, the age identity, and prior copies of the user's private
-    /// files. See [`tighten`] for why a directory already there is repaired
+    /// files. See `tighten` for why a directory already there is repaired
     /// whoever made it, why a linked one is refused rather than changed, and
     /// what ownership is checked.
     ///
@@ -256,10 +256,10 @@ impl StateDir {
     /// `apply` is the entry that will call it. A read-only command still
     /// creates the state *root*, because `bx plan` and `bx doctor` take the
     /// shared lock and a lock needs a file — but that goes through
-    /// [`ensure_dir`] on the root alone, not through here, so `restore/` and
+    /// `ensure_dir` on the root alone, not through here, so `restore/` and
     /// `shell/` are not created by a read. Invariant 1 forbids rewriting a byte
     /// the *user* wrote, and none of these paths is one; see the
-    /// [`super::lock`] module documentation for the argument.
+    /// `super::lock` module documentation for the argument.
     ///
     /// # Errors
     ///

@@ -340,7 +340,7 @@ impl Ledger {
     /// Undo a [`Ledger::record`] whose write never landed, by putting back the
     /// entry `withdrawal` captured before it — or no entry, when there was none.
     ///
-    /// Take the [`Withdrawal`] with [`LedgerView::withdrawal`] **before** the
+    /// Take the `Withdrawal` with [`LedgerView::withdrawal`] **before** the
     /// `record`, keep it across the publish, and hand it here when the publish
     /// is refused. The entry comes back exactly as it was: its prior, its
     /// history and its created directories, not only its key. Returns the
@@ -477,12 +477,12 @@ impl Ledger {
     ///
     /// A load that found a key mismatch reports and acts on that alone, and
     /// leaves a stray `created_dirs` entry in a surviving row for the next
-    /// load to strip — see [`LedgerView::check_paths`]. Saving the view
+    /// load to strip — see `LedgerView::check_paths`. Saving the view
     /// verbatim would put it on disk, and the next read would report
     /// `UnrelatedCreatedDirs` on a file bx had just written. So this strips
     /// them here too, and warns.
     ///
-    /// [`merge_created_dirs`] does the same on the `record` path, and both are
+    /// `merge_created_dirs` does the same on the `record` path, and both are
     /// needed rather than one: `record` hands the entry back to its caller
     /// before any save, so a caller acting on what it returns must not see a
     /// stray either. "The write path" means **every** write: the rule on

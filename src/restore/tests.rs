@@ -617,10 +617,10 @@ fn one_conflicting_target_does_not_stop_the_others() {
 
 #[test]
 fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
-    // Were `plan_restore` to return `Error::Read` for a destination it
-    // cannot read, `restore` would drop its session with `?`: the journal
-    // would stand, and the next writing run roll back every target this
-    // `rm` had already restored.
+    // Were `plan_restore_with` to return `Error::Read` for a destination
+    // it cannot read, `restore` would drop its session with `?`: the
+    // journal would stand, and the next writing run roll back every target
+    // this `rm` had already restored.
     use std::os::unix::fs::PermissionsExt as _;
 
     let home = guarded_home();
@@ -691,9 +691,9 @@ fn a_destination_rm_cannot_read_is_a_conflict_and_the_rest_still_restore() {
 #[test]
 fn an_rm_target_whose_parent_does_not_resolve_is_a_conflict_and_the_rest_still_restore() {
     // A destination whose parent does not resolve is observed as absent.
-    // Were `plan_restore` to say Revert (or AlreadyGone) for it, rm's write
-    // would fail with UnusableParent and stop the whole rm, and the next
-    // writing run would roll back the target it had restored.
+    // Were `plan_restore_with` to say Revert (or AlreadyGone) for it, rm's
+    // write would fail with UnusableParent and stop the whole rm, and the
+    // next writing run would roll back the target it had restored.
     let guard = guarded_home();
     for displaced in [true, false] {
         let case = format!("the second target displaced a file: {displaced}");
@@ -1018,8 +1018,8 @@ fn plan_restore_says_exactly_what_restore_then_does() {
 #[test]
 fn an_edit_between_plan_restore_and_the_removal_is_kept_and_nothing_is_unlinked() {
     // A removal carries plan's observation; without it, an edit landing
-    // after `plan_restore` would be unlinked, surviving only as a blob
-    // nothing named.
+    // after `plan_restore_with` would be unlinked, surviving only as a
+    // blob nothing named.
     let home = guarded_home();
     let state = StateDir::resolve(home.path());
     let rel = ".config/app/created.conf";

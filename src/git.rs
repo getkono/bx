@@ -419,6 +419,55 @@ mod tests {
     }
 
     #[test]
+    fn a_bounded_git_in_its_own_group_leads_one_and_otherwise_shares_bxs() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        use rustix::process::{Pid, Signal, getpgid, getpgrp, kill_process};
+
+        let home = guarded_home();
+        // A stand-in for git that leaves a process behind, its pipes closed
+        // so the command still returns, and prints that process's id.
+        let program = home.path().join("git");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nsleep 30 </dev/null >/dev/null 2>&1 &\necho $!\n",
+        )
+        .expect("write the stand-in");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make it executable");
+        for own_group in [false, true] {
+            let git = git(home.path())
+                .with_program(&program)
+                .with_deadline(Instant::now() + Duration::from_secs(30));
+            let git = if own_group { git.in_own_group() } else { git };
+            // Another test thread that forks while the stand-in is open for
+            // writing holds that descriptor until its child calls `exec`, and
+            // running it inside that window fails with `ETXTBSY`. The window
+            // closes on its own, so only that error is retried.
+            let mut printed = None;
+            for _ in 0..200 {
+                match git.query(home.path(), &["status"]) {
+                    Err(Error::Spawn { source, .. })
+                        if source.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    answer => {
+                        printed = Some(answer.expect("it runs"));
+                        break;
+                    }
+                }
+            }
+            let printed = printed.expect("the stand-in stayed busy");
+            let left = Pid::from_raw(printed.parse().expect("a pid")).expect("a positive pid");
+            let group = getpgid(Some(left)).expect("the leftover is running");
+            let _ = kill_process(left, Signal::KILL);
+            assert_eq!(group != getpgrp(), own_group, "own_group {own_group}");
+        }
+    }
+
+    #[test]
     fn a_git_past_its_deadline_did_not_finish_in_time() {
         let home = guarded_home();
         let error = git(home.path())

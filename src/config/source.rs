@@ -83,7 +83,7 @@ pub fn parse_phase(raw: &str) -> Result<Phase, String> {
         Some(Phase::Terminal) => {
             "; `terminal` is the single slot one plugin may claim, and a source never claims it"
         }
-        Some(Phase::Env | Phase::Path) => {
+        Some(phase) if phase.assigns() => {
             "; that phase holds only environment fragments bx judges, and a source is not one"
         }
         Some(Phase::Completion) => "; that phase is the completion system's own setup",

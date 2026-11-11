@@ -183,9 +183,16 @@ impl Phase {
             Self::Terminal => "terminal",
         }
     }
+
+    /// Whether the phase may hold an environment assignment: only `env` and
+    /// `path`, whose content must be an environment fragment the plan judges.
+    #[must_use]
+    pub const fn assigns(self) -> bool {
+        matches!(self, Self::Env | Self::Path)
+    }
 }
 
-// Only tests ask these, so they sit last, beside them.
+// Only tests ask this, so it sits last, beside them.
 #[cfg(test)]
 impl Shells {
     /// Only `shell`.
@@ -195,16 +202,6 @@ impl Shells {
             zsh: matches!(shell, Shell::Zsh),
             bash: matches!(shell, Shell::Bash),
         }
-    }
-}
-
-#[cfg(test)]
-impl Phase {
-    /// Whether the phase may hold an environment assignment: only `env` and
-    /// `path`, whose content must be an environment fragment the plan judges.
-    #[must_use]
-    pub const fn assigns(self) -> bool {
-        matches!(self, Self::Env | Self::Path)
     }
 }
 

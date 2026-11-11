@@ -283,7 +283,7 @@ mod tests {
     use crate::paths::Portable;
     use crate::plan::tests::seed;
     use crate::state::{ExclusiveLock, Ledger, Mechanism, NewEntry, PriorBytes, StateDir};
-    use crate::sync::tests::{cloned, commit_all, git as test_git, other, rev, run};
+    use crate::testing::git::{cloned, commit_all, git as test_git, other, rev, run};
     use crate::testing::{GuardedHome, guarded_home};
 
     /// The notes doctor finds in `home`'s config repo, with no externals.

@@ -3,7 +3,7 @@
 
 use super::update_command::{AT, layer, publish, upstream};
 use super::*;
-use crate::sync::tests::{cloned, commit_all, git, rev, run};
+use crate::testing::git::{cloned, commit_all, git, rev, run};
 use crate::testing::{GuardedHome, mode_of};
 
 /// Where the pinned external is checked out, relative to the home.
@@ -385,7 +385,7 @@ fn a_pin_subject_on_a_commit_that_touches_no_layer_is_not_replayed() {
     let (repo, _, _) = released(&home);
     std::fs::write(repo.join("notes"), "mine\n").expect("a note");
     commit_all(home.path(), &repo, pin::SUBJECT);
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("theirs"), "x\n").expect("a file");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -580,7 +580,7 @@ fn a_pin_commit_whose_push_was_refused_is_replayed_over_another_machines_push() 
     upgrade(&home, &[], Upgrading::Upgrade { yes: true }, &mut refused).expect("upgrade");
     assert!(text(&refused).contains("was refused"), "{}", text(&refused));
     std::fs::remove_file(&hook).expect("the hook");
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);

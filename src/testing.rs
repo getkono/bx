@@ -54,6 +54,9 @@ use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
 
+#[cfg(test)]
+pub(crate) mod git;
+
 /// Canonicalise if possible, and fall back to the path as given.
 ///
 /// `/tmp` is frequently a symlink and `env::temp_dir()` honours `TMPDIR`, so the

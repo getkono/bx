@@ -3,7 +3,7 @@ use super::*;
 use crate::plan::DiffKind;
 use crate::plan::tests::inputs;
 use crate::restore::{self, Restored};
-use crate::sync::tests::{commit_all, run as git_run};
+use crate::testing::git::{commit_all, run as git_run};
 use crate::testing::{GuardedHome, guarded_home};
 
 /// Where the external is checked out, relative to the home.
@@ -23,7 +23,7 @@ struct Upstream {
 
 /// `git` for a test: the tempdir home's configuration only, unattended.
 fn git(home: &Path) -> Git {
-    crate::sync::tests::git(home).unattended()
+    crate::testing::git::git(home).unattended()
 }
 
 /// An upstream repository at `~/upstream`, reachable as [`URL`].

@@ -1,6 +1,6 @@
 use super::*;
 use crate::sync;
-use crate::sync::tests::{cloned, commit_all, git, other, rev, run};
+use crate::testing::git::{cloned, commit_all, git, other, rev, run};
 
 /// Commit `layer` as `bx.toml` on a second machine and push it.
 fn publish_elsewhere(home: &crate::testing::GuardedHome, layer: &str) -> String {

@@ -367,11 +367,11 @@ mod tests {
     use super::*;
     use crate::config::Origin;
     use crate::config::external::Pin;
-    use crate::sync::tests::{commit_all, run as git_run};
+    use crate::testing::git::{commit_all, run as git_run};
     use crate::testing::{GuardedHome, guarded_home};
 
     fn git(home: &Path) -> Git {
-        crate::sync::tests::git(home).unattended()
+        crate::testing::git::git(home).unattended()
     }
 
     /// A repository at `~/src/a` holding `files`, committed; its commit.

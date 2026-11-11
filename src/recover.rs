@@ -26,8 +26,8 @@
 //!
 //! # Who recovers, and who only reports
 //!
-//! A **writing** command that recovers and then writes in the same run — `rm`
-//! today — calls [`lock_for_writing`] first, which recovers under the state
+//! A **writing** command that recovers and then writes in the same run — `add`
+//! and `rm` today — calls [`lock_for_writing`] first, which recovers under the state
 //! directory's lock, refuses to go on if it cannot, and hands that same lock to
 //! the session it is about to open, so no second bx can win the directory in
 //! between. Nothing in the type system makes such a command use it rather than

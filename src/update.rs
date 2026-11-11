@@ -3,9 +3,10 @@
 //! shell reads to decide whether to ask.
 //!
 //! The command itself — pull, look, show the plan, confirm, lock, commit,
-//! apply — is [`crate::command::update`], beside `apply` and `sync`, whose
-//! rendering and confirmation it shares. What lives here is what is `bx
-//! update`'s alone.
+//! apply — is `run`, shared with `bx upgrade` and entered through
+//! [`crate::command::update`], beside `apply` and `sync`, whose rendering
+//! and confirmation it shares. What lives here is what is `bx update`'s
+//! alone.
 //!
 //! # Looking
 //!
@@ -103,6 +104,8 @@ use crate::paths::{self, Portable};
 use crate::plan::external::finished_clone;
 use crate::state::StateDir;
 use crate::sync;
+
+pub(crate) mod run;
 
 /// How long `bx update --background` may take, from start to finish:
 /// counted from when [`check`] begins, before the configuration is loaded, so

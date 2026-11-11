@@ -295,7 +295,7 @@ impl Git {
 mod tests {
     use super::*;
     use crate::plan::tests::env;
-    use crate::sync::tests::git;
+    use crate::testing::git::git;
     use crate::testing::guarded_home;
 
     #[test]

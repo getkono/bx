@@ -636,9 +636,9 @@ fn a_branch_the_remote_lacks_is_unreachable_not_an_error() {
     let home = guarded_home();
     let repo = home.child("upstream");
     std::fs::create_dir_all(&repo).unwrap();
-    crate::sync::tests::run(home.path(), &repo, &["init", "--quiet", "-b", "main"]);
+    crate::testing::git::run(home.path(), &repo, &["init", "--quiet", "-b", "main"]);
     std::fs::write(repo.join("f"), "f\n").unwrap();
-    crate::sync::tests::commit_all(home.path(), &repo, "f");
+    crate::testing::git::commit_all(home.path(), &repo, "f");
     std::fs::write(
         home.child(".gitconfig"),
         format!(
@@ -647,12 +647,12 @@ fn a_branch_the_remote_lacks_is_unreachable_not_an_error() {
         ),
     )
     .unwrap();
-    let git = crate::sync::tests::git(home.path()).unattended();
+    let git = crate::testing::git::git(home.path()).unattended();
     let mut external = followed("~/upstream-clone", Check::Ask);
     external.path = Portable::parse_in("~/clone", home.path()).unwrap();
     external.url = "https://h/o/upstream".to_string();
 
-    let tip = crate::sync::tests::rev(home.path(), &repo, "HEAD");
+    let tip = crate::testing::git::rev(home.path(), &repo, "HEAD");
     let ledger = crate::state::LedgerView::default();
     let seen = look(&git, home.path(), &external, &Lock::default(), &ledger);
     assert_eq!(
@@ -686,7 +686,7 @@ fn a_branch_the_remote_lacks_is_unreachable_not_an_error() {
 
     // The user's own clone at the path is never fetched into: without a
     // ledger entry it is asked with ls-remote, and proves nothing.
-    crate::sync::tests::run(
+    crate::testing::git::run(
         home.path(),
         home.path(),
         &["clone", "--quiet", "https://h/o/upstream", "clone"],

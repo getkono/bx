@@ -21,7 +21,7 @@ use super::{Action, Change, Inputs, LedgerView, Mechanism, Mode, Report, StateDi
 use crate::config::env::ENVIRONMENT_D;
 use crate::paths::Portable;
 use crate::shell::bash;
-use crate::sync::tests::{commit_all, git, run as git_run};
+use crate::testing::git::{commit_all, git, run as git_run};
 use crate::testing::{GuardedHome, guarded_home};
 
 /// What is on disk at a generated target before bx runs.

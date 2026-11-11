@@ -1,7 +1,7 @@
 use super::*;
 use crate::config::lock::Lock;
-use crate::sync::tests::{cloned, commit_all, git, rev, run};
 use crate::testing::GuardedHome;
+use crate::testing::git::{cloned, commit_all, git, rev, run};
 use crate::update::Stamps;
 
 /// Where the followed external is checked out, relative to the home.
@@ -145,7 +145,7 @@ fn a_push_refused_because_the_upstream_moved_keeps_the_lock_and_names_bx_sync() 
     let (repo, _) = following(&home);
     // Another machine's commit, pushed aside; the hook moves the upstream to
     // it once the lock is committed, after the pull.
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(
@@ -963,7 +963,7 @@ fn a_branch_diverged_only_by_unpushed_lock_commits_catches_up_and_locks_again() 
     // machine pushes a change of its own.
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -995,7 +995,7 @@ fn diverged(home: &GuardedHome) -> std::path::PathBuf {
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(home, &["skills/b/SKILL.md"]);
     update_unpushed(home);
-    let other = crate::sync::tests::other(home);
+    let other = crate::testing::git::other(home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1092,7 +1092,7 @@ fn a_replay_the_upstream_already_holds_says_so() {
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
     // Another machine locked the very same commit and pushed it.
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::copy(repo.join("bx.lock"), other.join("bx.lock")).expect("bx.lock");
     commit_all(home.path(), &other, update::SUBJECT);
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1178,7 +1178,7 @@ fn lock_commits_both_machines_made_are_left_for_a_person() {
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
     // The other machine locked a commit of its own on the same line.
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     let theirs = std::fs::read_to_string(other.join("bx.lock"))
         .expect("bx.lock")
         .replace(&first, &"d".repeat(40));
@@ -1213,7 +1213,7 @@ fn a_branch_diverged_by_a_persons_commit_is_left_for_them() {
     let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
     std::fs::write(repo.join("bx.lock"), format!("{edited}# mine\n")).expect("an edit");
     commit_all(home.path(), &repo, "mine");
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1407,7 +1407,7 @@ pub(super) fn pushed_and_moved(home: &GuardedHome) -> (std::path::PathBuf, Strin
 
 /// Another machine locks the external at `tip` and pushes it.
 pub(super) fn locked_elsewhere(home: &GuardedHome, tip: &str) {
-    let other = crate::sync::tests::other(home);
+    let other = crate::testing::git::other(home);
     let lock = std::fs::read_to_string(other.join("bx.lock")).expect("bx.lock");
     let from = locked(home).expect("locked here");
     std::fs::write(other.join("bx.lock"), lock.replace(&from, tip)).expect("bx.lock");
@@ -1492,7 +1492,7 @@ fn a_background_check_judges_what_the_upstream_has_not_locked_against_its_lock()
 fn a_background_check_behind_an_upstream_with_the_same_lock_judges_its_own() {
     let home = guarded_home();
     let (repo, _) = pushed_and_moved(&home);
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1543,7 +1543,7 @@ fn a_background_check_diverged_from_its_upstream_judges_its_own_lock() {
     let (repo, _) = pushed_and_moved(&home);
     std::fs::write(repo.join("mine"), "x\n").expect("a note");
     commit_all(home.path(), &repo, "mine");
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1563,7 +1563,7 @@ fn a_background_check_with_nothing_on_auto_never_fetches_the_config_repo() {
     let (repo, _) = locked_once(&home);
     run(home.path(), &repo, &["push", "--quiet"]);
     let tracked = rev(home.path(), &repo, "origin/master");
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1761,7 +1761,7 @@ fn update_says_it_fast_forwarded_and_declining_locks_nothing() {
     let (repo, _) = locked_once(&home);
     // Pushed, as `bx sync` would; then another machine pushed too.
     run(home.path(), &repo, &["push", "--quiet"]);
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -1982,7 +1982,7 @@ fn an_update_a_diverged_config_repo_refuses_answers_the_offer_and_says_why() {
     let edited = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
     std::fs::write(repo.join("bx.lock"), format!("{edited}# mine\n")).expect("an edit");
     commit_all(home.path(), &repo, "mine");
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     std::fs::write(other.join("notes"), "x\n").expect("a note");
     commit_all(home.path(), &other, "elsewhere");
     run(home.path(), &other, &["push", "--quiet"]);
@@ -2003,7 +2003,7 @@ fn an_update_both_machines_locked_answers_the_offer_and_says_why() {
     run(home.path(), &repo, &["push", "--quiet"]);
     publish(&home, &["skills/b/SKILL.md"]);
     update_unpushed(&home);
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     let theirs = std::fs::read_to_string(other.join("bx.lock"))
         .expect("bx.lock")
         .replace(&first, &"d".repeat(40));

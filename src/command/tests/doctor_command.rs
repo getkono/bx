@@ -1,5 +1,5 @@
 use super::*;
-use crate::sync::tests::{cloned, git, run};
+use crate::testing::git::{cloned, git, run};
 
 #[test]
 fn doctor_names_a_modified_file_and_an_unpushed_commit_and_is_pending() {

@@ -3,8 +3,8 @@
 
 use super::update_command::{AT, layer, locked_elsewhere, publish, pushed_and_moved, upstream};
 use super::*;
-use crate::sync::tests::{cloned, commit_all, git, rev, run};
 use crate::testing::GuardedHome;
+use crate::testing::git::{cloned, commit_all, git, rev, run};
 use crate::update::Stamps;
 
 /// A tracked target, beside the followed external of [`layer`].
@@ -197,7 +197,7 @@ fn refusing_pushes(repo: &Path) -> std::path::PathBuf {
 
 /// Another machine commits `file` holding `body` and pushes it.
 fn pushed_elsewhere(home: &GuardedHome, file: &str, body: &str) {
-    let other = crate::sync::tests::other(home);
+    let other = crate::testing::git::other(home);
     let path = other.join(file);
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("a dir");
     std::fs::write(path, body).expect("the other machine's file");
@@ -301,7 +301,7 @@ fn a_carry_whose_file_another_machine_renamed_is_left_for_a_person() {
     update(&home, &mut Vec::new()).expect("committed, and not pushed");
     std::fs::remove_file(hook).expect("the hook");
     // Unedited, so rename detection would list only the new path.
-    let other = crate::sync::tests::other(&home);
+    let other = crate::testing::git::other(&home);
     run(home.path(), &other, &["mv", "files/lock", "files/moved"]);
     commit_all(home.path(), &other, "renamed");
     run(home.path(), &other, &["push", "--quiet"]);

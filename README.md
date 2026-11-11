@@ -36,6 +36,11 @@ installed binary. Each release pins the installer's checksum, so if the
 installer has changed since your release, `bx self-upgrade` refuses and sends
 you here; reinstall with the line above. `bx self-update` is the same command.
 
+The installer reads `BX_VERSION` for a release other than the latest (e.g.
+`v1.2.3`) and `BX_INSTALL_DIR` for where to put the binary (default
+`~/.local/bin`), and `sh -s -- --latest` prints the latest release's tag and
+installs nothing.
+
 ## Getting started
 
 ```bash
@@ -123,7 +128,9 @@ config repo's upstream without pulling it, so a commit another machine
 already locked is reported as one `bx sync` brings in rather than as new; an
 upstream it cannot fetch is said, and judged against this machine's
 `bx.lock`, without changing the exit status.
-`bx update --snooze` puts the next question off. `bx upgrade --check` is
+`bx update PATH…` and `bx upgrade PATH…` act on only those externals, named by
+path; with none, `update` acts on every followed one and `upgrade` on every
+one. `bx update --snooze` puts the next question off. `bx upgrade --check` is
 `bx update --check`, then the same look at each pinned external, then
 `bx self-upgrade --check`: it exits `2` when any of them finds something
 newer, and otherwise `1` when any could not look.
@@ -134,7 +141,11 @@ and point you at `bx init`, which offers the config already on the machine.
 `bx secret list` reads; nothing under `bx secret` writes. Who secrets are
 encrypted to is the `recipients` list under `[secrets]` in `bx.toml` or a
 module, edited by hand, and a secret is encrypted or re-encrypted to them with
-`age -e`.
+`age -e`. What decrypts them here is the `identity` under `[secrets]` in
+`local.toml`, `~/.ssh/id_ed25519` when it names none: an age identity file, as
+`age-keygen` or `age -p` writes it, or any ssh private key age reads. A
+passphrase-protected one is never asked for by `plan` or `apply`; only
+`bx secret list` asks, and only at a terminal.
 
 ### Reading a plan
 
@@ -194,14 +205,16 @@ or a login banner without anyone parsing its output:
 
 | | |
 |---|---|
-| `0` | converged — nothing to do |
+| `0` | converged — nothing to do; for `plan` and `apply`, also when the only rows are `<`, which are `bx sync`'s to carry |
 | `1` | error |
 | `2` | changes pending, or a conflict or blocked target needs a decision |
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 The other commands use the same codes. `bx add` exits `2` when it refused a
 path, `bx rm` when a conflict left something as it was, and
-`bx self-upgrade --check` when a newer release exists.
+`bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
+when it did not carry the `<` rows it announced — declined, or refused for
+want of a terminal.
 
 ## Requirements
 
@@ -295,8 +308,11 @@ path, `bx rm` when a conflict left something as it was, and
   interrupted write left behind, an external that follows a branch
   `bx.lock` holds no commit for, a `bx.lock` entry nothing follows any more,
   an update stamp that holds no time, a `local.toml` inside the config
-  repo, which bx never loads, and a `bash` on `PATH` older than 4.4 — macOS's
-  is 3.2 — that leaves out bash's question about updates. With
+  repo, which bx never loads, a `bash` on `PATH` older than 4.4 — macOS's
+  is 3.2 — that leaves out bash's question about updates, and a config repo
+  with uncommitted changes, commits its upstream lacks, no upstream, a
+  detached `HEAD`, or a rebase in progress, or that is behind or has diverged,
+  and a followed external's checkout holding local work. With
   `[doctor] login-shell = "zsh"` (or `"bash"`), usually in `local.toml`, it
   also reports an account whose login shell is another, quoting the `chsh`
   that changes it, never running it, and a session whose `$SHELL` still names

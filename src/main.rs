@@ -1,7 +1,7 @@
 //! The `bx` binary.
 //!
-//! Fourteen commands, no manual. Everything the user needs to discover is reachable
-//! from `--help` and the prompts in `bx init`.
+//! No manual. Everything the user needs to discover is reachable from `--help`
+//! and the prompts in `bx init`.
 
 use std::io::Write as _;
 
@@ -42,7 +42,7 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Pull, apply, push
+    /// Pull, apply, carry tracked files into the repo and commit them, push
     Sync {
         /// Write without asking for confirmation
         #[arg(long)]

@@ -84,7 +84,9 @@ wrong even if it passes CI.
 - **similar** — diffs for `plan`. **anstyle** — styling that respects
   `NO_COLOR`. **indicatif** — progress during `apply` only.
 - **age** — secrets, in-process, so the static binary needs no external
-  `age`/`sops`. Default identity is the user's existing ssh ed25519 key.
+  `age`/`sops`. Default identity is the user's existing ssh ed25519 key;
+  `identity` in `local.toml` may instead name an age identity file or any ssh
+  key age reads.
 - **rmp-serde** — MessagePack for machine-owned state (ledger, fingerprints,
   journal). Not JSON: length-prefixed, and it has a native binary type. Every
   such file must be reconstructible, so a corrupt one degrades to recomputation.
@@ -93,6 +95,10 @@ wrong even if it passes CI.
 - **tempfile + rustix** — atomic writes (temp in destination dir, fsync,
   rename), file modes, the advisory state-dir lock, and discarding what was
   typed ahead of a confirmation.
+- **sha2** — content addressing for the restore store, and activation-cache
+  fingerprints.
+- **getrandom** — the write-ahead journal's per-session nonce, from the
+  platform's own random source. Default features off.
 - **jiff** — UTC timestamps for `bx --version` and `bx doctor`. Default
   features off: no tz database and no system time zone lookup.
 - **eyre + color-eyre** — application error reporting; `main` installs

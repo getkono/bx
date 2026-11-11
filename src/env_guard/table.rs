@@ -736,8 +736,8 @@ mod tests {
 
     #[test]
     fn a_name_the_table_does_not_list_is_not_emittable_whatever_its_family() {
-        // No rule matches a name by an exact list, a family prefix, a
-        // location suffix or an exception. None of these is
+        // Only an exact table entry is emittable: no family prefix,
+        // location suffix or exception admits a name. None of these is
         // in the table, so each is refused, even given a path inside the root.
         for name in [
             "GNUPGHOME",

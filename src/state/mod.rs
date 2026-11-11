@@ -576,23 +576,13 @@ pub enum Error {
     /// Nothing is recorded and nothing is stored. See [`Ledger::record`].
     ///
     /// Any edit outside bx's lines raises this, and re-recording converges
-    /// nowhere, so the message names the two ways out, and what the second
-    /// leaves behind. Putting the file back needs nothing from bx. Accepting the
-    /// file as it is now is `Ledger::adopt_current_as_prior`, which no command
-    /// offers yet, so only tests reach it. Afterwards `bx rm`
-    /// restores the file exactly as it was accepted — bx's region or include
-    /// line in it as it was then, stale and no longer managed, for the user to
-    /// remove by hand — and what was there before bx stays in the ledger's
-    /// history: the original in [`LedgerEntry::superseded`], or, for a file bx
-    /// created, [`LedgerEntry::superseded_absent`].
+    /// nowhere, so the message names the one way out a user has: put the file
+    /// back as bx last wrote it, which needs nothing from bx. No command
+    /// accepts the file as it is now, so the message offers no such route.
     #[error(
         "{target} changed since bx last wrote it, and bx shares that file through a managed \
          region or an include line, so it still holds bx's own lines; bx will not record it \
-         as your original. Nothing was recorded. To go on, either put the file back as bx last \
-         wrote it, or accept the file as it is now as the version `bx rm` restores. Accepting \
-         keeps bx's lines as they are in it now: `bx rm` will write them back stale, bx no \
-         longer manages them there, and you remove them by hand. What was there before bx, the \
-         original file or that there was none, stays in the ledger's history"
+         as your original. Nothing was recorded. To go on, put the file back as bx last wrote it"
     )]
     PriorConflict {
         /// The target, as the ledger keys it.

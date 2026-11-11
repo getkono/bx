@@ -990,20 +990,21 @@ fn accepting_a_changed_shared_file_converges_and_keeps_the_first_original() {
     let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
     ledger.record(apply(bx1, original)).expect("first apply");
 
-    // The edit: a conflict, every time, whose message names both ways out.
+    // The edit: a conflict, every time, whose message names the one way out
+    // a command-line user has, and offers no accept route no command provides.
     for _ in 0..2 {
         let message = ledger
             .record(apply(bx2, edited))
             .expect_err("a conflict")
             .to_string();
-        assert!(message.contains("put the file back"), "{message}");
         assert!(
-            message.contains("accept the file as it is now"),
+            message.contains("put the file back as bx last wrote it"),
             "{message}"
         );
+        assert!(!message.contains("accept"), "{message}");
     }
 
-    // The user accepts the file as it is now.
+    // The file is accepted as it is now, through the test-only route.
     let accepted = ledger
         .adopt_current_as_prior(&target("~/.bashrc"), edited, Mode::from_bits(0o640))
         .expect("adopt")
@@ -1119,9 +1120,9 @@ fn accepting_a_file_bx_created_keeps_that_there_was_no_file_before_bx() {
 }
 
 #[test]
-fn a_prior_conflict_says_plainly_what_accepting_leaves_behind() {
-    // Accepting a region or include file makes `bx rm` write bx's stale
-    // lines back, unmanaged, and the message has to say so.
+fn a_prior_conflict_offers_only_putting_the_file_back() {
+    // No command accepts a changed region or include file as it is now, so
+    // the message names the one way out that exists and no other.
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let region = Mechanism::Region { comment: '#' };
@@ -1143,14 +1144,14 @@ fn a_prior_conflict_says_plainly_what_accepting_leaves_behind() {
         .expect_err("a conflict")
         .to_string();
     for needle in [
-        "put the file back",
-        "accept the file as it is now",
-        "write them back stale",
-        "no longer manages them",
-        "remove them by hand",
-        "or that there was none",
+        "~/.bashrc changed since bx last wrote it",
+        "Nothing was recorded",
+        "To go on, put the file back as bx last wrote it",
     ] {
         assert!(message.contains(needle), "missing {needle:?}: {message}");
+    }
+    for offered in ["accept", "either", "bx rm"] {
+        assert!(!message.contains(offered), "offers {offered:?}: {message}");
     }
 }
 

@@ -184,8 +184,7 @@ impl Ledger {
     ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
     ///   as it was. `plan` reports the same target as a conflict from `written`
     ///   alone, so an apply that shares its function never reaches this call.
-    ///   The way out that loses no byte is `Ledger::adopt_current_as_prior`,
-    ///   run only because the user chose it; no command offers it yet.
+    ///   The way out is for the user to put the file back as bx last wrote it.
     ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
@@ -358,8 +357,9 @@ impl Ledger {
         }
     }
 
-    /// Accept a target as it is now as the version `bx rm` restores — the way
-    /// out of [`Error::PriorConflict`] that loses no byte.
+    /// Accept a target as it is now as the version `bx rm` restores, which
+    /// clears an [`Error::PriorConflict`] without the user putting the file
+    /// back.
     ///
     /// `bytes` and `mode` are the target as it is on disk now. When the bytes
     /// hash to the entry's `written`, nothing has changed and nothing is done.
@@ -379,8 +379,9 @@ impl Ledger {
     /// into the file stale, bx no longer manages or removes them there, and
     /// the user removes them by hand. That holds for a file bx created too —
     /// `bx rm` then leaves the file, bx's line in it, rather than removing it.
-    /// So it must run only because the user chose it, and
-    /// [`Error::PriorConflict`]'s message says the same. Restoring the user's
+    /// So it must run only because the user chose it, and since no command
+    /// offers that choice, [`Error::PriorConflict`]'s message does not name
+    /// it. Restoring the user's
     /// edit without bx's lines needs the region writer's delimiter grammar,
     /// which does not exist yet.
     ///
@@ -434,9 +435,7 @@ impl Ledger {
     /// Turn caller-supplied prior bytes into a durable [`Prior`].
     ///
     /// Takes the directory rather than `&self` so that a caller holding a
-    /// `&mut` borrow of the entries can still store a blob: see
-    /// `Ledger::adopt_current_as_prior`, where the re-fetch a `&self` store
-    /// would force is a branch no input can take.
+    /// borrow of the entries can still store a blob.
     fn store_prior(dir: &StateDir, prior: PriorBytes) -> Result<Prior, Error> {
         match prior {
             PriorBytes::Absent => Ok(Prior::Absent),

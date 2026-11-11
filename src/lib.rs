@@ -62,7 +62,9 @@
 //! parses its arguments and dispatches. [`sync`] is the git on either side of
 //! `bx sync`'s apply: a fast-forward-only pull before it, and a push after it
 //! that never carries a state file. [`git`] runs the user's own `git` for it,
-//! for a declared external, and for `bx rm`'s checks on a checkout. [`update`]
+//! for a declared external, and for `bx rm`'s checks on a checkout, through
+//! the one deadline-bounded runner in `process` that a tool activation's
+//! command runs through too. [`update`]
 //! is `bx update`'s own part: where a followed external's branch is now,
 //! `bx.lock` written and committed before anything moves, and the stamps an
 //! interactive zsh or bash reads to decide whether to ask. [`pin`] is what
@@ -135,6 +137,7 @@ pub mod lexical;
 pub mod paths;
 pub mod pin;
 pub mod plan;
+mod process;
 pub mod recover;
 pub mod report;
 pub mod restore;

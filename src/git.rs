@@ -20,10 +20,11 @@ pub(crate) mod checkout;
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Instant;
 
 use crate::env::Env;
+use crate::process;
 use crate::report::stderr_suffix;
 
 /// Variables that make git operate on a repository other than the one it is
@@ -222,16 +223,35 @@ impl Git {
         let mut command = self.command(repo, args);
         command.stdin(stdin);
         let output = match self.deadline {
-            None => command.output(),
-            Some(deadline) => match bounded(&mut command, deadline, self.own_group) {
-                Some(output) => output,
-                None => return Err(Error::TimedOut { args: shown }),
-            },
-        }
-        .map_err(|source| Error::Spawn {
-            args: shown.clone(),
-            source,
-        })?;
+            None => command
+                .output()
+                .map(|output| process::Output {
+                    status: output.status,
+                    stdout: output.stdout,
+                    stderr: output.stderr,
+                })
+                .map_err(process::Error::Spawn),
+            Some(deadline) => {
+                let options = process::Options {
+                    own_group: self.own_group,
+                    ..process::Options::default()
+                };
+                process::bounded(&mut command, deadline, options)
+            }
+        };
+        let output = match output {
+            Ok(output) => output,
+            // Neither stream is capped, so nothing is ever too large.
+            Err(process::Error::TimedOut | process::Error::TooLarge(_)) => {
+                return Err(Error::TimedOut { args: shown });
+            }
+            Err(process::Error::Spawn(source) | process::Error::Wait(source)) => {
+                return Err(Error::Spawn {
+                    args: shown,
+                    source,
+                });
+            }
+        };
         if !output.status.success() {
             return Err(Error::Failed {
                 args: shown,
@@ -269,95 +289,6 @@ impl Git {
         self.output(repo, &args, Stdio::inherit())
             .map(|printed| printed.trim().to_string())
     }
-}
-
-/// Run `command` and collect what it printed, both by `deadline`, or kill it
-/// once `deadline` passes: the command alone, or with `own_group` the process
-/// group it leads, and so whatever it started.
-///
-/// `None` when it ran out of time. Each stream is read on its own thread, so
-/// a child that fills one pipe while this waits on the other cannot stall.
-/// A pipe is closed only once every process holding it is gone, so a process
-/// the command left behind holding one — an ssh `ControlPersist` master, a
-/// helper that backgrounds something — keeps its stream open after the
-/// command exits; collecting the streams is therefore bounded by the same
-/// deadline, and a reader still waiting then is left behind rather than
-/// joined. Under `own_group` the group is killed then too, which stops that
-/// process unless it left the group. The command is not reaped until its
-/// streams are collected, so the group's id cannot have passed to another
-/// process when it is killed.
-fn bounded(
-    command: &mut Command,
-    deadline: Instant,
-    own_group: bool,
-) -> Option<std::io::Result<Output>> {
-    use rustix::process::{WaitId, WaitIdOptions, waitid};
-    use std::io::Read as _;
-
-    if own_group {
-        std::os::unix::process::CommandExt::process_group(command, 0);
-    }
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(error) => return Some(Err(error)),
-    };
-    let group = rustix::process::Pid::from_child(&child);
-    let kill = |child: &mut std::process::Child| {
-        if own_group {
-            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    };
-    let read = |stream: Option<Box<dyn std::io::Read + Send>>| {
-        let (send, receive) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut stream) = stream {
-                let _ = stream.read_to_end(&mut bytes);
-            }
-            let _ = send.send(bytes);
-        });
-        receive
-    };
-    let stdout = read(child.stdout.take().map(|s| Box::new(s) as _));
-    let stderr = read(child.stderr.take().map(|s| Box::new(s) as _));
-    // Whether the command has exited, leaving it unreaped. `union`, not `|`,
-    // for the reason `state::restore::read` gives.
-    let exited = WaitIdOptions::EXITED
-        .union(WaitIdOptions::NOHANG)
-        .union(WaitIdOptions::NOWAIT);
-    loop {
-        match waitid(WaitId::Pid(group), exited) {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    kill(&mut child);
-                    return None;
-                }
-                std::thread::sleep(left.min(Duration::from_millis(10)));
-            }
-            Err(error) => {
-                kill(&mut child);
-                return Some(Err(error.into()));
-            }
-        }
-    }
-    let collect = |stream: &std::sync::mpsc::Receiver<Vec<u8>>| {
-        stream
-            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .ok()
-    };
-    let (Some(stdout), Some(stderr)) = (collect(&stdout), collect(&stderr)) else {
-        kill(&mut child);
-        return None;
-    };
-    Some(child.wait().map(|status| Output {
-        status,
-        stdout,
-        stderr,
-    }))
 }
 
 #[cfg(test)]
@@ -488,63 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_past_its_deadline_is_killed_and_one_within_it_is_not() {
-        let started = Instant::now();
-        let mut slow = Command::new("sleep");
-        slow.arg("3").stdout(Stdio::piped()).stderr(Stdio::piped());
-        assert!(bounded(&mut slow, started + Duration::from_millis(50), false).is_none());
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "killed, not waited on"
-        );
-
-        let mut quick = Command::new("sh");
-        quick
-            .args(["-c", "echo out; echo err >&2; exit 3"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let output = bounded(&mut quick, Instant::now() + Duration::from_secs(30), false)
-            .expect("in time")
-            .expect("ran");
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(output.stdout, b"out\n");
-        assert_eq!(output.stderr, b"err\n");
-
-        let mut missing = Command::new("/nonexistent/bx-test");
-        assert!(matches!(
-            bounded(&mut missing, Instant::now() + Duration::from_secs(1), false),
-            Some(Err(_))
-        ));
-
-        // In a group of its own, what the command started is stopped too.
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let pid_file = scratch.path().join("pid");
-        let mut parent = Command::new("sh");
-        parent
-            .args([
-                "-c",
-                &format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let started = Instant::now();
-        assert!(bounded(&mut parent, started + Duration::from_millis(300), true).is_none());
-        let pid = std::fs::read_to_string(&pid_file).expect("the grandchild's pid");
-        let pid = pid.trim();
-        let grandchild = pid
-            .parse()
-            .ok()
-            .and_then(rustix::process::Pid::from_raw)
-            .expect("a process id");
-        let gone = (0..100).any(|_| {
-            let running = runs(grandchild);
-            if running {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            !running
-        });
-        assert!(gone, "the grandchild {pid} still runs");
-
+    fn a_git_past_its_deadline_did_not_finish_in_time() {
         let home = guarded_home();
         let error = git(home.path())
             .with_deadline(Instant::now())
@@ -554,84 +429,6 @@ mod tests {
                 error.to_string().contains("did not finish in time"),
                 "{error}"
             );
-        }
-    }
-
-    #[test]
-    fn a_process_left_holding_the_output_is_bounded_by_the_same_deadline() {
-        for own_group in [false, true] {
-            let scratch = tempfile::tempdir().expect("a scratch directory");
-            let pid_file = scratch.path().join("pid");
-            // The command exits at once, leaving `sleep` holding both pipes.
-            let mut command = Command::new("sh");
-            command
-                .args([
-                    "-c",
-                    &format!("sleep 30 & echo $! > {}; echo hi", pid_file.display()),
-                ])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let started = Instant::now();
-            let output = bounded(
-                &mut command,
-                started + Duration::from_millis(300),
-                own_group,
-            );
-            assert!(output.is_none(), "own_group {own_group}: {output:?}");
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "own_group {own_group}: waited {:?} on the leftover",
-                started.elapsed()
-            );
-            let pid = std::fs::read_to_string(&pid_file).expect("the leftover's pid");
-            let leftover = pid
-                .trim()
-                .parse()
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-                .expect("a process id");
-            if own_group {
-                let gone = (0..100).any(|_| {
-                    let running = runs(leftover);
-                    if running {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    !running
-                });
-                assert!(gone, "the leftover {leftover:?} still runs");
-            } else {
-                // Out of reach without a group; stopped here so the suite
-                // leaves nothing behind.
-                let _ = rustix::process::kill_process(leftover, rustix::process::Signal::KILL);
-            }
-        }
-    }
-
-    /// Whether `pid` still runs.
-    ///
-    /// `kill(pid, 0)` answers on every platform: `ESRCH` means no such process,
-    /// and anything else, `EPERM` included, means one exists. A killed process
-    /// lingers as a zombie until it is reaped, and an orphan is reaped by
-    /// whatever adopts it; on Linux that may be a subreaper or a container's
-    /// first process that never reaps, so there a process whose `/proc` state
-    /// is `Z` no longer runs either. An unreadable `/proc` confirms nothing, so
-    /// the process is then judged by `kill` alone, never assumed gone.
-    ///
-    /// One function with an arm per platform, as `has_cap_fsetid` is, so the
-    /// whole of it builds wherever the suite does.
-    fn runs(pid: rustix::process::Pid) -> bool {
-        let exists = !matches!(
-            rustix::process::test_kill_process(pid),
-            Err(rustix::io::Errno::SRCH)
-        );
-        #[cfg(target_os = "linux")]
-        {
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero()));
-            exists && !stat.is_ok_and(|stat| stat.contains(") Z "))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            exists
         }
     }
 }

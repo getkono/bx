@@ -150,10 +150,8 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -163,6 +161,7 @@ use crate::config::target::Activated;
 use crate::config::when::Machine;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
+use crate::process;
 use crate::report::Action;
 use crate::state::{ContentHash, Fingerprint, Fingerprints};
 
@@ -352,88 +351,38 @@ impl Host for System {
 
     fn run(&self, program: &Path, args: &[String]) -> Result<Vec<u8>, RunError> {
         let deadline = Instant::now() + self.timeout;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .env("PATH", &self.path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| RunError::Spawn(e.to_string()))?;
-
-        // Each stream is drained on its own thread, so a child that fills one
-        // pipe while bx waits on the other cannot stall. Standard output is
-        // read only one byte past its bound: a child that keeps writing then
-        // finds its pipe closed rather than bx's memory growing. Standard error
+            .stdin(Stdio::null());
+        // Standard output is capped at what one run may print; standard error
         // is read to its end and only its start kept, so a tool that warns at
-        // length is never killed by a closed pipe for it.
-        let stdout = drain(child.stdout.take(), LIMIT + 1, false);
-        let stderr = drain(child.stderr.take(), STDERR_KEPT, true);
-
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(RunError::TimedOut(self.timeout));
-                }
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(RunError::Spawn(e.to_string()));
-                }
-            }
+        // length is never killed by a closed pipe for it. No group of its own:
+        // `bx apply` may be run at a terminal, where Ctrl-C must reach it.
+        let options = process::Options {
+            own_group: false,
+            stdout_limit: Some(LIMIT),
+            stderr_kept: Some(STDERR_KEPT),
         };
-
-        // A process the command left behind may still hold the pipe open, so
-        // collecting the output is bounded by the same deadline.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let out = stdout
-            .recv_timeout(remaining)
-            .map_err(|_| RunError::TimedOut(self.timeout))?;
-        if out.len() > LIMIT {
-            return Err(RunError::TooLarge(LIMIT));
-        }
-        if !status.success() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let err = stderr.recv_timeout(remaining).unwrap_or_default();
-            let err = String::from_utf8_lossy(&err);
+        let output = process::bounded(&mut command, deadline, options).map_err(|e| match e {
+            process::Error::Spawn(e) | process::Error::Wait(e) => RunError::Spawn(e.to_string()),
+            process::Error::TimedOut => RunError::TimedOut(self.timeout),
+            process::Error::TooLarge(limit) => RunError::TooLarge(limit),
+        })?;
+        if !output.status.success() {
+            let err = String::from_utf8_lossy(&output.stderr);
             return Err(RunError::Exited {
-                status: status.to_string(),
+                status: output.status.to_string(),
                 stderr: err.lines().next().unwrap_or("").trim().to_string(),
             });
         }
-        Ok(out)
+        Ok(output.stdout)
     }
 
     fn path(&self) -> &OsStr {
         &self.path
     }
-}
-
-/// Read the first `limit` bytes of `stream` on a thread of its own, and when
-/// `to_end`, read and discard the rest until the writer closes it.
-fn drain(
-    stream: Option<impl Read + Send + 'static>,
-    limit: usize,
-    to_end: bool,
-) -> mpsc::Receiver<Vec<u8>> {
-    let (send, receive) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut stream) = stream {
-            let _ = (&mut stream).take(limit as u64).read_to_end(&mut buf);
-            if to_end {
-                let _ = std::io::copy(&mut stream, &mut std::io::sink());
-            }
-        }
-        let _ = send.send(buf);
-    });
-    receive
 }
 
 /// Why an activation is left out of the generated file.

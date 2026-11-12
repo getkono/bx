@@ -4,3 +4,58 @@
 # no-user-specific-data test lists the repository's files with `git ls-files`,
 # so without it the unmutated baseline fails before any mutant is tested.
 copy_vcs = true
+
+# Mutants settled as surviving for good, so a census that reports zero missed
+# means it. Each entry names one mutant by its file, mutation and function, and
+# leaves line and column free so an edit elsewhere in the file does not bring
+# it back. Two entries fix the column as well, because their function holds
+# another mutant with the same name that tests catch. The comment above each
+# entry gives its class and the pull request that argues it. Mutants that still
+# need a test to catch them are not listed: `ask_passphrase` (#421) and the
+# `+` -> `*` in `read_state_file` (#420). The `|` -> `&` mutants on the same
+# lines are caught or time out, and stay in.
+exclude_re = [
+  # Equivalent, disjoint flag bits: RDONLY is 0 and DIRECTORY and CLOEXEC
+  # share no bit (#352 A3).
+  '^src/fs/durable\.rs:\d+:\d+: replace \| with \^ in Dir::open$',
+  # Equivalent, disjoint flag bits: W_OK is 2 and X_OK is 1 (#352 A4).
+  '^src/recover/inspect\.rs:\d+:\d+: replace \| with \^ in stuck_temp$',
+  # Equivalent, disjoint flag bits: W_OK is 2 and X_OK is 1 (#349 E1).
+  '^src/state/dir\.rs:\d+:\d+: replace \| with \^ in blame_ancestor$',
+  # Equivalent, disjoint flag bits: RDONLY is 0, and NOFOLLOW, NONBLOCK and
+  # CLOEXEC are distinct single bits (#349 E2).
+  '^src/state/lock\.rs:\d+:\d+: replace \| with \^ in SharedLock::probe$',
+  '^src/state/lock\.rs:\d+:\d+: replace \| with \^ in read_holder$',
+  # Equivalent, disjoint flag bits: RDWR, CREATE, NOFOLLOW and CLOEXEC are
+  # distinct single bits (#349 E3).
+  '^src/state/lock\.rs:\d+:\d+: replace \| with \^ in open_lock_file$',
+  # Equivalent, disjoint flag bits: RDONLY is 0, and NONBLOCK and CLOEXEC are
+  # distinct single bits (#349 E4).
+  '^src/state/store\.rs:\d+:\d+: replace \| with \^ in read_state_file$',
+  # Equivalent, argued: SET_ID and SPECIAL are nonzero, so either guard forced
+  # true only adds an fchmod to the mode already set, or a check for no bits
+  # (#352 A2).
+  '^src/fs/atomic/stage\.rs:\d+:\d+: replace & with \| in Staged::fill$',
+  # Equivalent, argued, for the guard after the first `symlink_metadata(dir)`
+  # (#352 A1). Race-only, for the guard in the ancestor walk: it differs only
+  # if permissions change between syscalls on the same path (#352 L1). The two
+  # guards have the same text, and `parent_state` has no other.
+  '^src/fs/atomic/observe\.rs:\d+:\d+: replace match guard unresolvable_path\(&e\) with true in parent_state$',
+  # Equivalent, argued: the read size of `CHUNK` does not change a SHA-256
+  # digest (#327).
+  '^src/hash\.rs:\d+:\d+: replace \* with \+$',
+  # Equivalent, argued: git prints both upstream fields or neither (#327).
+  '^src/sync\.rs:\d+:\d+: replace && with \|\| in upstream$',
+  # Equivalent, argued: a 40-byte hex `rev` has already returned (#347).
+  '^src/config/external\.rs:\d+:\d+: replace < with <= in unusable_rev$',
+  # Equivalent, argued: where the two differ `dest` is a directory whose
+  # parent exists, so `missing_parents` finds none (#351). Column 43 fixed:
+  # the other `&&` in `Session::write_dir` are caught.
+  '^src/journal/session\.rs:\d+:43: replace && with \|\| in Session::write_dir$',
+  # Equivalent, argued: the extra pass at `k == chars.len()` pushes nothing
+  # (#348).
+  '^src/shell/activation\.rs:\d+:\d+: replace < with <= in assembled$',
+  # Equivalent, argued: the line gains one leading newline, and every caller
+  # trims it (#348). Column 26 fixed: the `+` in `at + p` is caught.
+  '^src/shell/activation\.rs:\d+:26: replace \+ with \* in line_of$',
+]

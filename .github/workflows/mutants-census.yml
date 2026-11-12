@@ -108,9 +108,10 @@ jobs:
       # does not fail the step; a failed baseline or any other error does.
       #
       # cargo-mutants runs under the memory cap ci.yml's `mutants` job sets,
-      # for the reasons written out there: a mutant that allocates without end
-      # then has its test killed and counted `caught`, instead of taking the
-      # runner and the shard's every outcome with it.
+      # and with the environment carried past sudo the way it does, for the
+      # reasons written out there: a mutant that allocates without end then
+      # has its test killed and counted `caught`, instead of taking the runner
+      # and the shard's every outcome with it.
       - name: Mutants
         timeout-minutes: 300
         env:
@@ -122,10 +123,12 @@ jobs:
           if [ -n "$RE" ]; then set -- "$@" --re "$RE"; fi
           if [ -n "$TIMEOUT" ]; then set -- "$@" --timeout "$TIMEOUT"; fi
           status=0
-          sudo --preserve-env systemd-run --quiet --scope \
+          export -p > "$RUNNER_TEMP/mutants.env"
+          # shellcheck disable=SC2016 # expanded by the inner bash, not this one
+          sudo systemd-run --quiet --scope \
             -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue -- \
             setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
-            env PATH="$PATH" HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" \
+            bash -c '. "$1" && shift && exec "$@"' mutants "$RUNNER_TEMP/mutants.env" \
             mise run mutants "$@" || status=$?
           case $status in
             0 | 2 | 3) ;;

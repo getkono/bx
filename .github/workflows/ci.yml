@@ -389,15 +389,24 @@ jobs:
       #
       # Creating the scope needs root, and the run inside it does not: setpriv
       # drops back to this user and this user's own groups, which systemd-run's
-      # --uid would not, as it leaves root's groups in place. The step's
-      # environment comes through sudo, which sets PATH, HOME, USER and LOGNAME
-      # for root, so those four are passed back.
+      # --uid would not, as it leaves root's groups in place.
+      #
+      # The step's environment does not come through sudo: which variables
+      # survive is the sudo policy's choice, not this job's, and the sudo of
+      # ubuntu-26.04 drops CI and MISE_AUTO_INSTALL despite --preserve-env.
+      # The baseline then fails, because the no-user-specific-data test needs
+      # CI set to tell the runner's account from a person's. So the
+      # environment is written out with `export -p` before sudo, as this
+      # user, and sourced back in after setpriv, whatever sudo kept or reset
+      # in between.
       - name: Mutants
         run: |
-          sudo --preserve-env systemd-run --quiet --scope \
+          export -p > "$RUNNER_TEMP/mutants.env"
+          # shellcheck disable=SC2016 # expanded by the inner bash, not this one
+          sudo systemd-run --quiet --scope \
             -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue -- \
             setpriv --reuid="$(id -u)" --regid="$(id -g)" --init-groups \
-            env PATH="$PATH" HOME="$HOME" USER="$(id -un)" LOGNAME="$(id -un)" \
+            bash -c '. "$1" && shift && exec "$@"' mutants "$RUNNER_TEMP/mutants.env" \
             mise run mutants --in-diff pr.diff \
             --shard ${{ matrix.shard }}/12 --sharding round-robin
       - name: Upload mutants.out

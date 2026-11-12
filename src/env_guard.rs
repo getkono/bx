@@ -125,13 +125,13 @@
 //! shell-init snippet: fixed text that sets no environment variable outside
 //! bx's own `BX_` namespace, and gets every other variable by sourcing a
 //! guarded environment fragment.
-//! `tests::the_init_snippet_is_not_an_environment_fragment` holds the
+//! `tests::assignments::the_init_snippet_is_not_an_environment_fragment` holds the
 //! snippet's bytes to the rule rather than assuming it, and holds the bytes
 //! the repository actually keeps — `bench/fixtures/bx/bx-init.zsh`, the
 //! snippet's only copy, since no bx generator emits it. The zsh update
 //! prompt is the second: it assigns only its
 //! locals, `BX_` names and zsh's `precmd_functions` hook array, and
-//! `tests::the_update_prompt_is_not_an_environment_fragment` holds
+//! `tests::assignments::the_update_prompt_is_not_an_environment_fragment` holds
 //! [`crate::shell::update_prompt::ZSH`] to that. The bash update prompt is
 //! the third: it assigns only its locals, `BX_` names and `PROMPT_COMMAND`,
 //! which it only appends to, and only when bash says it is neither exported
@@ -139,7 +139,7 @@
 //! A line the user wrote after bx's region can still export it, so the
 //! appended entry names no function: it expands the unexported
 //! `BX_UPDATE_HOOK`, and is nothing in a child that inherits it;
-//! `tests::the_bash_update_prompt_is_not_an_environment_fragment` holds
+//! `tests::assignments::the_bash_update_prompt_is_not_an_environment_fragment` holds
 //! [`crate::shell::update_prompt::BASH`] to that. Nothing holds a *fourth*
 //! non-fragment file to the rule, so the generator that adds one carries the
 //! proof of its own bytes with it.

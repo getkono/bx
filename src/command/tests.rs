@@ -1259,6 +1259,7 @@ fn a_confirmation_discards_what_was_typed_before_it_was_asked() {
 
 mod doctor_command;
 mod sync_command;
+mod update_check_command;
 mod update_command;
 mod update_sync_command;
 mod upgrade_command;

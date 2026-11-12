@@ -736,7 +736,6 @@ enum StateRead {
 /// them.
 fn read_state_file(path: &Path) -> std::io::Result<StateRead> {
     use rustix::fs::{FileType, Mode as RawMode, OFlags};
-    use std::io::Read as _;
     let fd = rustix::fs::open(
         path,
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
@@ -755,14 +754,33 @@ fn read_state_file(path: &Path) -> std::io::Result<StateRead> {
     if u64::try_from(stat.st_size).map_or(true, |size| size > MAX_STATE_FILE) {
         return Ok(StateRead::TooLarge);
     }
-    let mut bytes = Vec::new();
-    std::fs::File::from(fd)
-        .take(MAX_STATE_FILE + 1)
-        .read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).map_or(true, |len| len > MAX_STATE_FILE) {
-        return Ok(StateRead::TooLarge);
+    match read_at_most(std::fs::File::from(fd), MAX_STATE_FILE)? {
+        Some(bytes) => Ok(StateRead::Bytes(bytes)),
+        None => Ok(StateRead::TooLarge),
     }
-    Ok(StateRead::Bytes(bytes))
+}
+
+/// Every byte of `reader` if it holds at most `limit` of them, or `None` if it
+/// holds more.
+///
+/// At most one byte past `limit` is read, so a reader that never ends is
+/// refused after `limit + 1` bytes rather than read until memory runs out.
+/// [`read_state_file`] has already refused a file whose `st_size` is past its
+/// limit; this is the bound for one that grew after the `fstat`, which no test
+/// of a real file can stage on demand, so the bound is its own function and is
+/// pinned over a reader that can.
+///
+/// # Errors
+///
+/// The read failure, unchanged.
+fn read_at_most(reader: impl std::io::Read, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > limit) {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 /// The shallowest component of `path`'s own directory chain that exists and is

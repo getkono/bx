@@ -1092,6 +1092,30 @@ fn a_state_file_longer_than_the_limit_is_never_read_whole() {
     }
 }
 
+/// The bound for a state file that grows after its `fstat`, which no real file
+/// stages on demand: a reader can hold exactly as many bytes as a test asks.
+/// A limit of a few bytes stands in for [`MAX_STATE_FILE`], so the property is
+/// pinned without allocating 256 MiB.
+#[test]
+fn a_reader_past_the_limit_is_refused_after_one_byte_more_than_it() {
+    use std::io::Read as _;
+    const LIMIT: u64 = 8;
+    let at_limit = read_at_most(std::io::repeat(7).take(LIMIT), LIMIT).expect("read");
+    assert_eq!(
+        at_limit,
+        Some(vec![7; 8]),
+        "exactly the limit is read whole"
+    );
+
+    let past = read_at_most(std::io::repeat(7).take(LIMIT + 1), LIMIT).expect("read");
+    assert_eq!(past, None, "one byte past the limit is refused");
+    // A longer reader is not read to its end either: one byte past the limit
+    // is all it takes to refuse it.
+    let mut endless = std::io::repeat(7).take(LIMIT + 100);
+    assert_eq!(read_at_most(&mut endless, LIMIT).expect("read"), None);
+    assert_eq!(endless.limit(), 100 - 1, "read limit + 1 bytes, no more");
+}
+
 #[test]
 fn an_intact_file_that_cannot_be_read_is_left_exactly_where_it_is() {
     if rustix::process::geteuid().is_root() {

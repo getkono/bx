@@ -1101,7 +1101,11 @@ fn a_reader_past_the_limit_is_refused_after_one_byte_more_than_it() {
     use std::io::Read as _;
     const LIMIT: u64 = 8;
     let at_limit = read_at_most(std::io::repeat(7).take(LIMIT), LIMIT).expect("read");
-    assert_eq!(at_limit, Some(vec![7; 8]), "exactly the limit is read whole");
+    assert_eq!(
+        at_limit,
+        Some(vec![7; 8]),
+        "exactly the limit is read whole"
+    );
 
     let past = read_at_most(std::io::repeat(7).take(LIMIT + 1), LIMIT).expect("read");
     assert_eq!(past, None, "one byte past the limit is refused");

@@ -1,4 +1,23 @@
 #!/bin/sh
 # Stand-in for mise: emits an init block of representative size, then exits.
 # The process spawn is the point — it is what `eval "\$(mise init zsh)"` costs.
-exec "$(dirname "$0")/gen.sh" mise 20
+#
+# With BX_BENCH_CAPTURED naming tests/fixtures/activation, `mise activate zsh`
+# prints the real tool's captured output instead, with this stub in place of
+# the capturing machine's mise and the PATH this stub ran with in place of
+# that machine's, as the real tool prints the PATH it inherited. That output
+# runs `mise hook-env` as it loads and at every prompt, and this stub answers
+# it, so nothing needs the real mise installed.
+set -eu
+here="$(cd "$(dirname "$0")" && pwd)"
+case "${1-}" in
+hook-env)
+	printf '%s\n' 'export __MISE_SESSION=bench'
+	exit 0
+	;;
+esac
+if [ -n "${BX_BENCH_CAPTURED-}" ] && [ "${2-}" = zsh ]; then
+	exec sed -e "1s|^export PATH='/usr/local/bin:/usr/bin:/bin'\$|export PATH='${PATH}'|" \
+		-e "s|/usr/local/bin/mise|${here}/mise|g" "${BX_BENCH_CAPTURED}/mise-activate-zsh.zsh"
+fi
+exec "${here}/gen.sh" mise 20

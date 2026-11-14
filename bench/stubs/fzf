@@ -1,4 +1,12 @@
 #!/bin/sh
 # Stand-in for fzf: emits an init block of representative size, then exits.
 # The process spawn is the point — it is what `eval "\$(fzf init zsh)"` costs.
+#
+# With BX_BENCH_CAPTURED naming tests/fixtures/activation, `fzf --zsh` prints
+# the real tool's captured output instead: its key bindings and completion,
+# with the load-time option capture they open and close with.
+set -eu
+if [ -n "${BX_BENCH_CAPTURED-}" ] && [ "${1-}" = --zsh ]; then
+	exec cat "${BX_BENCH_CAPTURED}/fzf-zsh.zsh"
+fi
 exec "$(dirname "$0")/gen.sh" fzf 20

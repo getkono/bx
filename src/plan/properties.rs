@@ -298,14 +298,21 @@ fn targets() -> impl Strategy<Value = Vec<Generated>> {
         (text(), any::<bool>()).prop_map(|(body, same)| Before::Owned { body, same }),
         text().prop_map(Before::Edited),
     ];
-    let target = (any::<bool>(), any::<bool>(), "([a-z]{1,6}\n){1,3}", before).prop_map(
-        |(nested, region, body, before)| Generated {
+    // An edit that leaves exactly the bytes bx wrote is no edit: the ledger
+    // still proves them bx's, and `rm` rightly takes them back.
+    let target = (any::<bool>(), any::<bool>(), "([a-z]{1,6}\n){1,3}", before)
+        .prop_map(|(nested, region, body, before)| Generated {
             nested,
             region,
             body,
             before,
-        },
-    );
+        })
+        .prop_filter("an edit changes what bx wrote", |target| {
+            match &target.before {
+                Before::Edited(text) => text.as_bytes() != target.written(&target.body),
+                _ => true,
+            }
+        });
     proptest::collection::vec(target, 0..=3)
 }
 

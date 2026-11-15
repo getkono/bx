@@ -172,13 +172,14 @@ const CHOICES: [(&str, Answer); 3] = [
 fn ask_edited(question: &str) -> Result<Answer, Error> {
     discard_typeahead(std::io::stdin());
     let labels: Vec<&str> = CHOICES.iter().map(|(label, _)| *label).collect();
+    // The pick is read by its position in `CHOICES`, which is the order its
+    // labels were offered in, so no label is compared to find its answer.
     let picked = inquire::Select::new(question, labels)
         .with_starting_cursor(0)
-        .prompt()
+        .raw_prompt()
         .map_err(confirmation_failed)?;
     Ok(CHOICES
-        .iter()
-        .find(|(label, _)| *label == picked)
+        .get(picked.index)
         .map_or(Answer::Keep, |(_, answer)| *answer))
 }
 

@@ -157,7 +157,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use super::{Assembly, Shell, quote};
-use crate::config::target::Activated;
+use crate::config::target::{Activated, Target};
 use crate::config::when::Machine;
 use crate::detect::{self, Presence};
 use crate::env_guard::{self, Reason, RootSet, Verdict, Violation};
@@ -471,15 +471,21 @@ pub struct Step {
     pub shell: Shell,
     /// What was decided.
     pub outcome: Outcome,
+    /// zsh's compiled wordcode of the output, for a zsh step whose output is
+    /// rendered and a zsh that compiled it ([`file::compile`]); `None`
+    /// otherwise.
+    pub wordcode: Option<file::Wordcode>,
 }
 
 impl Step {
     /// What the step is, in the vocabulary `plan` and `apply` share: a reuse
     /// is converged, a first capture creates a cache entry and a re-capture
-    /// modifies one, and an omission is blocked until the tool behaves.
+    /// modifies one, and an omission is blocked until the tool behaves. A
+    /// reuse whose wordcode zsh compiled anew modifies the cache too.
     #[must_use]
     pub const fn action(&self) -> Action {
         match &self.outcome {
+            Outcome::Reused { .. } if self.compiled() => Action::Modify,
             Outcome::Reused { .. } => Action::Unchanged,
             Outcome::Captured {
                 replaces: false, ..
@@ -493,6 +499,9 @@ impl Step {
     #[must_use]
     pub fn line(&self) -> String {
         let what = match &self.outcome {
+            Outcome::Reused { .. } if self.compiled() => {
+                "cached output reused; zsh compiled it, cache updated".to_string()
+            }
             Outcome::Reused { .. } => "cached output reused, nothing run".to_string(),
             Outcome::Captured {
                 replaces: false, ..
@@ -514,16 +523,32 @@ impl Step {
         )
     }
 
-    /// The text the step adds to its phase, if any.
+    /// Whether zsh compiled the step's wordcode during this plan, so the
+    /// cache has an entry to record.
+    const fn compiled(&self) -> bool {
+        matches!(&self.wordcode, Some(file::Wordcode { entry: Some(_), .. }))
+    }
+
+    /// The output the step renders, if any.
+    #[must_use]
+    pub fn output(&self) -> Option<&str> {
+        match &self.outcome {
+            Outcome::Reused { output } | Outcome::Captured { output, .. } => Some(output),
+            Outcome::Omitted(_) => None,
+        }
+    }
+
+    /// The text the step adds to its phase, if any: in zsh's file the line
+    /// that sources the output's own file ([`file::line`]), and in bash's one
+    /// `eval` of the output as a single-quoted literal.
     #[must_use]
     pub fn body(&self) -> Option<String> {
         let comment = format!("# bx activation: {}\n", self.decl.name);
-        match &self.outcome {
-            Outcome::Reused { output } | Outcome::Captured { output, .. } => {
-                Some(format!("{comment}eval {}\n", quote(output)))
-            }
-            Outcome::Omitted(_) => None,
-        }
+        let output = self.output()?;
+        Some(match self.shell {
+            Shell::Zsh => format!("{comment}{}", file::line(&self.decl.name)),
+            Shell::Bash => format!("{comment}eval {}\n", quote(output)),
+        })
     }
 }
 
@@ -560,10 +585,31 @@ impl Plan {
             .collect()
     }
 
-    /// Bring `cache` up to date with the plan: record every capture, and
-    /// forget every activation entry nothing reused or captured — an omitted
-    /// one, a refused one, and one no enabled declaration names any more — so an omission is retried from nothing. Entries this module
-    /// does not own are left alone.
+    /// The files zsh's rendered steps are written as, in declaration order:
+    /// each output's own file, then its wordcode where zsh compiled one
+    /// ([`file::targets`]).
+    #[must_use]
+    pub fn targets(&self) -> Vec<Target> {
+        self.steps
+            .iter()
+            .filter(|step| step.shell == Shell::Zsh)
+            .filter_map(|step| {
+                Some(file::targets(
+                    &step.decl.name,
+                    step.output()?,
+                    step.wordcode.as_ref(),
+                    &step.decl.origin,
+                ))
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Bring `cache` up to date with the plan: record every capture and
+    /// every wordcode zsh compiled, and forget every activation entry nothing
+    /// reused or captured — an omitted one, a refused one, and one no enabled
+    /// declaration names any more — so an omission is retried from nothing.
+    /// Entries this module does not own are left alone.
     pub fn record(&self, cache: &mut Fingerprints) {
         let mut kept = Vec::new();
         for step in &self.steps {
@@ -576,12 +622,21 @@ impl Plan {
                 }
                 Outcome::Omitted(_) => {}
             }
+            if let Some(wordcode) = &step.wordcode {
+                let key = format!("{}{}", file::KEY_PREFIX, step.decl.name);
+                if let Some(entry) = &wordcode.entry {
+                    cache.set(key.clone(), entry.clone());
+                }
+                kept.push(key);
+            }
         }
         let stale: Vec<String> = cache
             .iter()
             .map(|(key, _)| key)
             .filter(|key| {
-                (key.starts_with(KEY_PREFIX) || key.starts_with(BASH_KEY_PREFIX))
+                (key.starts_with(KEY_PREFIX)
+                    || key.starts_with(BASH_KEY_PREFIX)
+                    || key.starts_with(file::KEY_PREFIX))
                     && !kept.contains(key)
             })
             .cloned()
@@ -677,10 +732,19 @@ pub fn plan(
                     }
                     Outcome::Omitted(_) => None,
                 };
+                let outcome = refused.map_or(outcome, Outcome::Omitted);
+                // Only an output the guard passed is compiled, and only zsh's.
+                let wordcode = match (&outcome, shell) {
+                    (Outcome::Reused { output } | Outcome::Captured { output, .. }, Shell::Zsh) => {
+                        file::compile(&decl.name, output, cache, host)
+                    }
+                    _ => None,
+                };
                 Some(Step {
                     decl: decl.clone(),
                     shell,
-                    outcome: refused.map_or(outcome, Outcome::Omitted),
+                    outcome,
+                    wordcode,
                 })
             })
         })
@@ -1341,6 +1405,8 @@ fn line_of(chars: &[char], at: usize) -> String {
         .map_or(chars.len(), |p| at + p);
     chars[start..end].iter().collect()
 }
+
+pub mod file;
 
 #[cfg(test)]
 mod tests;

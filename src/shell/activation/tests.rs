@@ -135,14 +135,22 @@ impl Host for Fake {
     }
 }
 
-/// Plan, render and record, as `apply` does; the rendered file.
+/// Plan, render and record, as `apply` does; the rendered file, with each
+/// activation's line standing in for the file it sources replaced by what
+/// that file holds.
 fn apply(decls: &[ActivationDecl], cache: &mut Fingerprints, host: &Fake) -> (Plan, String) {
     let plan = plan(decls, cache, &RootSet::strict(), host);
     let mut assembly = Assembly::new();
     contribute(&mut assembly, &plan.rendered(Shell::Zsh))
         .expect("activations never claim the terminal slot");
     plan.record(cache);
-    (plan, assembly.render())
+    let mut file = assembly.render();
+    for step in plan.steps().iter().filter(|step| step.shell == Shell::Zsh) {
+        if let Some(output) = step.output() {
+            file = file.replace(&file::line(&step.decl.name), output);
+        }
+    }
+    (plan, file)
 }
 
 #[test]
@@ -643,7 +651,7 @@ fn the_real_outputs_of_common_tools_render() {
         let mut cache = Fingerprints::default();
         let (plan, file) = apply(&[activation], &mut cache, &host);
         assert_eq!(plan.steps()[0].action(), Action::Create, "{command}");
-        assert!(file.contains(&quote(output)), "{command}");
+        assert!(file.contains(output), "{command}");
     }
     // And one relocating assignment in any of them is still found.
     let (_, mise) = REAL_OUTPUTS[0];
@@ -681,7 +689,7 @@ fn an_output_the_guard_refuses_is_blocked_named_and_never_written() {
     );
     assert!(!file.contains("STARSHIP"), "{file}");
     assert!(
-        file.contains("# bx activation: vi\neval 'export EDITOR=vi\n'\n"),
+        file.contains("# bx activation: vi\nexport EDITOR=vi\n"),
         "{file}"
     );
     let keys: Vec<&String> = cache.iter().map(|(k, _)| k).collect();
@@ -739,7 +747,7 @@ fn a_second_apply_on_an_unchanged_machine_runs_nothing_and_renders_the_same_byte
         assert_eq!(step.action(), Action::Create, "{step:?}");
     }
     assert_eq!(cache.len(), 2);
-    assert!(file.contains("eval 'export EDITOR=nvim\n'\n"), "{file}");
+    assert!(file.contains("export EDITOR=nvim\n"), "{file}");
     assert!(
         file.find("# bx phase: activations").unwrap()
             < file.find("# bx phase: completions").unwrap()
@@ -768,14 +776,14 @@ fn only_a_change_in_the_binarys_content_or_the_command_runs_it_again() {
     host.upgrade("mise", b"mise 1", &["ignored\n"]);
     let (plan, file) = apply(&decls, &mut cache, &host);
     assert_eq!(host.runs(), 2);
-    assert!(file.contains("eval 'v1\n'"), "{file}");
+    assert!(file.contains("v1\n"), "{file}");
     assert_eq!(plan.steps()[0].action(), Action::Unchanged);
 
     // New content runs it again and replaces the entry.
     host.upgrade("mise", b"mise 2", &["v2\n"]);
     let (plan, file) = apply(&decls, &mut cache, &host);
     assert_eq!(host.runs(), 4);
-    assert!(file.contains("eval 'v2\n'"), "{file}");
+    assert!(file.contains("v2\n"), "{file}");
     assert_eq!(plan.steps()[0].action(), Action::Modify);
     assert!(plan.steps()[0].line().contains("cache replaced"));
 
@@ -831,7 +839,7 @@ fn output_that_differs_between_two_runs_is_omitted_uncached_and_retried() {
     // Retried at the next plan, and trusted once two runs agree.
     let (plan, file) = apply(&decls, &mut cache, &host);
     assert!(matches!(plan.steps()[0].outcome, Outcome::Captured { .. }));
-    assert!(file.contains("eval 'two\n'"), "{file}");
+    assert!(file.contains("two\n"), "{file}");
     assert_eq!(host.runs(), 4);
 }
 
@@ -886,10 +894,7 @@ fn an_absent_or_misbehaving_tool_is_omitted_and_everything_else_renders() {
                  cache replaced",
         ]
     );
-    assert!(
-        file.contains("# bx activation: ok\neval 'ok\n'\n"),
-        "{file}"
-    );
+    assert!(file.contains("# bx activation: ok\nok\n"), "{file}");
     assert_eq!(file.matches("# bx activation:").count(), 1, "{file}");
     let keys: Vec<&String> = cache.iter().map(|(k, _)| k).collect();
     assert_eq!(keys, ["activation:ok"], "an omission forgets its entry");
@@ -931,20 +936,58 @@ fn an_entry_that_does_not_decode_is_a_miss() {
     assert_eq!(entry.output, "a\n");
 }
 
-#[test]
-fn a_rendered_activation_is_one_eval_of_a_literal_and_sets_nothing_itself() {
-    // Invariant 2: the phase is not an environment fragment. The tool's
-    // text, however hostile, is the single-quoted argument of one `eval`;
-    // stripping that literal leaves bx's own bytes, which set nothing.
-    let output = "export A='1'\nB=2; echo \"$(x)\" '\\''\n}\n'unterminated\n";
-    let step = Step {
-        decl: decl("t", &["t"]),
-        shell: Shell::Zsh,
+/// A zsh or bash step that reused `output`, compiled by nothing.
+fn reused(name: &str, shell: Shell, output: &str) -> Step {
+    Step {
+        decl: decl(name, &[name]),
+        shell,
         outcome: Outcome::Reused {
             output: output.to_string(),
         },
+        wordcode: None,
+    }
+}
+
+/// The bytes `target`'s generator renders.
+fn bytes_of(target: &Target) -> Vec<u8> {
+    let crate::config::target::Body::Generated(generator) = &target.body else {
+        panic!("{:?}", target.body);
     };
-    let body = step.body().expect("renders");
+    generator.render(&crate::config::when::tools(&|_| true))
+}
+
+#[test]
+fn a_rendered_activation_sets_nothing_itself_and_its_file_holds_the_output_byte_for_byte() {
+    // Invariant 2: the phase is not an environment fragment. bx's own bytes
+    // in it set nothing: in zsh's file one guarded `source` of the output's
+    // own file, and in bash's one `eval` whose single-quoted argument holds
+    // the tool's text, however hostile.
+    let output = "export A='1'\nB=2; echo \"$(x)\" '\\''\n}\n'unterminated\n";
+    assert_eq!(
+        reused("t", Shell::Zsh, output).body().as_deref(),
+        Some(
+            "# bx activation: t\n[[ -r ~/.local/share/bx/activation/t.zsh ]] && \
+             source ~/.local/share/bx/activation/t.zsh\n"
+        )
+    );
+    let plan = Plan {
+        steps: vec![
+            reused("t", Shell::Zsh, output),
+            reused("t", Shell::Bash, output),
+        ],
+    };
+    // The file holds exactly the tool's bytes; bash's output stays in its
+    // `eval`, and there is no wordcode where no zsh compiled one.
+    let targets = plan.targets();
+    assert_eq!(targets.len(), 1, "{targets:?}");
+    assert_eq!(
+        targets[0].path.as_str(),
+        "~/.local/share/bx/activation/t.zsh"
+    );
+    assert_eq!(targets[0].attach, crate::config::target::Attach::Own);
+    assert_eq!(bytes_of(&targets[0]), output.as_bytes());
+
+    let body = reused("t", Shell::Bash, output).body().expect("renders");
     let rest = body
         .strip_prefix("# bx activation: t\neval '")
         .and_then(|b| b.strip_suffix("'\n"))
@@ -954,28 +997,83 @@ fn a_rendered_activation_is_one_eval_of_a_literal_and_sets_nothing_itself() {
     assert_eq!(rest.replace(r"'\''", "'"), output);
     assert!(!rest.replace(r"'\''", "").contains('\''), "{rest}");
 
-    assert_eq!(
-        Step {
-            decl: decl("o", &["o"]),
-            shell: Shell::Bash,
-            outcome: Outcome::Omitted(Omission::NotText),
+    let mut omitted = reused("o", Shell::Bash, "");
+    omitted.outcome = Outcome::Omitted(Omission::NotText);
+    assert_eq!(omitted.body(), None);
+    omitted.shell = Shell::Zsh;
+    assert_eq!(omitted.body(), None);
+    assert!(
+        Plan {
+            steps: vec![omitted]
         }
-        .body(),
-        None
+        .targets()
+        .is_empty()
     );
 }
 
 #[test]
-fn zsh_runs_a_cached_activation_as_the_tool_wrote_it_and_contains_a_broken_one() {
+fn an_activation_file_is_named_by_its_activation_or_a_digest_of_it() {
+    assert_eq!(file::stem("starship"), "starship");
+    assert_eq!(file::stem("zsh-auto_2"), "zsh-auto_2");
+    // A name no bare word or file name holds is spelled by its digest,
+    // which no plain name spells, one digest per name.
+    let odd = ["star ship", "a/b", "..", "", "it's", "x.y"];
+    let stems: BTreeMap<String, &str> = odd.iter().map(|name| (file::stem(name), *name)).collect();
+    assert_eq!(stems.len(), odd.len(), "{stems:?}");
+    for (stem, name) in &stems {
+        assert!(stem.starts_with("x.") && stem.len() == 18, "{name}: {stem}");
+        assert!(stem[2..].chars().all(|c| c.is_ascii_hexdigit()), "{stem}");
+        let targets = file::targets(name, "x\n", None, &decl("o", &["o"]).origin);
+        assert_eq!(
+            targets[0].path.as_str(),
+            format!("{}/{stem}.zsh", file::DIR)
+        );
+    }
+}
+
+/// The search path `zsh` is first on, and the machine that searches it.
+fn with_zsh(zsh: &Path) -> System {
+    System::new(zsh.parent().expect("a directory"), Duration::from_secs(10))
+}
+
+/// Write each of `targets` under `home`, in order, as `apply` would.
+fn write_all(targets: &[Target], home: &Path) {
+    for target in targets {
+        let path = target.path.render(home);
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&path, bytes_of(target)).expect("write");
+    }
+}
+
+/// What zsh prints sourcing `file` under `home`, then `print`ing `probe`.
+fn sourced(zsh: &Path, home: &Path, file: &Path, probe: &str) -> String {
+    let out = Command::new(zsh)
+        .args([
+            "-f",
+            "-c",
+            &format!("source \"$1\"; print -r -- {probe}"),
+            "zsh",
+        ])
+        .arg(file)
+        .env_clear()
+        .env("HOME", home)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .expect("zsh runs");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[test]
+fn zsh_loads_each_activation_compiled_as_the_tool_wrote_it_and_contains_a_broken_one() {
     let Some(zsh) = crate::shell::testing::installed("zsh") else {
         return;
     };
-    let step = |name: &str, output: &str| Step {
-        decl: decl(name, &[name]),
-        shell: Shell::Zsh,
-        outcome: Outcome::Reused {
-            output: output.to_string(),
-        },
+    let system = with_zsh(&zsh);
+    let step = |name: &str, output: &str| {
+        let mut step = reused(name, Shell::Zsh, output);
+        step.wordcode = file::compile(name, output, &Fingerprints::default(), &system);
+        step
     };
     let steps = vec![
         step(
@@ -985,30 +1083,98 @@ fn zsh_runs_a_cached_activation_as_the_tool_wrote_it_and_contains_a_broken_one()
         step("broken", "echo 'never closed\n"),
         step("after", "export Y=ok\n"),
     ];
-    let mut assembly = Assembly::new();
-    contribute(&mut assembly, &Plan { steps }.rendered(Shell::Zsh)).expect("contributes");
+    assert!(steps[0].wordcode.is_some() && steps[2].wordcode.is_some());
+    assert_eq!(
+        steps[1].wordcode, None,
+        "zsh compiles nothing it cannot parse"
+    );
+    let plan = Plan { steps };
+    let targets = plan.targets();
+    assert_eq!(
+        targets.iter().map(|t| t.path.as_str()).collect::<Vec<_>>(),
+        [
+            "~/.local/share/bx/activation/quoted.zsh",
+            "~/.local/share/bx/activation/quoted.zsh.zwc",
+            "~/.local/share/bx/activation/broken.zsh",
+            "~/.local/share/bx/activation/after.zsh",
+            "~/.local/share/bx/activation/after.zsh.zwc",
+        ],
+        "each output's file before its wordcode"
+    );
     let dir = tempfile::TempDir::new().expect("tempdir");
+    write_all(&targets, dir.path());
+    let mut assembly = Assembly::new();
+    contribute(&mut assembly, &plan.rendered(Shell::Zsh)).expect("contributes");
     let file = dir.path().join("zshrc.zsh");
     std::fs::write(&file, assembly.render()).expect("write");
-    let out = Command::new(zsh)
-        .args([
-            "-f",
-            "-c",
-            "source \"$1\"; print -r -- \"$X|$W|$Y|$(z)\"",
-            "zsh",
-        ])
-        .arg(&file)
-        .env_clear()
-        .env("HOME", dir.path())
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .expect("zsh runs");
+    let probe = "\"$X|$W|$Y|$(z)\"";
     let home = dir.path().display();
+    let expected = format!("a'b $HOME|{home}/w|ok|zed\n");
+    assert_eq!(sourced(&zsh, dir.path(), &file, probe), expected);
+
+    // What zsh loads is the wordcode: the file's text replaced, but left no
+    // newer than its `.zwc`, is not read.
+    let quoted = dir.path().join(".local/share/bx/activation/quoted.zsh");
+    let mut zwc = quoted.clone().into_os_string();
+    zwc.push(".zwc");
+    let zwc = PathBuf::from(zwc);
+    std::fs::write(&quoted, "export X=text W=text\nz() { print -r -- text; }\n").expect("write");
+    let older = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&quoted)
+        .and_then(|f| f.set_modified(older))
+        .expect("backdated");
+    assert_eq!(sourced(&zsh, dir.path(), &file, probe), expected);
+
+    // A `.zwc` another zsh version wrote is passed over for the file, as is
+    // one older than it.
+    let mut code = std::fs::read(&zwc).expect("the wordcode");
+    let version = code
+        .windows(2)
+        .position(|w| w[0].is_ascii_digit() && w[1] == b'.')
+        .expect("zsh's version in the header");
+    code[version] = b'0';
+    std::fs::write(&zwc, &code).expect("write");
     assert_eq!(
-        String::from_utf8_lossy(&out.stdout),
-        format!("a'b $HOME|{home}/w|ok|zed\n")
+        sourced(&zsh, dir.path(), &file, probe),
+        "text|text|ok|text\n"
     );
+    std::fs::write(&zwc, bytes_of(&targets[1])).expect("write");
+    std::fs::File::options()
+        .write(true)
+        .open(&zwc)
+        .and_then(|f| f.set_modified(older - Duration::from_secs(1)))
+        .expect("backdated");
+    assert_eq!(
+        sourced(&zsh, dir.path(), &file, probe),
+        "text|text|ok|text\n"
+    );
+}
+
+#[test]
+fn the_wordcode_is_the_same_bytes_every_time_and_cached_until_its_inputs_change() {
+    let Some(zsh) = crate::shell::testing::installed("zsh") else {
+        return;
+    };
+    let system = with_zsh(&zsh);
+    let mut cache = Fingerprints::default();
+    let first = file::compile("t", "t() { :; }\n", &cache, &system).expect("compiled");
+    let entry = first.entry.clone().expect("a new entry");
+    // Invariant 3: the same zsh compiles the same bytes under the same name
+    // to the same wordcode, whichever scratch directory it ran in.
+    let again = file::compile("t", "t() { :; }\n", &cache, &system).expect("compiled");
+    assert_eq!(again, first);
+    cache.set(format!("{}t", file::KEY_PREFIX), entry);
+    let reused = file::compile("t", "t() { :; }\n", &cache, &system).expect("reused");
+    assert_eq!((reused.bytes, reused.entry), (first.bytes.clone(), None));
+    // A changed output, or a different name, is compiled again.
+    let changed = file::compile("t", "t() { true; }\n", &cache, &system).expect("compiled");
+    assert!(changed.entry.is_some() && changed.bytes != first.bytes);
+    assert!(file::compile("u", "t() { :; }\n", &cache, &system).is_some_and(|c| c.entry.is_some()));
+    // No zsh, no wordcode.
+    let without = System::new("/nonexistent", Duration::from_secs(1));
+    assert_eq!(file::compile("t", "t() { :; }\n", &cache, &without), None);
 }
 
 /// A tool named `tool` first on a search path of its own: a link to `sh`,
@@ -1047,17 +1213,25 @@ fn a_tool_that_prints_the_path_it_ran_with_is_cached_referring_to_the_live_path(
         String::from_utf8(raw).unwrap().contains(":/bin:/usr/bin'"),
         "the tool really printed the PATH it ran with"
     );
-    let expected = "# bx activation: tool\neval 'export PATH='\\''/opt/t/bin:'\\''\"$PATH\"\n\
-                        export X=\"${PATH}\"\n'\n";
+    let expected = "export PATH='/opt/t/bin:'\"$PATH\"\nexport X=\"${PATH}\"\n";
     let roots = RootSet::strict();
     let mut caches = Vec::new();
     for system in [&system, &other] {
         let planned = plan(&decls, &Fingerprints::default(), &roots, system);
-        assert_eq!(planned.steps()[0].body().as_deref(), Some(expected));
+        assert_eq!(planned.steps()[0].output(), Some(expected));
         let mut cache = Fingerprints::default();
         planned.record(&mut cache);
-        caches.push(cache);
+        // The wordcode's entry is keyed by where zsh was found, which the
+        // two search paths may answer differently; the output's is not.
+        caches.push((
+            cache.get(&decls[0].key()).cloned(),
+            planned.steps()[0]
+                .wordcode
+                .as_ref()
+                .map(|code| code.bytes.clone()),
+        ));
     }
+    assert!(caches[0].0.is_some());
     assert_eq!(caches[0], caches[1], "the cache holds no PATH either");
 }
 
@@ -1149,10 +1323,7 @@ fn the_system_runs_the_resolved_binary_and_caches_what_it_printed() {
     let mut cache = Fingerprints::default();
     let roots = RootSet::strict();
     let plan_one = plan(&decls, &cache, &roots, &system);
-    assert_eq!(
-        plan_one.steps()[0].body().expect("captured"),
-        "# bx activation: tool\neval 'export EDITOR=vi\n'\n"
-    );
+    assert_eq!(plan_one.steps()[0].output(), Some("export EDITOR=vi\n"));
     plan_one.record(&mut cache);
     let plan_two = plan(&decls, &cache, &roots, &system);
     assert!(matches!(

@@ -136,17 +136,30 @@ impl Gen {
     /// on this machine, and what the machine's facts are: the one input
     /// besides the target itself, asked while `plan` and `apply` decide,
     /// never by the generated shell.
+    ///
+    /// Bytes, not text, because a zsh activation's `.zwc` is zsh's wordcode;
+    /// every other generator's bytes are the text it renders.
     #[must_use]
-    pub fn render(&self, decide: &dyn crate::config::when::Decide) -> String {
+    pub fn render(&self, decide: &dyn crate::config::when::Decide) -> Vec<u8> {
         match self {
-            Self::Env(fragment) => fragment.render(decide),
-            Self::LaunchAgent(agent) => agent.render(decide),
-            Self::Source(fragment) => crate::config::env::source_line(fragment),
-            Self::Profile(file) => bash::profile_line(file),
-            Self::Interactive(file) => file.render(decide),
-            Self::Bash(file) => file.render(decide),
-            Self::Inputrc(keybindings) => bash::render_inputrc(keybindings),
+            Self::Env(fragment) => fragment.render(decide).into_bytes(),
+            Self::LaunchAgent(agent) => agent.render(decide).into_bytes(),
+            Self::Source(fragment) => crate::config::env::source_line(fragment).into_bytes(),
+            Self::Profile(file) => bash::profile_line(file).into_bytes(),
+            Self::Interactive(file) => file.render(decide).into_bytes(),
+            Self::Bash(file) => file.render(decide).into_bytes(),
+            Self::Inputrc(keybindings) => bash::render_inputrc(keybindings).into_bytes(),
+            Self::Activation(output) => output.clone().into_bytes(),
+            Self::Wordcode(wordcode) => wordcode.clone(),
         }
+    }
+
+    /// [`Gen::render`] read as the text every generator but the wordcode
+    /// renders, for the tests that compare it with text.
+    #[cfg(test)]
+    #[must_use]
+    pub fn text(&self, decide: &dyn crate::config::when::Decide) -> String {
+        String::from_utf8(self.render(decide)).expect("a text generator renders text")
     }
 
     /// What the generator's plan row says beside its bytes: for zsh's and
@@ -163,7 +176,9 @@ impl Gen {
             | Self::LaunchAgent(_)
             | Self::Source(_)
             | Self::Profile(_)
-            | Self::Inputrc(_) => None,
+            | Self::Inputrc(_)
+            | Self::Activation(_)
+            | Self::Wordcode(_) => None,
         }
     }
 }

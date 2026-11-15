@@ -321,6 +321,16 @@ fn decide_and_write(
         .iter()
         .map(|target| with_activations(target.clone(), &report.activations))
         .collect();
+    // Each zsh activation's own file and its wordcode, which zsh's
+    // interactive file sources, decided and written as any other file bx
+    // owns whole, and taken back once no activation renders them.
+    targets.extend(
+        report
+            .activations
+            .targets()
+            .into_iter()
+            .map(Resolution::Ready),
+    );
     let owned = |path: &paths::Portable| {
         ledger
             .get(path)

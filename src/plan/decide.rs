@@ -707,7 +707,7 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             if let Some(note) = guard_generated(generator, &content, ctx.roots, &facts) {
                 return Ok(Wanted::Blocked(note));
             }
-            content.into_bytes()
+            content
         }
         // A declared directory mode reaches disk before any file beneath it
         // is written, which [`locked_parent`] reads as a declaration.

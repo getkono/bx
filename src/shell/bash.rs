@@ -645,7 +645,7 @@ mod tests {
                     (
                         target.path.to_string(),
                         target.attach.clone(),
-                        generator.render(&tools(&|_| true)),
+                        generator.text(&tools(&|_| true)),
                     )
                 }
                 Resolution::Blocked(entry) => panic!("nothing is held back: {entry:?}"),
@@ -1137,7 +1137,7 @@ mod tests {
         let Body::Generated(generator) = &file.body else {
             panic!("{:?}", file.body);
         };
-        let rendered = generator.render(&tools(&|_| true));
+        let rendered = generator.text(&tools(&|_| true));
         let probe = "printf '%s|' \"$LANG\" \"${PAGER-unset}\" \"${SSHY-unset}\" \"$EDITOR\" \
                      \"${ZONLY-unset}\" \"${BROWSER-unset}\"; declare -F mkcd hooked; \
                      declare -p LANG EDITOR PAGER 2>/dev/null; true\n";

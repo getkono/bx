@@ -161,7 +161,9 @@ fn decision_4_apply_with_yes_writes_without_asking() {
 
 #[test]
 fn applied_counts_an_activation_capture_as_a_change() {
-    // V1: the interactive file, its `~/.zshrc` region, and the capture.
+    // V1: the interactive file, its `~/.zshrc` region, the output's own
+    // file, its wordcode where a zsh on `PATH` compiles one, and the capture.
+    let compiled = usize::from(crate::detect::locate_in_env("zsh").is_usable());
     let home = guarded_home();
     home.write(".zshrc", "user\n");
     let stub = home.child("stub");
@@ -189,7 +191,7 @@ fn applied_counts_an_activation_capture_as_a_change() {
         text(&out)
     );
     assert!(
-        text(&out).ends_with("Applied 3 change(s).\n"),
+        text(&out).ends_with(&format!("Applied {} change(s).\n", 4 + compiled)),
         "{}",
         text(&out)
     );

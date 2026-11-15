@@ -314,7 +314,9 @@ pub fn link_text(text: &str, home: &Path) -> PathBuf {
 /// a pure function of the resolved target and whether each tool a
 /// `when = "has:TOOL"` names is present: the plan decides on exactly the bytes
 /// `apply` writes. [`Gen::render`], which [`crate::shell`] implements, is
-/// that function.
+/// that function. The two variants a declared zsh activation adds,
+/// [`Gen::Activation`] and [`Gen::Wordcode`], carry what the plan decided
+/// for it, since running a tool and compiling what it printed are the plan's.
 ///
 /// Every variant so far is produced by the `[[env]]` placement graph
 /// ([`super::env`]), which also carries the `[[plugin]]` entries, the
@@ -359,6 +361,17 @@ pub enum Gen {
     /// [`crate::shell::bash::render_inputrc`]. Readline's syntax has no
     /// environment variable to judge.
     Inputrc(Keybindings),
+    /// One zsh activation's cached output, byte for byte, in a file of its
+    /// own that zsh's interactive file sources
+    /// ([`crate::shell::activation::file`]). The plan judged it by the
+    /// relocation rule before it became a target, as it judges every
+    /// activation's output, so it is not judged again here.
+    Activation(String),
+    /// zsh's compiled wordcode of one [`Gen::Activation`] file, its `.zwc`,
+    /// which `zcompile` made from exactly that file's bytes while the plan
+    /// decided ([`crate::shell::activation::file`]). Not text: the one body
+    /// whose bytes are not a rendering of anything bx wrote.
+    Wordcode(Vec<u8>),
 }
 
 /// One tool activation's text in an interactive file, as the plan decided it:
@@ -374,8 +387,9 @@ pub struct Activated {
     pub phase: Phase,
     /// The activation's name, which owns the text in its phase.
     pub name: String,
-    /// The text: a comment naming the activation, then one `eval` of a
-    /// single-quoted literal holding the output.
+    /// The text: a comment naming the activation, then, in zsh's file, the
+    /// one guarded line that sources the activation's own file, and in
+    /// bash's, one `eval` of a single-quoted literal holding the output.
     pub body: String,
 }
 
@@ -397,8 +411,8 @@ pub struct Activated {
 /// whose path resolved lands in the phase it names, after that phase's own
 /// declarations, as the one guarded line [`Source::render_in`] renders; and
 /// every declared tool activation the plan reused or captured lands in the phase it
-/// names, as the one `eval` of a literal [`Activated::body`] holds,
-/// before any source in that phase. No phase
+/// names, as the one guarded `source` of its own file [`Activated::body`]
+/// holds, before any source in that phase. No phase
 /// but `env` holds an environment assignment (Invariant 2): the `options`
 /// phase assigns only zsh's own unexported history parameters, which
 /// [`super::history`]'s tests hold it to, and the `functions` phase assigns

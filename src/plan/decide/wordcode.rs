@@ -148,3 +148,100 @@ fn rewrite(target: &Target, bytes: &[u8], home: &std::path::Path) -> Result<Op, 
         base: bytes.len() <= Base::KEPT_WHOLE,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Origin;
+    use crate::shell::activation::file;
+    use crate::testing::guarded_home;
+
+    /// The activation `stub`'s file and its wordcode, as resolved targets.
+    fn resolved() -> Vec<Resolution<Target>> {
+        let code = file::Wordcode {
+            bytes: b"code".to_vec(),
+            entry: None,
+        };
+        let origin = Origin {
+            file: std::path::PathBuf::new(),
+            line: 0,
+        };
+        file::targets("stub", "stub_hook() { :; }\n", Some(&code), &origin)
+            .into_iter()
+            .map(Resolution::Ready)
+            .collect()
+    }
+
+    /// The target `resolution` resolved to.
+    fn ready(resolution: &Resolution<Target>) -> &Target {
+        let Resolution::Ready(target) = resolution else {
+            unreachable!("every row is ready")
+        };
+        target
+    }
+
+    /// The file's row and the wordcode's, decided as `file` and `wordcode`.
+    fn rows(resolutions: &[Resolution<Target>], file: Action, wordcode: Action) -> Vec<Change> {
+        [file, wordcode]
+            .into_iter()
+            .zip(resolutions)
+            .map(|(action, resolution)| Change {
+                target: ready(resolution).path.as_str().to_string(),
+                origin: ready(resolution).origin.clone(),
+                action,
+                diff: None,
+                note: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_rewritten_wordcode_is_kept_as_a_base_only_while_it_is_small_enough() {
+        let home = guarded_home();
+        let resolutions = resolved();
+        for (len, kept) in [
+            (1, true),
+            (Base::KEPT_WHOLE, true),
+            (Base::KEPT_WHOLE + 1, false),
+        ] {
+            let op =
+                rewrite(ready(&resolutions[1]), &vec![b'w'; len], home.path()).expect("observed");
+            assert_eq!(op.base, kept, "{len} bytes");
+        }
+    }
+
+    #[test]
+    fn a_held_file_ties_no_wordcode_that_is_neither_written_nor_already_right() {
+        let home = guarded_home();
+        let resolutions = resolved();
+        let file = rewrite(ready(&resolutions[0]), b"file", home.path()).expect("observed");
+        // The wordcode is a conflict of its own that nothing writes: no write
+        // waits on the file's answer, and its row stays as it was decided.
+        let mut changes = rows(&resolutions, Action::Conflict, Action::Conflict);
+        let (mut ops, mut held) = (Vec::new(), vec![(0, file)]);
+        let tied = tie(&resolutions, &mut changes, &mut ops, &mut held, home.path()).expect("tied");
+        assert!(tied.is_empty(), "{tied:?}");
+        assert_eq!(
+            (changes[1].action, changes[1].note.as_deref()),
+            (Action::Conflict, None)
+        );
+        assert!(ops.is_empty() && held.len() == 1);
+    }
+
+    #[test]
+    fn a_wordcode_waits_on_a_file_that_is_neither_written_nor_held_nor_right() {
+        let home = guarded_home();
+        let resolutions = resolved();
+        let own = rewrite(ready(&resolutions[1]), b"code", home.path()).expect("observed");
+        // The file is a conflict with no write of its own: the wordcode's
+        // write is dropped, and its row says it waits on the file.
+        let mut changes = rows(&resolutions, Action::Conflict, Action::Create);
+        let (mut ops, mut held) = (vec![own], Vec::new());
+        let tied = tie(&resolutions, &mut changes, &mut ops, &mut held, home.path()).expect("tied");
+        assert!(tied.is_empty() && ops.is_empty(), "{ops:?}");
+        assert_eq!(
+            (changes[1].action, changes[1].note.as_deref()),
+            (Action::Conflict, Some(WAITS))
+        );
+    }
+}

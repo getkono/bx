@@ -1219,6 +1219,38 @@ fn the_wordcode_is_the_same_bytes_every_time_and_cached_until_its_inputs_change(
     assert_eq!(file::compile("t", "t() { :; }\n", &cache, &without), None);
 }
 
+/// A zsh whose `zcompile` succeeds and leaves an empty `.zwc`.
+struct EmptyZcompile(Fake);
+
+impl Host for EmptyZcompile {
+    fn locate(&self, program: &str) -> Presence {
+        self.0.locate(program)
+    }
+
+    fn hash(&self, path: &Path) -> Result<ContentHash, String> {
+        self.0.hash(path)
+    }
+
+    fn run(&self, program: &Path, args: &[String]) -> Result<Vec<u8>, RunError> {
+        // `zsh -f -c SCRIPT zsh DIR NAME` compiles `DIR/NAME` beside it.
+        let compiled = Path::new(&args[4]).join(format!("{}.zwc", args[5]));
+        std::fs::write(compiled, b"").expect("an empty wordcode");
+        self.0.run(program, args)
+    }
+
+    fn path(&self) -> &OsStr {
+        self.0.path()
+    }
+}
+
+#[test]
+fn an_empty_wordcode_is_no_wordcode_and_the_file_is_sourced_as_it_is() {
+    let host = EmptyZcompile(Fake::default().tool("zsh", b"zsh", &[""]));
+    let cache = Fingerprints::default();
+    assert_eq!(file::compile("t", "t() { :; }\n", &cache, &host), None);
+    assert_eq!(host.0.runs(), 1, "zsh ran, and compiled nothing");
+}
+
 /// A tool named `tool` first on a search path of its own: a link to `sh`,
 /// so the test starts a real process without writing an executable. The
 /// system directories follow it, so the scripts it runs find `head`.

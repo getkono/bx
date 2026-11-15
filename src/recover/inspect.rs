@@ -1327,6 +1327,76 @@ mod tests {
     }
 
     #[test]
+    fn only_a_file_removal_that_kept_its_entry_is_rolled_forward_to_a_record() {
+        // A terminated journal whose one landed write removed `dest` under a
+        // mechanism. A file so removed is a tracked target's carried deletion:
+        // its entry is kept at `removed_written()`, with the removed bytes as
+        // its prior. A directory or a link so removed keeps nothing.
+        for (dir, link) in [(false, false), (true, false), (false, true)] {
+            let case = format!("dir {dir}, link {link}");
+            let home = guarded_home();
+            let state = StateDir::resolve(home.path());
+            state.ensure().expect("ensure");
+            let (portable, dest) = target(home.path(), ".conf");
+            let removed = b"the removed copy\n";
+            let digest = ContentHash::of(removed);
+            fs::write_atomically(
+                &state.restore().join(digest.to_hex()),
+                removed,
+                Mode::PRIVATE_FILE,
+            )
+            .expect("the snapshot");
+            raw_journal(
+                &state.journal(),
+                &[
+                    Record::Begin(Begin {
+                        kind: SessionKind::Apply,
+                        home: home.path().to_path_buf(),
+                        scope: Vec::new(),
+                    }),
+                    Record::Intent(Intent {
+                        before: Prior::Existed(RestoreRef {
+                            digest,
+                            mode: Mode::PRIVATE_FILE,
+                            len: u64::try_from(removed.len()).expect("a length"),
+                        }),
+                        after: Written::Absent,
+                        dir,
+                        link,
+                        ..intent(&portable, &dest, removed)
+                    }),
+                    Record::Done(Done {
+                        target: portable.clone(),
+                    }),
+                    Record::End(End { written: 1 }),
+                ],
+            );
+
+            assert_eq!(
+                recover(&state).expect("recover"),
+                Outcome::Recorded { entries: 1 },
+                "{case}",
+            );
+            let entry = LedgerView::read(&state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .cloned();
+            if dir || link {
+                assert!(entry.is_none(), "{case}: {entry:?}");
+                continue;
+            }
+            let entry = entry.expect("a carried deletion keeps its entry");
+            assert_eq!(entry.written, removed_written());
+            assert_eq!(entry.mode, Mode::PRIVATE_FILE);
+            let Prior::Existed(prior) = &entry.prior else {
+                panic!("the removed bytes are the prior: {entry:?}");
+            };
+            assert_eq!(prior.digest, digest);
+        }
+    }
+
+    #[test]
     fn a_rebuild_whose_created_directory_cannot_be_made_portable_is_an_error() {
         // The loader refuses a journal whose created directory
         // is not a parent of its destination below its UTF-8 home, so no

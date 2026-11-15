@@ -273,6 +273,27 @@ fn decision_4_apply_on_a_terminal_asks_and_honours_the_answer() {
 }
 
 #[test]
+fn a_plan_whose_pager_does_not_exist_is_written_before_apply_asks() {
+    let home = guarded_home();
+    seed(home.path(), &inline("~/.a", "a\\n"));
+    let tty = Env {
+        stdin_tty: true,
+        rows: Some(1),
+        pager: Some(crate::env::Pager {
+            command: home.child("no-such-pager").display().to_string(),
+            set_less: true,
+        }),
+        ..env(home.path())
+    };
+
+    let mut out = Vec::new();
+    let exit = apply_with(&tty, false, &mut out, &mut || Ok(false)).expect("a declined apply");
+
+    assert_eq!(exit, Exit::Pending);
+    assert!(text(&out).starts_with("  + ~/.a"), "{}", text(&out));
+}
+
+#[test]
 fn apply_with_nothing_to_write_asks_nothing_and_needs_no_confirmation() {
     let home = guarded_home();
     home.write(".mine", "mine\n");

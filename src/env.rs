@@ -135,6 +135,13 @@ pub struct Pager {
 /// What bx pages through when neither `$BX_PAGER` nor `$PAGER` names one.
 pub const DEFAULT_PAGER: &str = "less -FRX";
 
+/// The status `sh -c` exits with where it found the command but could not
+/// run it.
+const NOT_RUN: i32 = 126;
+
+/// The status `sh -c` exits with where it found no such command.
+const NOT_FOUND: i32 = 127;
+
 impl Pager {
     /// The pager, or `None` where nothing is paged: standard output is not a
     /// terminal, `NO_COLOR` asks for plain output, or `$BX_PAGER` is set to
@@ -171,8 +178,11 @@ impl Pager {
     /// is written next — `apply`'s question — follows it on the screen.
     ///
     /// `Ok(false)` where the pager could not be started, and nothing was
-    /// shown: the caller writes `text` itself. A pager quit before it read
-    /// everything is not an error.
+    /// shown: the caller writes `text` itself. That is the case too where
+    /// `sh` started but exited 126 or 127, which is how it says the command
+    /// was not found or could not be run — the default `less -FRX` where no
+    /// `less` is installed. A pager quit before it read everything is not an
+    /// error.
     ///
     /// # Errors
     ///
@@ -200,7 +210,7 @@ impl Pager {
             Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => return Err(error),
             _ => {}
         }
-        waited.map(|_| true)
+        waited.map(|status| !matches!(status.code(), Some(NOT_RUN | NOT_FOUND)))
     }
 }
 
@@ -387,6 +397,31 @@ mod tests {
             set_less: false,
         };
         assert!(quit.page(&"x\n".repeat(1 << 20)).expect("quit early"));
+    }
+
+    #[test]
+    fn a_pager_that_does_not_exist_or_cannot_run_has_shown_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = Pager {
+            command: dir.path().join("no-such-pager").display().to_string(),
+            set_less: true,
+        };
+        assert!(!missing.page("one\ntwo\n").expect("not shown"));
+
+        let unrunnable = dir.path().join("unrunnable");
+        std::fs::write(&unrunnable, "#!/bin/sh\n").expect("write");
+        let unrunnable = Pager {
+            command: unrunnable.display().to_string(),
+            set_less: false,
+        };
+        assert!(!unrunnable.page("one\n").expect("not shown"));
+
+        // Any other status is a pager that ran, and its own business.
+        let failed = Pager {
+            command: "exit 1".to_string(),
+            set_less: false,
+        };
+        assert!(failed.page("one\n").expect("ran"));
     }
 
     #[test]

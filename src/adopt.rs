@@ -1228,8 +1228,9 @@ fn open_layer(path: &Path) -> Result<Opened, Error> {
 /// observed it.
 ///
 /// The one write every edit bx makes to a hand-authored layer goes through:
-/// `bx add` and `bx rm` here, and `bx upgrade`'s pin rewrite
-/// ([`crate::pin::write_and_commit`]). A save an editor made between bx's
+/// `bx add` and `bx rm` here, `bx upgrade`'s pin rewrite
+/// ([`crate::pin::write_and_commit`]), and `bx init`'s answers to
+/// `local.toml` ([`crate::init`]). A save an editor made between bx's
 /// read and its write is never replaced: the write is refused, and the layer
 /// holds what the editor saved. `read` is the observation the edit was made
 /// from, and its stamp is what [`fs::write_over`] checks.

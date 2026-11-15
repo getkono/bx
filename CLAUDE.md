@@ -38,7 +38,9 @@ wrong even if it passes CI.
    the user said so. What bx wrote it takes back once nothing declares it, and
    only while the ledger proves the bytes are still exactly the ones it left; a
    file edited since is kept as it is and stops being managed. A configuration
-   that declares nothing at all takes back nothing.
+   that declares nothing at all takes back nothing. bx rewrites a byte the user
+   wrote only on that user's explicit answer for that file, and keeps the bytes
+   it replaced restorable.
 2. **Native locations unless the configuration declares otherwise.** Never point
    a tool at a bx-owned directory. Never move a tool's config, data, or cache
    outside a root the configuration declares. Declare no root and nothing

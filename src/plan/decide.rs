@@ -102,12 +102,13 @@ pub(super) struct Decided {
     pub agreed: Vec<Agreed>,
     /// The directories the session is to declare before its first write.
     pub declared: Declared,
-    /// Each file bx owns whole that was edited since bx wrote it, and each
-    /// such file or symlink deleted since, by index into
-    /// [`Decided::changes`], with the write that takes bx's bytes over the
-    /// edit or restores what was deleted. Its row is a conflict, or a
-    /// deletion that stands, and `apply` makes the write only for a row the
-    /// user answered with *take bx's* — never by default.
+    /// Each file bx owns whole whose bytes or mode were changed since bx wrote
+    /// it, each region of bx's edited inside its markers, each symlink bx
+    /// made that was retargeted since, and each file or symlink of those
+    /// deleted since, by index into [`Decided::changes`], with the write that
+    /// takes bx's bytes over the edit or restores what was deleted. Its row is
+    /// a conflict, or a deletion that stands, and `apply` makes the write only
+    /// for a row the user answered with *take bx's* — never by default.
     pub held: Vec<(usize, Op)>,
 }
 
@@ -518,16 +519,14 @@ pub(super) fn decide(
         Some(entry) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
         _ => (action, note),
     };
-    // A file bx owns whole whose bytes someone else changed since: the one
-    // conflict `apply` asks about, at a terminal, rather than only skipping.
-    // A deletion is asked about the same way.
+    // A file bx owns whole whose bytes or mode someone else changed since, or
+    // a region of bx's edited inside its markers: the conflicts `apply` asks
+    // about, at a terminal, rather than only skipping. A deletion is asked
+    // about the same way.
     let edited = gone
         || (found == Action::Modify
             && action == Action::Conflict
-            && matches!(target.attach, Attach::Own)
-            && entry.is_some_and(|entry| {
-                entry.mechanism == Mechanism::Own && observed.digest() != Some(entry.written)
-            }));
+            && entry.is_some_and(|entry| changed_since(&target.attach, &observed, entry)));
 
     // A write into a directory its owner cannot write or search is refused
     // here, so `apply` never reaches `stage` for it. A row with no write is
@@ -608,6 +607,40 @@ pub(super) fn decide(
         base,
     });
     Ok((change, op))
+}
+
+/// Whether `observed` is someone else's change, since bx last left `entry`,
+/// that an answer of *take bx's* can keep whole as the prior `bx rm` restores:
+///
+/// * a file bx owns whole whose bytes are not the ones bx wrote, or whose
+///   mode is not the one bx set;
+/// * a region of bx's edited inside its markers: the entry records the
+///   region's digest, and the one whole region on disk no longer hashes to
+///   it. The file is kept whole, its region text and markers with it, as
+///   [`crate::state::Ledger::record`] adopts it.
+///
+/// A region removed, a region entry with no digest of its own, and an include
+/// line are not: what is the user's there cannot be told from bx's lines, and
+/// the conflict is only reported and skipped.
+fn changed_since(attach: &Attach, observed: &Observed, entry: &LedgerEntry) -> bool {
+    let bytes_changed = observed.digest() != Some(entry.written);
+    match attach {
+        Attach::Own => {
+            entry.mechanism == Mechanism::Own
+                && (bytes_changed || observed.mode != Some(entry.mode))
+        }
+        Attach::Region { comment } => {
+            entry.mechanism == (Mechanism::Region { comment: *comment })
+                && entry.region.is_some()
+                && bytes_changed
+                && observed
+                    .bytes
+                    .as_deref()
+                    .and_then(|bytes| region::digest(bytes, *comment))
+                    .is_some_and(|region| Some(region) != entry.region)
+        }
+        Attach::Include { .. } => false,
+    }
 }
 
 /// The note an edited file's row ends with: what `apply` does about it.

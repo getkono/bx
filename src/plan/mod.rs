@@ -124,8 +124,10 @@ pub struct Report {
     /// interactive file was rendered with, and what an executed `apply`
     /// recorded in the fingerprint store.
     pub activations: activation::Plan,
-    /// Each file bx owns whole that was edited since bx wrote it, and each
-    /// such file or symlink deleted since, in row order: the questions a
+    /// Each file bx owns whole whose bytes or mode were changed since bx wrote
+    /// it, each region of bx's edited inside its markers, each symlink bx made
+    /// that was retargeted since, and each file or symlink of those deleted
+    /// since, in row order: the questions a
     /// writing run asks at a terminal. Its row is a conflict, or a deletion
     /// that stands, whose note says so in every mode.
     pub questions: Vec<Question>,

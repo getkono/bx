@@ -527,65 +527,70 @@ fn numbered<'a>(body: &[&'a str]) -> Vec<Line<'a>> {
 /// piece of the line marked by whether it is one the edit changed.
 fn emphasis(lines: &[Line<'_>]) -> Vec<Option<Vec<(bool, String)>>> {
     let mut emphasis = vec![None; lines.len()];
-    let mut at = 0;
-    while at < lines.len() {
-        // A note — a missing newline — sits inside a run without ending it.
-        let run = |from: usize, side: fn(&Line<'_>) -> bool| {
-            let mut to = from;
-            let mut members = Vec::new();
-            while let Some(line) = lines.get(to) {
-                if side(line) {
-                    members.push(to);
-                } else if !matches!(line, Line::Note(_)) {
-                    break;
-                }
-                to += 1;
+    // The removed lines of the run being read, and the added lines after
+    // them. A removed line after an added one starts the next run; a note — a
+    // missing newline — sits inside a run without ending it; anything else
+    // ends it. Added lines with no removed line before them pair with
+    // nothing: `similar` emphasises words only where it pairs an edit.
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for (index, line) in lines.iter().enumerate() {
+        match line {
+            Line::Removed { .. } if added.is_empty() => removed.push(index),
+            Line::Removed { .. } => {
+                pair(lines, &removed, &added, &mut emphasis);
+                (removed, added) = (vec![index], Vec::new());
             }
-            (members, to)
-        };
-        let (removed, middle) = run(at, |line| matches!(line, Line::Removed { .. }));
-        if removed.is_empty() {
-            at += 1;
-            continue;
-        }
-        let (added, end) = run(middle, |line| matches!(line, Line::Added { .. }));
-        at = end.max(at + 1);
-        if added.is_empty() {
-            continue;
-        }
-        let text = |index: &usize| match lines[*index] {
-            Line::Removed { text, .. } | Line::Added { text, .. } => text,
-            _ => "",
-        };
-        let old: Vec<&str> = removed.iter().map(text).collect();
-        let new: Vec<&str> = added.iter().map(text).collect();
-        let diff = TextDiff::configure().diff_slices(&old, &new);
-        for op in diff.ops() {
-            for change in diff.iter_inline_changes(op) {
-                let line = match change.tag() {
-                    ChangeTag::Delete => change.old_index().map(|index| removed[index]),
-                    ChangeTag::Insert => change.new_index().map(|index| added[index]),
-                    ChangeTag::Equal => None,
-                };
-                let values = change.values();
-                if let Some(line) = line
-                    && values.iter().any(|(emphasised, _)| *emphasised)
-                {
-                    // Adjacent pieces alike are one: a word and the space
-                    // after it are styled once, not twice.
-                    let mut pieces: Vec<(bool, String)> = Vec::new();
-                    for &(emphasised, value) in values {
-                        match pieces.last_mut() {
-                            Some((last, text)) if *last == emphasised => text.push_str(value),
-                            _ => pieces.push((emphasised, value.to_string())),
-                        }
-                    }
-                    emphasis[line] = Some(pieces);
-                }
+            Line::Added { .. } => added.push(index),
+            Line::Note(_) => {}
+            Line::Hunk(_) | Line::Context { .. } => {
+                pair(lines, &removed, &added, &mut emphasis);
+                (removed, added) = (Vec::new(), Vec::new());
             }
         }
     }
+    pair(lines, &removed, &added, &mut emphasis);
     emphasis
+}
+
+/// Mark in `emphasis` the words of each line in `removed` that `similar`
+/// pairs with one in `added` as an edit, each a line's index in `lines`.
+/// Either side empty pairs nothing: a whole-line insert or delete carries no
+/// emphasised piece.
+fn pair(
+    lines: &[Line<'_>],
+    removed: &[usize],
+    added: &[usize],
+    emphasis: &mut [Option<Vec<(bool, String)>>],
+) {
+    let text = |index: &usize| match lines[*index] {
+        Line::Removed { text, .. } | Line::Added { text, .. } => text,
+        _ => "",
+    };
+    let old: Vec<&str> = removed.iter().map(text).collect();
+    let new: Vec<&str> = added.iter().map(text).collect();
+    let diff = TextDiff::configure().diff_slices(&old, &new);
+    for op in diff.ops() {
+        for change in diff.iter_inline_changes(op) {
+            let line = match change.tag() {
+                ChangeTag::Delete => change.old_index().map(|index| removed[index]),
+                ChangeTag::Insert => change.new_index().map(|index| added[index]),
+                ChangeTag::Equal => None,
+            };
+            let values = change.values();
+            if let Some(line) = line
+                && values.iter().any(|(emphasised, _)| *emphasised)
+            {
+                // `similar` gives a single line's pieces with adjacent ones
+                // already joined where they are alike.
+                emphasis[line] = Some(
+                    values
+                        .iter()
+                        .map(|&(emphasised, value)| (emphasised, value.to_string()))
+                        .collect(),
+                );
+            }
+        }
+    }
 }
 
 /// The file header of a unified diff as [`unified`] wrote it — `--- T (a)`
@@ -716,7 +721,8 @@ fn changed(
     strong: Style,
 ) {
     match emphasis {
-        Some(pieces) if palette.color => {
+        // Without colour the pieces join to `text`, escaped alike.
+        Some(pieces) => {
             out.push_str(&palette.paint(style, &sign.to_string()));
             for (emphasised, piece) in pieces {
                 let style = if *emphasised { strong } else { style };
@@ -1170,6 +1176,66 @@ mod tests {
         // The gutter is dimmed; the unchanged line is not emphasised.
         assert!(coloured.contains(&paint(QUIET, "2 2 │")), "{coloured:?}");
         assert!(coloured.contains("  keep\n"), "{coloured:?}");
+    }
+
+    #[test]
+    fn emphasis_pairs_each_run_of_removed_lines_with_the_added_ones_after_it() {
+        let removed = |old, text| Line::Removed { old, text };
+        let added = |new, text| Line::Added { new, text };
+        let context = Line::Context {
+            old: 9,
+            new: 9,
+            text: "same",
+        };
+        let pieces = |words: &[&str]| {
+            let mut pieces = vec![(false, "a ".to_string())];
+            for (at, word) in words.iter().enumerate() {
+                if at > 0 {
+                    pieces.push((false, " ".to_string()));
+                }
+                pieces.push((true, (*word).to_string()));
+            }
+            Some(pieces)
+        };
+        let edit = |before: &[&str], after: &[&str]| vec![pieces(before), pieces(after)];
+        // Two removed lines then two added: both pair, the first with the
+        // first, across the note between them. The words alike before an
+        // edit, `a` and the space after it, are one piece.
+        let lines = [
+            removed(1, "a one two"),
+            removed(2, "a b"),
+            Line::Note("\\ No newline at end of file"),
+            added(1, "a three four"),
+            added(2, "a c"),
+        ];
+        let got = emphasis(&lines);
+        assert_eq!(got[0], edit(&["one", "two"], &["three", "four"])[0]);
+        assert_eq!(got[1], edit(&["b"], &["c"])[0]);
+        assert_eq!(got[2], None);
+        assert_eq!(got[3], edit(&["one", "two"], &["three", "four"])[1]);
+        assert_eq!(got[4], edit(&["b"], &["c"])[1]);
+
+        // A removed line after an added one starts a run of its own, and a
+        // context line ends one: neither pairs across it.
+        let lines = [
+            removed(1, "a b"),
+            added(1, "a c"),
+            removed(2, "x y z"),
+            context,
+            added(3, "x y q"),
+            added(4, "lone"),
+        ];
+        let got = emphasis(&lines);
+        assert_eq!(got[..2], edit(&["b"], &["c"]));
+        assert_eq!(got[2..], [None, None, None, None]);
+
+        // A word replaced and the words deleted after it are one emphasised
+        // piece.
+        let got = emphasis(&[removed(1, "a b c"), added(1, "a x")]);
+        assert_eq!(
+            got[0],
+            Some(vec![(false, "a ".to_string()), (true, "b c".to_string())])
+        );
     }
 
     #[test]

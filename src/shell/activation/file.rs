@@ -22,9 +22,10 @@
 //! `.zwc` beside it. That file's
 //! bytes become the [`wordcode`] target, written after the output's own file,
 //! so its modification time is not older than the file it compiles. `-f` and
-//! `-U` keep every alias out of the compiled code — none is defined in a zsh
-//! that read no startup file, and `-U` would not expand one that were — so
-//! the code is the same whatever aliases the account defines. A shell
+//! `-U` keep every alias out of the compiled code — `-f` reads none of the
+//! account's startup files, and `-U` would not expand an alias the system's
+//! `/etc/zshenv` defined — so the code is the same whatever aliases are
+//! defined. A shell
 //! loading compiled code parses nothing, so it expands none of its own
 //! aliases into the tool's code either, which is what the tools write
 //! `builtin` and `command` throughout to avoid. zsh's

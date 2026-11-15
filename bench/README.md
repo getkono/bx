@@ -105,8 +105,10 @@ output* below says; bash's read the stubs' own.
 **`prompt`** — zsh only: the same two homes as zsh's `net`, each timed to its
 first prompt rather than to `-c exit`. The shell reads its commands from an
 input holding `exit`, so before it reads that line it runs its `precmd` hooks
-(mise's, which runs `mise hook-env` again, and starship's) and expands
-`PROMPT`, which starts starship. `RPROMPT` is drawn only by the line editor,
+(mise's and starship's) and expands `PROMPT`, which starts starship. At the
+first prompt mise's hook spawns `mise hook-env` only if something after
+activation changed `PATH` or a `MISE_*` variable; otherwise it returns without
+spawning. `RPROMPT` is drawn only by the line editor,
 which a start without a terminal does not run, so its spawn is not counted.
 **Reported, never gated**, as `net` is.
 

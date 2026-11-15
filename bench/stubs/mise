@@ -6,8 +6,10 @@
 # prints the real tool's captured output instead, with this stub in place of
 # the capturing machine's mise and the PATH this stub ran with in place of
 # that machine's, as the real tool prints the PATH it inherited. That output
-# runs `mise hook-env` as it loads and at every prompt, and this stub answers
-# it, so nothing needs the real mise installed.
+# runs `mise hook-env` as it loads and at every prompt after the first; the
+# first prompt's hook spawns it only if something after activation changed
+# `PATH` or a `MISE_*` variable. This stub answers it, so nothing needs the
+# real mise installed.
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
 case "${1-}" in

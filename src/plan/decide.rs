@@ -556,8 +556,8 @@ pub(super) fn decide(
 }
 
 /// The note an edited file's row ends with: what `apply` does about it.
-pub(super) const ASK: &str = "bx apply asks at a terminal whether to keep your edit or take bx's \
-                              bytes, keeping yours for bx rm";
+pub(super) const ASK: &str = "at a terminal, bx apply and bx sync ask whether to keep your edit or \
+                              take bx's bytes, keeping yours for bx rm";
 
 /// The whole file a region target leaves, and the mode it leaves it at.
 ///

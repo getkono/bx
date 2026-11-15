@@ -58,4 +58,8 @@ exclude_re = [
   # Equivalent, argued: the line gains one leading newline, and every caller
   # trims it (#348). Column 26 fixed: the `+` in `at + p` is caught.
   '^src/shell/activation\.rs:\d+:26: replace \+ with \* in line_of$',
+  # Unreachable, argued: `write_all` to a blocking pipe retries EINTR, and the
+  # one error left once the pager has exited is EPIPE, BrokenPipe, so no test
+  # can make the write fail any other way (#440).
+  '^src/env\.rs:\d+:\d+: replace match guard error\.kind\(\) != std::io::ErrorKind::BrokenPipe with false in Pager::page$',
 ]

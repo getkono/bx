@@ -470,9 +470,12 @@ fn two_machines_that_both_changed_a_tracked_target_are_a_conflict_and_push_nothi
     assert_eq!(exit, Exit::Pending, "{}", text(&out));
     let shown = text(&out);
     assert!(shown.contains("  ! ~/.lock"), "{shown}");
-    assert!(shown.contains("+++ ~/.lock (this machine)"), "{shown}");
+    assert!(
+        shown.contains("── ~/.lock (last sync → this machine) ─"),
+        "{shown}"
+    );
     assert!(shown.contains("+mine"), "{shown}");
-    assert!(shown.contains("+++ ~/.lock (repo)"), "{shown}");
+    assert!(shown.contains("── ~/.lock (last sync → repo) ─"), "{shown}");
     assert!(shown.contains("+theirs"), "{shown}");
     assert!(!shown.contains("Committed"), "{shown}");
     assert_eq!(std::fs::read(home.child(".lock")).expect("kept"), b"mine\n");

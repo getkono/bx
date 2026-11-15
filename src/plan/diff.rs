@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use anstyle::{AnsiColor, Style};
-use similar::TextDiff;
+use similar::{ChangeTag, TextDiff};
 
 use super::{Change, Report};
 use crate::fs::Mode;
@@ -285,26 +285,48 @@ pub enum View {
     Status,
 }
 
-/// Whether a rendering is coloured.
+/// Whether a rendering is coloured, and how wide it is drawn.
 ///
 /// Decided once, from the environment, and carried explicitly: nothing that
-/// renders reads `NO_COLOR` or asks whether it is writing to a terminal.
+/// renders reads `NO_COLOR`, asks whether it is writing to a terminal, or asks
+/// how wide that terminal is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     color: bool,
+    /// The columns a diff's file header is ruled to.
+    width: usize,
 }
 
+/// The width a rendering is drawn to where the terminal's is unknown: output
+/// that is not a terminal, or a terminal that does not say.
+pub const DEFAULT_WIDTH: usize = 80;
+
 impl Palette {
-    /// No escape sequences at all.
+    /// No escape sequences at all, [`DEFAULT_WIDTH`] wide.
     #[cfg(test)]
-    pub const PLAIN: Self = Self { color: false };
+    pub const PLAIN: Self = Self {
+        color: false,
+        width: DEFAULT_WIDTH,
+    };
 
     /// Colour only on a terminal, and only when `NO_COLOR` is unset or empty —
-    /// `no_color` is whether it is set to anything else.
+    /// `no_color` is whether it is set to anything else. 80 columns wide
+    /// until [`Palette::within`] says otherwise.
     #[must_use]
     pub const fn resolve(no_color: bool, tty: bool) -> Self {
         Self {
             color: tty && !no_color,
+            width: DEFAULT_WIDTH,
+        }
+    }
+
+    /// This palette drawn `columns` wide, or 80 columns where the width is
+    /// unknown.
+    #[must_use]
+    pub fn within(self, columns: Option<u16>) -> Self {
+        Self {
+            width: columns.map_or(DEFAULT_WIDTH, usize::from),
+            ..self
         }
     }
 
@@ -334,9 +356,14 @@ const fn fg(color: AnsiColor) -> Style {
 const ADDED: Style = fg(AnsiColor::Green);
 /// A removed line.
 const REMOVED: Style = fg(AnsiColor::Red);
-/// A hunk header, and the symbol of a row nothing happens to.
+/// The words that changed inside an added line.
+const ADDED_EMPHASIS: Style = ADDED.invert();
+/// The words that changed inside a removed line.
+const REMOVED_EMPHASIS: Style = REMOVED.invert();
+/// A hunk header, a line-number gutter, and the symbol of a row nothing
+/// happens to.
 const QUIET: Style = Style::new().dimmed();
-/// A diff's file headers.
+/// A diff's file header.
 const HEADER: Style = Style::new().bold();
 /// A banner, and the symbol of a row that needs a human.
 const ATTENTION: Style = fg(AnsiColor::Yellow).bold();
@@ -433,27 +460,276 @@ fn banner(report: &Report) -> Option<String> {
     })
 }
 
-/// The lines of one unified diff as [`unified`] wrote it, indented and styled.
+/// One line of a unified diff's body as [`unified`] wrote it, read back with
+/// the line numbers its hunk header gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Line<'a> {
+    /// `@@ -a,b +c,d @@`.
+    Hunk(&'a str),
+    /// A line both sides have, at `old` and at `new`.
+    Context {
+        old: usize,
+        new: usize,
+        text: &'a str,
+    },
+    /// A line only the old side has, at `old`.
+    Removed { old: usize, text: &'a str },
+    /// A line only the new side has, at `new`.
+    Added { new: usize, text: &'a str },
+    /// `\ No newline at end of file`, or anything else [`unified`] does not
+    /// write: shown as it is, with no line number.
+    Note(&'a str),
+}
+
+/// The first line number of each side a hunk header names: `-a,b +c,d` gives
+/// `a` and `c`, a count left out where it is one.
+fn hunk_starts(header: &str) -> Option<(usize, usize)> {
+    let mut ranges = header.strip_prefix("@@ -")?.split(' ');
+    let start = |range: &str| range.split(',').next()?.parse().ok();
+    let old = start(ranges.next()?)?;
+    let new = start(ranges.next()?.strip_prefix('+')?)?;
+    Some((old, new))
+}
+
+/// The body of a unified diff, each line numbered.
+fn numbered<'a>(body: &[&'a str]) -> Vec<Line<'a>> {
+    let (mut old, mut new) = (0, 0);
+    body.iter()
+        .map(|&line| {
+            if let Some(starts) = hunk_starts(line) {
+                (old, new) = starts;
+                return Line::Hunk(line);
+            }
+            let text = line.get(1..).unwrap_or_default();
+            match line.as_bytes().first() {
+                Some(b' ') => {
+                    let line = Line::Context { old, new, text };
+                    (old, new) = (old + 1, new + 1);
+                    line
+                }
+                Some(b'-') => {
+                    old += 1;
+                    Line::Removed { old: old - 1, text }
+                }
+                Some(b'+') => {
+                    new += 1;
+                    Line::Added { new: new - 1, text }
+                }
+                _ => Line::Note(line),
+            }
+        })
+        .collect()
+}
+
+/// The words each changed line changed, by the index of the line in `lines`:
+/// `Some` only for a line in a run of removed lines followed by added ones
+/// that `similar` pairs as an edit, rather than as unrelated text, with each
+/// piece of the line marked by whether it is one the edit changed.
+fn emphasis(lines: &[Line<'_>]) -> Vec<Option<Vec<(bool, String)>>> {
+    let mut emphasis = vec![None; lines.len()];
+    // The removed lines of the run being read, and the added lines after
+    // them. A removed line after an added one starts the next run; a note — a
+    // missing newline — sits inside a run without ending it; anything else
+    // ends it. Added lines with no removed line before them pair with
+    // nothing: `similar` emphasises words only where it pairs an edit.
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for (index, line) in lines.iter().enumerate() {
+        match line {
+            Line::Removed { .. } if added.is_empty() => removed.push(index),
+            Line::Removed { .. } => {
+                pair(lines, &removed, &added, &mut emphasis);
+                (removed, added) = (vec![index], Vec::new());
+            }
+            Line::Added { .. } => added.push(index),
+            Line::Note(_) => {}
+            Line::Hunk(_) | Line::Context { .. } => {
+                pair(lines, &removed, &added, &mut emphasis);
+                (removed, added) = (Vec::new(), Vec::new());
+            }
+        }
+    }
+    pair(lines, &removed, &added, &mut emphasis);
+    emphasis
+}
+
+/// Mark in `emphasis` the words of each line in `removed` that `similar`
+/// pairs with one in `added` as an edit, each a line's index in `lines`.
+/// Either side empty pairs nothing: a whole-line insert or delete carries no
+/// emphasised piece.
+fn pair(
+    lines: &[Line<'_>],
+    removed: &[usize],
+    added: &[usize],
+    emphasis: &mut [Option<Vec<(bool, String)>>],
+) {
+    let text = |index: &usize| match lines[*index] {
+        Line::Removed { text, .. } | Line::Added { text, .. } => text,
+        _ => "",
+    };
+    let old: Vec<&str> = removed.iter().map(text).collect();
+    let new: Vec<&str> = added.iter().map(text).collect();
+    let diff = TextDiff::configure().diff_slices(&old, &new);
+    for op in diff.ops() {
+        for change in diff.iter_inline_changes(op) {
+            let line = match change.tag() {
+                ChangeTag::Delete => change.old_index().map(|index| removed[index]),
+                ChangeTag::Insert => change.new_index().map(|index| added[index]),
+                ChangeTag::Equal => None,
+            };
+            let values = change.values();
+            if let Some(line) = line
+                && values.iter().any(|(emphasised, _)| *emphasised)
+            {
+                // `similar` gives a single line's pieces with adjacent ones
+                // already joined where they are alike.
+                emphasis[line] = Some(
+                    values
+                        .iter()
+                        .map(|&(emphasised, value)| (emphasised, value.to_string()))
+                        .collect(),
+                );
+            }
+        }
+    }
+}
+
+/// The file header of a unified diff as [`unified`] wrote it — `--- T (a)`
+/// and `+++ T (b)` — as the one title `T (a → b)`.
+fn title(from: &str, to: &str) -> Option<String> {
+    fn side<'a>(line: &'a str, prefix: &str) -> Option<(&'a str, &'a str)> {
+        line.strip_prefix(prefix)?
+            .strip_suffix(')')?
+            .rsplit_once(" (")
+    }
+    let (target, before) = side(from, "--- ")?;
+    let (also, after) = side(to, "+++ ")?;
+    (target == also).then(|| format!("{target} ({before} → {after})"))
+}
+
+/// The lines of one unified diff as [`unified`] wrote it, drawn the way a
+/// reader scans a change: one file header ruled to the palette's width, each
+/// line behind a gutter of its old and new line numbers, and, in colour, the
+/// words an edited line changed in reverse video on its red or green.
+///
+/// The sign of each line stays in front of its text, so the plain rendering
+/// reads without colour exactly as the coloured one does.
 fn unified_rows(out: &mut String, text: &str, palette: Palette) {
     // Split on `\n` alone, as `unified` wrote it: a `\r` is part of its
     // line, and is shown escaped with every other control character.
-    let lines = text.strip_suffix('\n').unwrap_or(text).split('\n');
-    for (index, line) in lines.enumerate() {
-        let style = match line.as_bytes().first() {
-            // The first two lines are the `---` and `+++` file headers.
-            _ if index < 2 => Some(HEADER),
-            Some(b'+') => Some(ADDED),
-            Some(b'-') => Some(REMOVED),
-            Some(b'@') => Some(QUIET),
-            _ => None,
-        };
-        let line = escape(line);
+    let lines: Vec<&str> = text
+        .strip_suffix('\n')
+        .unwrap_or(text)
+        .split('\n')
+        .collect();
+    let (header, body) = match lines.as_slice() {
+        [from, to, body @ ..] => match title(from, to) {
+            Some(title) => (vec![ruled(&title, palette.width)], body),
+            None => (vec![(*from).to_string(), (*to).to_string()], body),
+        },
+        _ => (Vec::new(), lines.as_slice()),
+    };
+    for line in header {
+        let _ = writeln!(
+            out,
+            "{DIFF_INDENT}{}",
+            palette.paint(HEADER, &escape(&line))
+        );
+    }
+
+    let lines = numbered(body);
+    let emphasis = emphasis(&lines);
+    let widest = lines
+        .iter()
+        .map(|line| match *line {
+            Line::Context { old, new, .. } => old.max(new),
+            Line::Removed { old, .. } => old,
+            Line::Added { new, .. } => new,
+            Line::Hunk(_) | Line::Note(_) => 0,
+        })
+        .max()
+        .unwrap_or_default();
+    let digits = widest.to_string().len();
+    let gutter = |old: Option<usize>, new: Option<usize>| {
+        let number = |n: Option<usize>| n.map_or_else(String::new, |n| n.to_string());
+        let gutter = format!("{:>digits$} {:>digits$} │", number(old), number(new));
+        palette.paint(QUIET, &gutter)
+    };
+    for (line, emphasis) in lines.iter().zip(&emphasis) {
         out.push_str(DIFF_INDENT);
-        match style {
-            Some(style) => out.push_str(&palette.paint(style, &line)),
-            None => out.push_str(&line),
+        match *line {
+            Line::Hunk(header) => out.push_str(&palette.paint(QUIET, &escape(header))),
+            Line::Context { old, new, text } => {
+                let _ = write!(out, "{}  {}", gutter(Some(old), Some(new)), escape(text));
+            }
+            Line::Removed { old, text } => {
+                let _ = write!(out, "{} ", gutter(Some(old), None));
+                changed(
+                    out,
+                    '-',
+                    text,
+                    emphasis.as_deref(),
+                    palette,
+                    REMOVED,
+                    REMOVED_EMPHASIS,
+                );
+            }
+            Line::Added { new, text } => {
+                let _ = write!(out, "{} ", gutter(None, Some(new)));
+                changed(
+                    out,
+                    '+',
+                    text,
+                    emphasis.as_deref(),
+                    palette,
+                    ADDED,
+                    ADDED_EMPHASIS,
+                );
+            }
+            Line::Note(note) => {
+                let _ = write!(
+                    out,
+                    "{} {}",
+                    gutter(None, None),
+                    palette.paint(QUIET, &escape(note))
+                );
+            }
         }
         out.push('\n');
+    }
+}
+
+/// `title` as a file header ruled out to `width` columns —
+/// `── ~/.gitconfig (on disk → bx) ─────…` — counting the diff's indentation,
+/// and with a short rule still after a title too long to fit.
+fn ruled(title: &str, width: usize) -> String {
+    const MIN_RULE: usize = 3;
+    // The indentation, `── ` before the title and ` ` after it.
+    let taken = DIFF_INDENT.len() + 3 + escape(title).chars().count() + 1;
+    let rule = width.saturating_sub(taken).max(MIN_RULE);
+    format!("── {title} {}", "─".repeat(rule))
+}
+
+/// A removed or added line, `sign` and its text in `style`, and the pieces
+/// `emphasis` marks in `strong`.
+fn changed(
+    out: &mut String,
+    sign: char,
+    text: &str,
+    emphasis: Option<&[(bool, String)]>,
+    palette: Palette,
+    style: Style,
+    strong: Style,
+) {
+    match emphasis {
+        // Without colour the pieces join to `text`, escaped alike.
+        Some(pieces) => {
+            out.push_str(&palette.paint(style, &sign.to_string()));
+            for (emphasised, piece) in pieces {
+                let style = if *emphasised { strong } else { style };
+                out.push_str(&palette.paint(style, &escape(piece)));
+            }
+        }
+        _ => out.push_str(&palette.paint(style, &format!("{sign}{}", escape(text)))),
     }
 }
 
@@ -600,7 +876,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_body_where_there_was_no_file_is_the_headers_alone() {
+    fn an_empty_body_where_there_was_no_file_is_the_header_alone() {
         // `similar` has no hunk between two sides with no line, so this used
         // to be `Text("")`, rendered as one blank indented line and no header.
         let diff = Diff::between("~/.a", None, b"", None).expect("a diff");
@@ -621,11 +897,11 @@ mod tests {
             Path::new(HOME),
         );
         let lines: Vec<&str> = shown.lines().collect();
-        assert_eq!(
-            lines[1..3],
-            ["    --- ~/.a (on disk)", "    +++ ~/.a (bx)"],
+        assert!(
+            lines[1].starts_with("    ── ~/.a (on disk → bx) ───"),
             "{shown}"
         );
+        assert!(lines[2].starts_with("Plan: "), "{shown}");
         assert!(!lines.iter().any(|line| line.trim().is_empty()), "{shown}");
     }
 
@@ -782,22 +1058,237 @@ mod tests {
 
         assert_eq!(
             rendered,
-            "  ~ ~/.gitconfig  (~/.config/bx/bx.toml:4)\n\
-             \x20   --- ~/.gitconfig (on disk)\n\
-             \x20   +++ ~/.gitconfig (bx)\n\
-             \x20   @@ -2,7 +2,7 @@\n\
-             \x20    2\n\
-             \x20    3\n\
-             \x20    4\n\
-             \x20   -5\n\
-             \x20   +five\n\
-             \x20    6\n\
-             \x20    7\n\
-             \x20    8\n\
-             \x20 ? ~/.env  (~/.config/bx/bx.toml:12) run `bx init` to set scratch_root\n\
-             Plan: 0 to create, 1 to modify, 0 conflict, 1 blocked, 1 unchanged.\n"
+            format!(
+                "  ~ ~/.gitconfig  (~/.config/bx/bx.toml:4)\n\
+                 \x20   ── ~/.gitconfig (on disk → bx) {}\n\
+                 \x20   @@ -2,7 +2,7 @@\n\
+                 \x20   2 2 │  2\n\
+                 \x20   3 3 │  3\n\
+                 \x20   4 4 │  4\n\
+                 \x20   5   │ -5\n\
+                 \x20     5 │ +five\n\
+                 \x20   6 6 │  6\n\
+                 \x20   7 7 │  7\n\
+                 \x20   8 8 │  8\n\
+                 \x20 ? ~/.env  (~/.config/bx/bx.toml:12) run `bx init` to set scratch_root\n\
+                 Plan: 0 to create, 1 to modify, 0 conflict, 1 blocked, 1 unchanged.\n",
+                "─".repeat(45)
+            )
         );
         assert!(!rendered.contains(HOME), "{rendered}");
+        // The header is ruled to exactly the default width.
+        let header = rendered.lines().nth(1).expect("a header");
+        assert_eq!(header.chars().count(), DEFAULT_WIDTH, "{header}");
+    }
+
+    #[test]
+    fn a_header_is_ruled_to_the_width_and_keeps_a_short_rule_past_it() {
+        let header = |palette: Palette| {
+            render(&a_report(), View::Plan, palette, Path::new(HOME))
+                .lines()
+                .nth(1)
+                .expect("a header")
+                .to_string()
+        };
+        assert_eq!(Palette::PLAIN.within(None), Palette::PLAIN);
+        assert_eq!(
+            header(Palette::PLAIN.within(Some(120))).chars().count(),
+            120
+        );
+        // The narrowest width a full rule fits: the title and three of it.
+        assert_eq!(header(Palette::PLAIN.within(Some(38))).chars().count(), 38);
+        // Narrower than the title: three rule characters still follow it.
+        assert_eq!(
+            header(Palette::PLAIN.within(Some(10))),
+            "    ── ~/.gitconfig (on disk → bx) ───"
+        );
+        // A width of zero is a terminal that cannot say, drawn as narrow.
+        assert_eq!(
+            header(Palette::PLAIN.within(Some(0))),
+            "    ── ~/.gitconfig (on disk → bx) ───"
+        );
+    }
+
+    #[test]
+    fn a_gutter_is_as_wide_as_the_largest_line_number() {
+        let before: String = (1..=12).map(|n| format!("{n}\n")).collect();
+        let after = before.replace("10\n", "ten\n");
+        let mut modify = change("~/.n", 1, Action::Modify);
+        modify.diff = Diff::between("~/.n", Some(before.as_bytes()), after.as_bytes(), None);
+
+        let rendered = plain(&Report {
+            changes: vec![modify],
+            ..Report::default()
+        });
+
+        assert!(
+            rendered.contains(
+                "    @@ -7,6 +7,6 @@\n     7  7 │  7\n     8  8 │  8\n     9  9 │  9\n    \
+                 10    │ -10\n       10 │ +ten\n    11 11 │  11\n    12 12 │  12\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_edited_line_emphasises_the_words_it_changed_in_colour_only() {
+        let mut modify = change("~/.w", 1, Action::Modify);
+        modify.diff = Diff::between(
+            "~/.w",
+            Some(b"name = alice\nkeep\n"),
+            b"name = bob\nkeep\n",
+            None,
+        );
+        let report = Report {
+            changes: vec![modify],
+            ..Report::default()
+        };
+
+        let plain = plain(&report);
+        assert!(
+            plain.contains("    1   │ -name = alice\n      1 │ +name = bob\n    2 2 │  keep\n"),
+            "{plain}"
+        );
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+
+        let coloured = render(
+            &report,
+            View::Plan,
+            Palette::resolve(false, true),
+            Path::new(HOME),
+        );
+        let paint =
+            |style: Style, text: &str| format!("{}{text}{}", style.render(), style.render_reset());
+        let removed = [
+            paint(REMOVED, "-"),
+            paint(REMOVED, "name = "),
+            paint(REMOVED_EMPHASIS, "alice"),
+        ]
+        .concat();
+        let added = [
+            paint(ADDED, "+"),
+            paint(ADDED, "name = "),
+            paint(ADDED_EMPHASIS, "bob"),
+        ]
+        .concat();
+        assert!(coloured.contains(&removed), "{coloured:?}");
+        assert!(coloured.contains(&added), "{coloured:?}");
+        // The gutter is dimmed; the unchanged line is not emphasised.
+        assert!(coloured.contains(&paint(QUIET, "2 2 │")), "{coloured:?}");
+        assert!(coloured.contains("  keep\n"), "{coloured:?}");
+    }
+
+    #[test]
+    fn emphasis_pairs_each_run_of_removed_lines_with_the_added_ones_after_it() {
+        let removed = |old, text| Line::Removed { old, text };
+        let added = |new, text| Line::Added { new, text };
+        let context = Line::Context {
+            old: 9,
+            new: 9,
+            text: "same",
+        };
+        let pieces = |words: &[&str]| {
+            let mut pieces = vec![(false, "a ".to_string())];
+            for (at, word) in words.iter().enumerate() {
+                if at > 0 {
+                    pieces.push((false, " ".to_string()));
+                }
+                pieces.push((true, (*word).to_string()));
+            }
+            Some(pieces)
+        };
+        let edit = |before: &[&str], after: &[&str]| vec![pieces(before), pieces(after)];
+        // Two removed lines then two added: both pair, the first with the
+        // first, across the note between them. The words alike before an
+        // edit, `a` and the space after it, are one piece.
+        let lines = [
+            removed(1, "a one two"),
+            removed(2, "a b"),
+            Line::Note("\\ No newline at end of file"),
+            added(1, "a three four"),
+            added(2, "a c"),
+        ];
+        let got = emphasis(&lines);
+        assert_eq!(got[0], edit(&["one", "two"], &["three", "four"])[0]);
+        assert_eq!(got[1], edit(&["b"], &["c"])[0]);
+        assert_eq!(got[2], None);
+        assert_eq!(got[3], edit(&["one", "two"], &["three", "four"])[1]);
+        assert_eq!(got[4], edit(&["b"], &["c"])[1]);
+
+        // A removed line after an added one starts a run of its own, and a
+        // context line ends one: neither pairs across it.
+        let lines = [
+            removed(1, "a b"),
+            added(1, "a c"),
+            removed(2, "x y z"),
+            context,
+            added(3, "x y q"),
+            added(4, "lone"),
+        ];
+        let got = emphasis(&lines);
+        assert_eq!(got[..2], edit(&["b"], &["c"]));
+        assert_eq!(got[2..], [None, None, None, None]);
+
+        // A word replaced and the words deleted after it are one emphasised
+        // piece.
+        let got = emphasis(&[removed(1, "a b c"), added(1, "a x")]);
+        assert_eq!(
+            got[0],
+            Some(vec![(false, "a ".to_string()), (true, "b c".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_missing_newline_does_not_break_a_run_or_take_a_line_number() {
+        let mut modify = change("~/.m", 1, Action::Modify);
+        modify.diff = Diff::between("~/.m", Some(b"key = one"), b"key = two", None);
+        let report = Report {
+            changes: vec![modify],
+            ..Report::default()
+        };
+
+        let plain = plain(&report);
+        assert!(
+            plain.contains(
+                "    1   │ -key = one\n        │ \\ No newline at end of file\n      \
+                 1 │ +key = two\n        │ \\ No newline at end of file\n"
+            ),
+            "{plain}"
+        );
+        let coloured = render(
+            &report,
+            View::Plan,
+            Palette::resolve(false, true),
+            Path::new(HOME),
+        );
+        let strong = format!(
+            "{}two{}",
+            ADDED_EMPHASIS.render(),
+            ADDED_EMPHASIS.render_reset()
+        );
+        assert!(coloured.contains(&strong), "{coloured:?}");
+    }
+
+    #[test]
+    fn a_header_bx_did_not_write_is_shown_as_it_stands() {
+        let mut out = String::new();
+        unified_rows(
+            &mut out,
+            "--- a (x)\n+++ b (y)\n@@ -1 +1 @@\n-p\n+q\n",
+            Palette::PLAIN,
+        );
+        assert_eq!(
+            out,
+            "    --- a (x)\n    +++ b (y)\n    @@ -1 +1 @@\n    1   │ -p\n      1 │ +q\n"
+        );
+        assert_eq!(hunk_starts("@@ -3,0 +4,2 @@"), Some((3, 4)));
+        assert_eq!(hunk_starts("@@ -x +1 @@"), None);
+        assert_eq!(hunk_starts("not a hunk"), None);
+        assert_eq!(
+            title("--- a (x)", "+++ a (y)"),
+            Some("a (x → y)".to_string())
+        );
+        assert_eq!(title("--- a", "+++ a (y)"), None);
     }
 
     #[test]
@@ -926,7 +1417,13 @@ mod tests {
             coloured.contains("\x1b[2m@@ -2,7 +2,7 @@\x1b[0m"),
             "{coloured:?}"
         );
-        assert!(coloured.contains("\x1b[1m--- ~/.gitconfig (on disk)\x1b[0m"));
+        assert!(coloured.contains("\x1b[1m── ~/.gitconfig (on disk → bx) ─"));
+        // The gutter is dimmed, and a context line's text is not styled.
+        assert!(
+            coloured.contains("\x1b[2m2 2 │\x1b[0m  2\n"),
+            "{coloured:?}"
+        );
+        assert!(coloured.contains("\x1b[2m5   │\x1b[0m \x1b[31m-5\x1b[0m\n"));
         // Symbols by what they ask of a human.
         assert!(
             coloured.contains("\x1b[1m\x1b[33m?\x1b[0m") || coloured.contains("\x1b[33m\x1b[1m?")
@@ -934,7 +1431,32 @@ mod tests {
         assert!(coloured.contains("\x1b[2m=\x1b[0m"), "{coloured:?}");
         // The summary and a context line stay plain.
         assert!(coloured.ends_with("1 unchanged.\n"));
-        assert!(coloured.contains("\n     2\n"), "{coloured:?}");
+    }
+
+    #[test]
+    fn no_escape_is_written_under_no_color_or_off_a_terminal_whatever_the_width() {
+        let mut edit = change("~/.w", 1, Action::Modify);
+        edit.diff = Diff::between("~/.w", Some(b"a = one\n"), b"a = two\n", None);
+        let report = Report {
+            changes: vec![edit],
+            ..Report::default()
+        };
+        for palette in [
+            Palette::resolve(true, true),
+            Palette::resolve(false, false),
+            Palette::resolve(true, true).within(Some(200)),
+        ] {
+            let shown = render(&report, View::Plan, palette, Path::new(HOME));
+            assert!(!shown.contains('\x1b'), "{shown:?}");
+            // The row symbol and the summary line are as a machine reads them.
+            assert!(
+                shown.starts_with("  ~ ~/.w  (~/.config/bx/bx.toml:1)\n"),
+                "{shown}"
+            );
+            assert!(shown.ends_with(
+                "\nPlan: 0 to create, 1 to modify, 0 conflict, 0 blocked, 0 unchanged.\n"
+            ));
+        }
     }
 
     #[test]
@@ -990,7 +1512,7 @@ mod tests {
         assert_eq!(report.actions(), vec![Action::Modify]);
         let rendered = render(&report, View::Plan, Palette::PLAIN, home.path());
         assert!(
-            rendered.contains("    -a\\r\n    -b\\r\n    +a\n    +b\n"),
+            rendered.contains("    1   │ -a\\r\n    2   │ -b\\r\n      1 │ +a\n      2 │ +b\n"),
             "{rendered:?}"
         );
         assert!(!rendered.contains('\r'), "{rendered:?}");
@@ -1007,7 +1529,7 @@ mod tests {
         });
 
         assert!(
-            rendered.contains("    -one\n    -two\n    +one\\rtwo\n"),
+            rendered.contains("    1   │ -one\n    2   │ -two\n      1 │ +one\\rtwo\n"),
             "{rendered:?}"
         );
         assert!(!rendered.contains('\r'), "{rendered:?}");
@@ -1024,7 +1546,7 @@ mod tests {
         });
 
         assert!(
-            rendered.contains("    +\\x1b[31mred\tx\\x7f\n"),
+            rendered.contains("      1 │ +\\x1b[31mred\tx\\x7f\n"),
             "{rendered:?}"
         );
         assert!(
@@ -1048,10 +1570,13 @@ mod tests {
             lines[0], "  + ~/.a\\nb  (~/.config/bx/bx.toml:1)",
             "{rendered:?}"
         );
-        assert_eq!(lines[1], "    --- ~/.a\\nb (on disk)", "{rendered:?}");
-        assert_eq!(lines[2], "    +++ ~/.a\\nb (bx)", "{rendered:?}");
-        assert_eq!(lines[4], "    +x", "{rendered:?}");
-        assert_eq!(lines.len(), 6, "{rendered:?}");
+        assert!(
+            lines[1].starts_with("    ── ~/.a\\nb (on disk → bx) ───"),
+            "{rendered:?}"
+        );
+        assert_eq!(lines[2], "    @@ -0,0 +1 @@", "{rendered:?}");
+        assert_eq!(lines[3], "      1 │ +x", "{rendered:?}");
+        assert_eq!(lines.len(), 5, "{rendered:?}");
     }
 
     fn interrupted(unfinished: Vec<Unfinished>) -> Interrupted {

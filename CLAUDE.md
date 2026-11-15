@@ -81,7 +81,8 @@ wrong even if it passes CI.
   shell-startup path.
 - **inquire** — interactive prompts for `init` and confirmations. There is no
   TUI beyond these.
-- **similar** — diffs for `plan`. **anstyle** — styling that respects
+- **similar** — diffs for `plan`, with inline word emphasis (its `inline`
+  feature). **anstyle** — styling that respects
   `NO_COLOR`. **indicatif** — progress during `apply` only.
 - **age** — secrets, in-process, so the static binary needs no external
   `age`/`sops`. Default identity is the user's existing ssh ed25519 key;

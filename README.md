@@ -198,6 +198,28 @@ it yours.
 `plan` and `apply` compute this with the same code, so `apply` can never do work
 `plan` did not show you.
 
+Under each row, a changed file's diff is headed by one line ruled to the
+terminal's width, naming the two sides, and each line carries its old and new
+line numbers:
+
+```
+  ~ ~/.gitconfig  (~/.config/bx/bx.toml:4)
+    ── ~/.gitconfig (on disk → bx) ─────────────────────────────────────────────
+    @@ -2,3 +2,3 @@
+    2 2 │  [user]
+    3   │ -  name = alice
+      3 │ +  name = bob
+    4 4 │    email = me@example.com
+```
+
+On a terminal the removed and added lines are red and green, and the words an
+edited line changed are shown in reverse video. A plan taller than the terminal
+goes through `$BX_PAGER`, else `$PAGER`, else `less -FRX`, and `apply` asks its
+question once the pager exits; set `BX_PAGER=` (empty) to never page. Piped, or
+with `NO_COLOR` set, the output is plain text with no escape sequences and is
+never paged: the row symbols and the closing `Plan:` line read the same either
+way.
+
 ### Exit codes
 
 `plan` follows the `diff` convention, so it is usable from CI, a prompt segment,

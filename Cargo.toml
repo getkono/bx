@@ -50,8 +50,9 @@ unsafe_code = "forbid"
 clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
 # Interactive prompts for `init` and every confirmation. There is no TUI.
 inquire = "0.9.4"
-# Rendering: diffs for `plan`, colour, progress.
-similar = "3.2.0"
+# Rendering: diffs for `plan`, colour, progress. `inline` is the word-level
+# emphasis inside a changed line; it adds no crate.
+similar = { version = "3.2.0", features = ["inline"] }
 anstyle = "1.0.14"
 indicatif = "0.18.6"
 # Secrets: age in-process, so the static binary needs no external `age`/`sops`.

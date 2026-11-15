@@ -424,9 +424,12 @@ fn decision_18_plan_over_an_interrupted_session_announces_the_roll_back_and_noth
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
     let shown = stdout(&output);
     assert!(shown.contains("  ~ ~/.owned  ("), "{shown}");
-    assert!(shown.contains("    -after\n    +before\n"), "{shown}");
+    assert!(
+        shown.contains("    1   │ -after\n      1 │ +before\n"),
+        "{shown}"
+    );
     assert!(shown.contains("  ~ ~/.config/made/new.conf  ("), "{shown}");
-    assert!(shown.contains("    -made\n"), "{shown}");
+    assert!(shown.contains("    1   │ -made\n"), "{shown}");
     assert!(
         shown.contains("run `bx plan` again after `bx apply` rolls these back"),
         "{shown}"
@@ -450,7 +453,7 @@ fn decision_18_an_apply_that_is_not_confirmed_rolls_nothing_back() {
 
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
-        stdout(&output).contains("    -after\n    +before\n"),
+        stdout(&output).contains("    1   │ -after\n      1 │ +before\n"),
         "{}",
         stdout(&output)
     );

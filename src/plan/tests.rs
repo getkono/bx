@@ -23,6 +23,9 @@ pub(crate) fn env(home: &Path) -> Env {
         stdout_tty: false,
         stdin_tty: false,
         stderr_tty: false,
+        columns: None,
+        rows: None,
+        pager: None,
         user: None,
     }
 }

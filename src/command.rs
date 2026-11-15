@@ -1122,11 +1122,21 @@ fn show(env: &Env, view: View, out: &mut dyn Write) -> Result<Exit, Error> {
     Ok(plan::exit(&report, Mode::Plan))
 }
 
-/// Write the rendering of `report`, coloured as the environment allows.
+/// Write the rendering of `report`, coloured and as wide as the environment
+/// allows, through the environment's pager where it is too tall for the
+/// terminal. Paging returns once the pager exits, so a question put next
+/// follows the plan on the screen.
 fn emit(out: &mut dyn Write, report: &Report, view: View, env: &Env) -> Result<(), Error> {
-    let palette = Palette::resolve(env.no_color, env.stdout_tty);
-    out.write_all(plan::render(report, view, palette, &env.home).as_bytes())
-        .map_err(Error::Output)
+    let palette = Palette::resolve(env.no_color, env.stdout_tty).within(env.columns);
+    let text = plan::render(report, view, palette, &env.home);
+    if let Some(pager) = env.pager_for(&text) {
+        // What is already written goes first, ahead of what the pager shows.
+        out.flush().map_err(Error::Output)?;
+        if pager.page(&text).map_err(Error::Output)? {
+            return Ok(());
+        }
+    }
+    out.write_all(text.as_bytes()).map_err(Error::Output)
 }
 
 #[cfg(test)]

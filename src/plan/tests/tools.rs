@@ -750,6 +750,46 @@ fn a_kept_edit_of_an_activation_file_keeps_its_wordcode_from_overriding_it() {
 }
 
 #[test]
+fn a_wordcode_missing_beside_a_file_already_right_is_written_on_its_own() {
+    let home = guarded_home();
+    let Some((inputs, _)) = compiled(&home) else {
+        return;
+    };
+    let wordcode = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+
+    // The file is what bx wants, so it is not written; its wordcode is
+    // decided on its own and compiles exactly those bytes.
+    std::fs::remove_file(home.child(WORDCODE)).expect("deleted");
+    let planned = plan(&inputs);
+    let row = row_of(&planned, WORDCODE);
+    assert_eq!(
+        planned.changes[row_of(&planned, OUTPUT)].action,
+        Action::Unchanged
+    );
+    assert_eq!(planned.changes[row].action, Action::Create);
+    assert!(
+        planned.changes[row]
+            .note
+            .as_deref()
+            .is_none_or(|note| !note.contains(crate::plan::decide::WAITS)),
+        "{:?}",
+        planned.changes[row].note
+    );
+    assert_eq!(exit(&apply(&inputs), Mode::Apply), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        wordcode
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+}
+
+#[test]
 fn an_activation_file_written_again_with_the_same_output_rewrites_its_wordcode_after_it() {
     let home = guarded_home();
     let Some((inputs, _)) = compiled(&home) else {

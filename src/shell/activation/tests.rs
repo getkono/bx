@@ -936,6 +936,37 @@ fn an_entry_that_does_not_decode_is_a_miss() {
     assert_eq!(entry.output, "a\n");
 }
 
+#[test]
+fn a_reused_step_says_whether_zsh_compiled_its_wordcode_during_the_plan() {
+    let mut step = reused("t", Shell::Zsh, "t() { :; }\n");
+    step.wordcode = Some(file::Wordcode {
+        bytes: b"wordcode".to_vec(),
+        entry: None,
+    });
+    // The cache already held the wordcode: nothing was run or recorded.
+    assert_eq!(step.action(), Action::Unchanged);
+    assert_eq!(
+        step.line(),
+        format!(
+            "{} activation `t`: cached output reused, nothing run",
+            Action::Unchanged.symbol()
+        )
+    );
+    // zsh compiled it now, so the cache has an entry to record.
+    step.wordcode = Some(file::Wordcode {
+        bytes: b"wordcode".to_vec(),
+        entry: Some(Fingerprint::raw(b"entry".to_vec())),
+    });
+    assert_eq!(step.action(), Action::Modify);
+    assert_eq!(
+        step.line(),
+        format!(
+            "{} activation `t`: cached output reused; zsh compiled it, cache updated",
+            Action::Modify.symbol()
+        )
+    );
+}
+
 /// A zsh or bash step that reused `output`, compiled by nothing.
 fn reused(name: &str, shell: Shell, output: &str) -> Step {
     Step {

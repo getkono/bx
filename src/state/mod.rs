@@ -575,8 +575,11 @@ pub enum Error {
     ///
     /// Nothing is recorded and nothing is stored. See [`Ledger::record`].
     ///
-    /// Any edit outside bx's lines raises this, and re-recording converges
-    /// nowhere, so the message names the one way out a user has: put the file
+    /// An edit inside a region, any edit to a file holding an include line,
+    /// and any edit to a region whose entry records no digest of the region's
+    /// own raises this — an edit only around a region recorded with one does
+    /// not — and re-recording converges nowhere, so the message names the one
+    /// way out a user has: put the file
     /// back as bx last wrote it, which needs nothing from bx. No command
     /// accepts the file as it is now, so the message offers no such route.
     #[error(

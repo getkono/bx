@@ -968,6 +968,76 @@ fn check_record_refuses_exactly_what_record_refuses_and_stores_nothing() {
 }
 
 #[test]
+fn a_region_edited_only_around_is_adopted_without_bxs_lines_and_one_edited_inside_is_refused() {
+    let home = guarded_home();
+    let (dir, lock) = locked(&home);
+    let region = Mechanism::Region { comment: '#' };
+    let bx1: &[u8] = b"user\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+    let at = |written: &[u8], before: &[u8]| {
+        NewEntry::new(
+            target("~/.bashrc"),
+            ContentHash::of(written),
+            Mode::DEFAULT_FILE,
+            region.clone(),
+            prior(before, 0o644),
+        )
+        .with_region(written)
+    };
+    let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+    let first = ledger.record(at(bx1, b"user\n")).expect("record");
+    assert_eq!(
+        first.region,
+        Some(ContentHash::of(b"# >>> bx >>>\nBX1\n# <<< bx <<<\n"))
+    );
+    let first_prior = first.prior.clone();
+
+    // Inside the region: refused, and nothing is stored.
+    let blobs = blob_names(&dir);
+    let inside = at(b"BX2", b"user\n# >>> bx >>>\nBX1\nmine\n# <<< bx <<<\n");
+    let err = ledger.check_record(&inside).expect_err("refused");
+    assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
+    let err = ledger.record(inside).expect_err("refused");
+    assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
+    assert_eq!(blob_names(&dir), blobs, "nothing was stored");
+
+    // Around it: the user's bytes, without bx's region, become the prior,
+    // and the one they replace is kept in the history.
+    let bx2: &[u8] = b"top\nuser\n# >>> bx >>>\nBX2\n# <<< bx <<<\nend\n";
+    let around: &[u8] = b"top\nuser\n# >>> bx >>>\nBX1\n# <<< bx <<<\nend\n";
+    ledger.check_record(&at(bx2, around)).expect("no conflict");
+    let stored = ledger.record(at(bx2, around)).expect("record");
+    let Prior::Existed(adopted) = &stored.prior else {
+        panic!("a snapshot: {:?}", stored.prior);
+    };
+    assert_eq!(adopted.digest, ContentHash::of(b"top\nuser\nend\n"));
+    assert!(has_blob(&dir, b"top\nuser\nend\n"));
+    assert!(
+        !has_blob(&dir, around),
+        "bx's lines are not kept as the user's"
+    );
+    let Prior::Existed(first_prior) = first_prior else {
+        panic!("a snapshot");
+    };
+    assert_eq!(stored.superseded, vec![first_prior]);
+    assert_eq!(
+        stored.region,
+        Some(ContentHash::of(b"# >>> bx >>>\nBX2\n# <<< bx <<<\n"))
+    );
+
+    // The same edit, recorded as a region in another comment character, is
+    // still refused: whose lines are whose is not known for it.
+    let mut other = at(
+        b"BX3",
+        b"top\nuser\n# >>> bx >>>\nBX2\n# <<< bx <<<\nend\nmore\n",
+    );
+    other.mechanism = Mechanism::Region { comment: ';' };
+    assert!(matches!(
+        ledger.check_record(&other),
+        Err(Error::PriorConflict { .. })
+    ));
+}
+
+#[test]
 fn accepting_a_changed_shared_file_converges_and_keeps_the_first_original() {
     // `PriorConflict` fires on any edit outside bx's region, so its message
     // has to name a remedy, and re-recording has to converge.
@@ -1348,6 +1418,7 @@ fn saving_the_ledger_twice_produces_identical_bytes() {
                 LedgerEntry {
                     path,
                     written: ContentHash::of(&[n]),
+                    region: None,
                     mode: Mode::DEFAULT_FILE,
                     mechanism: Mechanism::Own,
                     prior: Prior::Absent,

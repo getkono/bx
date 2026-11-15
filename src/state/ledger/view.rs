@@ -739,6 +739,7 @@ mod tests {
             LedgerEntry {
                 path: key,
                 written: ContentHash::of(b"bx wrote this"),
+                region: None,
                 mode: Mode::DEFAULT_FILE,
                 mechanism: Mechanism::Own,
                 prior: Prior::Absent,
@@ -885,6 +886,7 @@ mod tests {
                 LedgerEntry {
                     path: key,
                     written: ContentHash::of(b"x"),
+                    region: None,
                     mode: Mode::DEFAULT_FILE,
                     mechanism: Mechanism::Own,
                     prior: Prior::Absent,
@@ -942,6 +944,7 @@ mod tests {
                 LedgerEntry {
                     path,
                     written: ContentHash::of(b"x"),
+                    region: None,
                     mode: Mode::DEFAULT_FILE,
                     mechanism: Mechanism::Own,
                     prior: Prior::Absent,
@@ -1089,6 +1092,7 @@ mod tests {
                 LedgerEntry {
                     path: key,
                     written: ContentHash::of(b"x"),
+                    region: None,
                     mode: Mode::DEFAULT_FILE,
                     mechanism: Mechanism::Own,
                     prior: Prior::Absent,
@@ -1178,6 +1182,7 @@ mod tests {
             LedgerEntry {
                 path: target("~/.zzzz"),
                 written: ContentHash::of(b"x"),
+                region: None,
                 mode: Mode::DEFAULT_FILE,
                 mechanism: Mechanism::Own,
                 prior: Prior::Absent,
@@ -1192,6 +1197,7 @@ mod tests {
             LedgerEntry {
                 path: target("~/.config/tool/x.conf"),
                 written: ContentHash::of(b"x"),
+                region: None,
                 mode: Mode::DEFAULT_FILE,
                 mechanism: Mechanism::Own,
                 prior: Prior::Absent,
@@ -1276,6 +1282,7 @@ mod tests {
                 LedgerEntry {
                     path,
                     written: ContentHash::of(b"x"),
+                    region: None,
                     mode: Mode::DEFAULT_FILE,
                     mechanism: Mechanism::Own,
                     prior: Prior::Absent,

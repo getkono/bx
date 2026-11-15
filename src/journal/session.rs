@@ -664,7 +664,8 @@ impl Session {
                         mode,
                         mechanism.clone(),
                         PriorBytes::of(&observed),
-                    );
+                    )
+                    .with_region(bytes);
                     entry.with_created_dirs(portable_dirs(&created_dirs, &self.home)?)
                 }),
                 Some(mechanism.clone()),

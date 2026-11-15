@@ -968,7 +968,7 @@ fn check_record_refuses_exactly_what_record_refuses_and_stores_nothing() {
 }
 
 #[test]
-fn a_region_edited_only_around_is_adopted_without_bxs_lines_and_one_edited_inside_is_refused() {
+fn a_region_edited_only_around_is_adopted_without_bxs_lines_and_one_removed_is_refused() {
     let home = guarded_home();
     let (dir, lock) = locked(&home);
     let region = Mechanism::Region { comment: '#' };
@@ -991,12 +991,12 @@ fn a_region_edited_only_around_is_adopted_without_bxs_lines_and_one_edited_insid
     );
     let first_prior = first.prior.clone();
 
-    // Inside the region: refused, and nothing is stored.
+    // Removed: refused, and nothing is stored.
     let blobs = blob_names(&dir);
-    let inside = at(b"BX2", b"user\n# >>> bx >>>\nBX1\nmine\n# <<< bx <<<\n");
-    let err = ledger.check_record(&inside).expect_err("refused");
+    let removed = at(b"BX2", b"user\nmine\n");
+    let err = ledger.check_record(&removed).expect_err("refused");
     assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
-    let err = ledger.record(inside).expect_err("refused");
+    let err = ledger.record(removed).expect_err("refused");
     assert!(matches!(err, Error::PriorConflict { .. }), "got {err}");
     assert_eq!(blob_names(&dir), blobs, "nothing was stored");
 
@@ -1035,6 +1035,130 @@ fn a_region_edited_only_around_is_adopted_without_bxs_lines_and_one_edited_insid
         ledger.check_record(&other),
         Err(Error::PriorConflict { .. })
     ));
+}
+
+#[test]
+fn a_region_edited_inside_is_adopted_whole_and_a_legacy_one_is_refused() {
+    let home = guarded_home();
+    let (dir, lock) = locked(&home);
+    let region = Mechanism::Region { comment: '#' };
+    let bx1: &[u8] = b"user\n# >>> bx >>>\nBX1\n# <<< bx <<<\n";
+    let bx2: &[u8] = b"user\n# >>> bx >>>\nBX2\n# <<< bx <<<\n";
+    let inside: &[u8] = b"user\n# >>> bx >>>\nBX1\nmine\n# <<< bx <<<\n";
+    let at = |path: &str, written: &[u8], before: &[u8]| {
+        NewEntry::new(
+            target(path),
+            ContentHash::of(written),
+            Mode::DEFAULT_FILE,
+            region.clone(),
+            prior(before, 0o600),
+        )
+    };
+    let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+    let first = ledger
+        .record(at("~/.bashrc", bx1, b"user\n").with_region(bx1))
+        .expect("record")
+        .clone();
+
+    // The user's edit of bx's lines, markers and all, is what `bx rm` puts
+    // back once they took bx's region over it.
+    ledger
+        .check_record(&at("~/.bashrc", bx2, inside).with_region(bx2))
+        .expect("no conflict");
+    let stored = ledger
+        .record(at("~/.bashrc", bx2, inside).with_region(bx2))
+        .expect("record");
+    assert_eq!(stored.prior, Prior::Existed(reference(inside, 0o600)));
+    assert!(has_blob(&dir, inside));
+    let Prior::Existed(first_prior) = first.prior else {
+        panic!("a snapshot");
+    };
+    assert_eq!(stored.superseded, vec![first_prior]);
+
+    // An entry with no region digest cannot tell an edit inside from one
+    // beside, and is still refused.
+    ledger
+        .record(at("~/.zshrc", bx1, b"user\n"))
+        .expect("a legacy record");
+    let blobs = blob_names(&dir);
+    let legacy = at(
+        "~/.zshrc",
+        bx2,
+        b"user\n# >>> bx >>>\nBX1\nours\n# <<< bx <<<\n",
+    );
+    assert!(matches!(
+        ledger.record(legacy),
+        Err(Error::PriorConflict { .. })
+    ));
+    assert_eq!(blob_names(&dir), blobs, "nothing was stored");
+}
+
+#[test]
+fn a_retargeted_link_is_adopted_as_the_prior() {
+    let home = guarded_home();
+    let (dir, lock) = locked(&home);
+    let at = |written: &[u8], before: PriorBytes| {
+        NewEntry::new(
+            target("~/.tool"),
+            ContentHash::of(written),
+            Mode::LINK,
+            Mechanism::Link,
+            before,
+        )
+    };
+    let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+    ledger
+        .record(at(b"/opt/one", PriorBytes::Absent))
+        .expect("record");
+    let theirs = PriorBytes::Bytes {
+        bytes: b"/opt/theirs".to_vec(),
+        mode: Mode::LINK,
+    };
+    ledger
+        .check_record(&at(b"/opt/two", theirs.clone()))
+        .expect("no conflict");
+    let stored = ledger.record(at(b"/opt/two", theirs)).expect("record");
+    let Prior::Existed(adopted) = &stored.prior else {
+        panic!("the user's text: {:?}", stored.prior);
+    };
+    assert_eq!(adopted.digest, ContentHash::of(b"/opt/theirs"));
+    assert_eq!(adopted.mode, Mode::LINK);
+    assert!(stored.superseded_absent);
+}
+
+#[test]
+fn a_mode_the_user_set_is_adopted_only_when_the_record_changes_it() {
+    let home = guarded_home();
+    let (dir, lock) = locked(&home);
+    let at = |path: &str, mode: u32, before: PriorBytes| {
+        NewEntry::new(
+            target(path),
+            ContentHash::of(b"bx\n"),
+            Mode::from_bits(mode),
+            Mechanism::Own,
+            before,
+        )
+    };
+    let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+    for path in ["~/.taken", "~/.tracked"] {
+        ledger
+            .record(at(path, 0o644, PriorBytes::Absent))
+            .expect("record");
+    }
+
+    // bx's bytes at the user's 0600, written back at bx's 0644: the user's
+    // mode is displaced, and kept.
+    let stored = ledger
+        .record(at("~/.taken", 0o644, prior(b"bx\n", 0o600)))
+        .expect("record");
+    assert_eq!(stored.prior, Prior::Existed(reference(b"bx\n", 0o600)));
+    assert!(stored.superseded_absent);
+
+    // Left at the user's 0600: nothing of theirs is displaced.
+    let stored = ledger
+        .record(at("~/.tracked", 0o600, prior(b"bx\n", 0o600)))
+        .expect("record");
+    assert_eq!(stored.prior, Prior::Absent);
 }
 
 #[test]

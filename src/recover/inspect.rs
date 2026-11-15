@@ -1250,8 +1250,9 @@ mod tests {
 
         // A journal whose one write displaced a changed copy of the shared file,
         // and landed, and whose session died before its save.
-        // Inside the region: an edit beside it would be adopted without it.
-        let edited = bx1.replace("BX1\n", "BX1\nmine\n");
+        // bx's region removed: an edit beside it would be adopted without
+        // it, and one inside it whole.
+        let edited = "user line\nmine\n".to_string();
         let displaced = ContentHash::of(edited.as_bytes());
         fs::write_atomically(
             &state.restore().join(displaced.to_hex()),

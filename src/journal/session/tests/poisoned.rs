@@ -243,8 +243,9 @@ fn a_prior_conflict_poisons_the_session_before_anything_is_published() {
     first.finish().expect("finish");
     let saved = std::fs::read(state.ledger()).expect("the saved ledger");
 
-    // Inside the region: an edit beside it is the user's, and no conflict.
-    let edit = region("BX1\nmine");
+    // bx's region removed: an edit beside it is the user's and no conflict,
+    // and one inside it is the user's edit of bx's lines, kept whole.
+    let edit = "user line\nmine\n".to_string();
     plant_file(&dest, &edit, Mode::DEFAULT_FILE);
 
     let mut second = apply_session(&state, home.path());

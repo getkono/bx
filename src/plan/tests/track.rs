@@ -547,6 +547,31 @@ fn a_repo_deletion_beside_an_agreed_machine_copy_is_carried_by_apply() {
 }
 
 #[test]
+fn a_target_bx_removed_then_switched_to_apply_is_created_not_a_deletion() {
+    let (home, tracked) = agreed_home("agreed\n");
+    std::fs::remove_file(copy(home.path(), "lock")).expect("the deletion");
+    assert!(apply(&tracked).executed);
+    let removal = entry(home.path(), "~/.lock").expect("bx's removal");
+    assert_eq!(removal.written, crate::state::removed_written());
+
+    // The repo gains a copy again, now applied one way. Nothing at `~/.lock`
+    // is what bx last left, so the write is a create, not a git-style
+    // deletion the user made.
+    put(&copy(home.path(), "lock"), "fresh\n");
+    let applied = inputs(
+        &home,
+        "[[target]]\npath = \"~/.lock\"\nfile = \"files/lock\"\ndirection = \"apply\"\n",
+    );
+    let planned = plan(&applied);
+    assert_eq!(planned.actions(), vec![Action::Create], "{planned:?}");
+    assert!(apply(&applied).executed);
+    assert_eq!(
+        read(&machine(home.path(), "lock")).as_deref(),
+        Some("fresh\n")
+    );
+}
+
+#[test]
 fn a_copy_that_appears_after_a_carried_deletion_is_a_first_copy_never_removed_again() {
     let (home, inputs) = agreed_home("agreed\n");
     std::fs::remove_file(copy(home.path(), "lock")).expect("the deletion");

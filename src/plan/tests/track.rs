@@ -145,7 +145,7 @@ fn a_large_tracked_file_is_agreed_by_digest_and_its_conflict_shows_the_two_sides
         home.path(),
     );
     assert!(
-        rendered.contains("+++ ~/.lock (this machine)"),
+        rendered.contains("── ~/.lock (repo → this machine) ─"),
         "{rendered}"
     );
     assert!(rendered.contains("-theirs"), "{rendered}");

@@ -106,7 +106,9 @@ pub fn clone_removing() -> ContentHash {
 /// A tracked target deleted on one side since the last sync, while the other
 /// side still holds what the two agreed on, has its deletion carried to the
 /// other side: that removal is bx's write, so the entry stays, with the bytes
-/// it removed as its prior, and `bx rm` puts them back. What is on disk there
+/// it removed as its prior unless bx itself created that copy, and `bx rm`
+/// puts them back; a copy bx itself created keeps its prior
+/// [`Prior::Absent`], so `bx rm` restores nothing there. What is on disk there
 /// is then what bx left while nothing is, and a file found there since is
 /// someone else's, as any edit of a file bx owns is.
 #[must_use]

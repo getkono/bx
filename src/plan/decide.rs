@@ -911,7 +911,8 @@ const TRACK_SHAPE: &str = "track mode carries this machine's whole file into the
 /// and `rm` puts them back.
 ///
 /// A deletion carried to the other side claims the copy it removes, on
-/// either side, so `rm` puts back what it removed: see [`one_side_deleted`].
+/// either side, so `rm` puts back what it removed unless bx itself created
+/// that copy, whose prior stays absent: see [`one_side_deleted`].
 fn decide_track(
     target: &Target,
     ctx: &Ctx<'_>,

@@ -574,7 +574,8 @@ if [ "$GATED" = own ]; then
 	done
 	for f in $(activations own zsh); do
 		# shellcheck disable=SC2016 # expanded by the compiling zsh, not this shell.
-		[ ! -f "${f}.zwc" ] || env -i PATH="$SEARCH" zsh -f -c 'zcompile -U -- "$1"' zsh "$f"
+		[ ! -f "${f}.zwc" ] || env -i PATH="$SEARCH" \
+			zsh -f -c 'cd -- "$1" && zcompile -U -- "$2"' zsh "${f%/*}" "${f##*/}"
 	done
 	# shellcheck disable=SC2046
 	left="$({ split cached "${WORK}/own/".zshenv "${WORK}/own/".zshrc "${WORK}/own/".bashrc \

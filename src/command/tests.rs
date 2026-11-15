@@ -31,6 +31,10 @@ fn prompts_child() {
     // assertion that kills them: with no terminal there is no answer, and
     // a wrapper that invents one would approve a write nobody confirmed.
     assert!(matches!(answer, Err(Error::Prompt(NotTTY))), "{answer:?}");
+    // Nor is there an answer about an edited file: inventing one could
+    // write bx's bytes over the edit.
+    let settled = ask_edited("~/.a was edited");
+    assert!(matches!(settled, Err(Error::Prompt(NotTTY))), "{settled:?}");
     assert!(
         ask_passphrase("~/.ssh/id_ed25519").is_none(),
         "a prompt with no terminal is no passphrase"
@@ -1279,6 +1283,7 @@ fn a_confirmation_discards_what_was_typed_before_it_was_asked() {
 }
 
 mod doctor_command;
+mod edited_command;
 mod sync_command;
 mod update_check_command;
 mod update_command;

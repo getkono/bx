@@ -177,7 +177,9 @@ it yours.
   <  sync       a tracked file this machine changed; `bx sync` carries
                 this machine's copy into the repo and commits it
   !  conflict   it exists, differs, and bx does not own it — or you edited
-                bx's output. Reported and skipped, never overwritten.
+                bx's output. Reported and skipped, never overwritten, unless
+                you answer `apply`'s question about an edited file with
+                "take bx's"; your bytes are kept for `bx rm`.
   ?  blocked    something it needs is missing: a value with no answer, or
                 one switched off or invalid; a secret that does not decrypt
                 here; a followed external `bx.lock` holds no commit for; an
@@ -318,9 +320,15 @@ want of a terminal.
 
 - A managed file edited by hand is a conflict: `plan` and `apply` report it,
   and `apply` skips it, leaving your edit exactly as it is.
-- `bx` asks nothing about a conflict: there is no prompt to keep the edit,
-  discard it, or skip the module. You settle it by hand, in the file or in
-  your configuration, and the next `plan` reads what you decided.
+- At a terminal, `apply` and `sync` ask about each file bx owns whole that you
+  edited since bx wrote it: keep your edit (the default), take bx's bytes, or
+  show a three-way diff — what bx wrote against what is on disk, then against
+  what bx wants. Taking bx's bytes keeps yours, and `bx rm` puts them back
+  exactly. With `--yes`, or with no terminal, nothing is asked and every
+  edited file is kept. Any other conflict you settle by hand, in the file or
+  in your configuration, and the next `plan` reads what you decided.
+- A file you brought to exactly what bx wants is recorded as bx's again, so
+  the next change to its body is bx's to make, not a conflict.
 - `doctor` reports a declared tool that is not on `PATH`, a required value with
   no answer, a damaged state file, an interrupted or running session, a
   directory wider than a private file in it, a declared optional source that is

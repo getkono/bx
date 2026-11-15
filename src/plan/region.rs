@@ -82,6 +82,37 @@ pub(super) fn find(file: &[u8], comment: char) -> Found {
     }
 }
 
+/// The digest of `file`'s region, delimiters included, when it has exactly
+/// one.
+///
+/// What the ledger records beside the whole file's digest, so a region is
+/// judged by its own bytes: an edit outside it leaves this digest as it was,
+/// and one inside it does not.
+#[must_use]
+pub(crate) fn digest(file: &[u8], comment: char) -> Option<crate::hash::ContentHash> {
+    match find(file, comment) {
+        Found::At(span) => Some(crate::hash::ContentHash::of(&file[span])),
+        Found::Absent | Found::Damaged(_) => None,
+    }
+}
+
+/// `file` without its region, when it has exactly one: every byte the user
+/// wrote around it, and nothing of bx's.
+///
+/// The newline [`splice`] adds before a region it appends to a file whose
+/// last line lacked one is the user's line ending now, and stays.
+#[must_use]
+pub(crate) fn without(file: &[u8], comment: char) -> Option<Vec<u8>> {
+    match find(file, comment) {
+        Found::At(span) => {
+            let mut out = file[..span.start].to_vec();
+            out.extend_from_slice(&file[span.end..]);
+            Some(out)
+        }
+        Found::Absent | Found::Damaged(_) => None,
+    }
+}
+
 /// `file` with its region holding `body`: replaced in place when it has one,
 /// appended when it has none, and the whole file when there is no file.
 ///

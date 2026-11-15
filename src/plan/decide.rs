@@ -599,12 +599,15 @@ fn placed_in_region(
 /// * the ledger says bx attached to this file some other way;
 /// * bx wrote a region here and it is gone — the user removed it;
 /// * a region is there that bx has no record of writing;
-/// * the region differs from what bx wants and the file is not as bx last
-///   left it. Whether the edit was inside the region or beside it cannot be
-///   told from a whole-file record, so the region is left as it is.
+/// * the region differs from what bx wants and was edited since bx last
+///   wrote it: its own bytes no longer hash to the region digest the ledger
+///   recorded. An entry with no such digest, written before bx recorded one,
+///   is judged by the whole file as before: any edit to it, inside the region
+///   or beside it, leaves the region as it is.
 ///
-/// A rewrite of a region bx wrote, in a file nobody else has touched since, is
-/// a modify, as a file bx owns whole is.
+/// A rewrite of a region bx wrote, whose own bytes nobody else has touched
+/// since, is a modify, as a file bx owns whole is; the bytes around it are
+/// carried through as they are now.
 fn region_ownership(
     action: Action,
     observed: &Observed,
@@ -633,9 +636,13 @@ fn region_ownership(
         (region::Found::Absent, None) => (action, note),
         (region::Found::Absent, Some(_)) => conflict("bx's region was removed since bx wrote it"),
         (_, None) => conflict("it holds a bx region bx has no record of writing"),
-        (_, Some(entry)) if observed.digest() != Some(entry.written) => {
+        (_, Some(entry)) if observed.digest() == Some(entry.written) => (action, note),
+        (_, Some(entry)) if entry.region.is_none() => {
             conflict("edited since bx last wrote it, and bx's region differs from what bx wants")
         }
+        (_, Some(entry)) if region::digest(bytes, comment) != entry.region => conflict(
+            "bx's region was edited since bx last wrote it, and differs from what bx wants",
+        ),
         _ => (action, note),
     }
 }

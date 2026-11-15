@@ -149,8 +149,27 @@ pub struct LedgerEntry {
     /// that decides the question `plan` has to answer for a file bx shares with
     /// the user: if the bytes on disk still hash to this, nobody but bx has
     /// touched the file and a rewrite is a `Modify`; if they do not, someone
-    /// else has, and it is a `Conflict`.
+    /// else has, and it is a `Conflict` — unless [`LedgerEntry::region`] says
+    /// the edit was beside bx's region rather than in it.
     pub written: ContentHash,
+    /// For a [`Mechanism::Region`], the digest of the region bx last wrote,
+    /// delimiters included.
+    ///
+    /// A region is bx's and the bytes around it are the user's, so an edit
+    /// around it is no reason to leave the region stale: while the region on
+    /// disk still hashes to this, the edit was outside it, and bx rewrites its
+    /// region and nothing else. When it does not, the edit was inside it, and
+    /// that is a conflict.
+    ///
+    /// `None` for every other mechanism, and for a region entry written before
+    /// the field existed or rebuilt by recovery, which records the digest of
+    /// what it finds and not the bytes: such an entry is judged by
+    /// [`LedgerEntry::written`] alone, as every region was before, and gains
+    /// the digest the next time bx writes the region. Written only when set, so
+    /// a ledger holding none saves byte-identically to one written before the
+    /// field, and a build that predates it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<ContentHash>,
     /// The mode bx set on the target.
     pub mode: Mode,
     /// How bx attached to it.
@@ -286,6 +305,9 @@ pub struct NewEntry {
     pub path: crate::paths::Portable,
     /// The digest of the whole bytes bx just wrote there.
     pub written: ContentHash,
+    /// For a region, the digest of the region in those bytes: see
+    /// [`LedgerEntry::region`]. `None` unless [`NewEntry::with_region`] sets it.
+    pub region: Option<ContentHash>,
     /// The mode bx set.
     pub mode: Mode,
     /// How bx attached to it.
@@ -323,7 +345,17 @@ impl NewEntry {
             mechanism,
             prior,
             created_dirs: Vec::new(),
+            region: None,
         }
+    }
+
+    /// Record the digest of the region in `bytes`, the whole file bx writes,
+    /// when this entry attaches as a [`Mechanism::Region`] and `bytes` holds
+    /// exactly one; any other entry is left without one.
+    #[must_use]
+    pub fn with_region(mut self, bytes: &[u8]) -> Self {
+        self.region = region_of(&self.mechanism, bytes);
+        self
     }
 
     /// Replace what this entry says the target held before.
@@ -484,6 +516,10 @@ fn unrelated_created_dir(
 ///
 /// The one statement of the rule [`Ledger::record`] documents, so the check a
 /// caller makes first and the refusal `record` gives cannot disagree.
+///
+/// A region whose own bytes are still the ones bx wrote is the exception: the
+/// change is all outside it, and [`outside_region`] gives what the user has
+/// there without bx's lines.
 pub(super) fn prior_conflict(
     existing: &LedgerEntry,
     mechanism: &Mechanism,
@@ -495,6 +531,7 @@ pub(super) fn prior_conflict(
     let digest = ContentHash::of(bytes);
     if digest != existing.written
         && (existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own)
+        && outside_region(existing, mechanism, bytes).is_none()
     {
         return Err(Error::PriorConflict {
             target: existing.path.as_str().to_string(),
@@ -502,6 +539,42 @@ pub(super) fn prior_conflict(
         });
     }
     Ok(())
+}
+
+/// The digest of the region in `bytes` that an entry attached as `mechanism`
+/// records: see [`LedgerEntry::region`].
+#[must_use]
+pub fn region_of(mechanism: &Mechanism, bytes: &[u8]) -> Option<ContentHash> {
+    match mechanism {
+        Mechanism::Region { comment } => crate::plan::region::digest(bytes, *comment),
+        _ => None,
+    }
+}
+
+/// `displaced` without bx's region, when every change in it since bx last
+/// wrote `existing` lies outside that region: the bytes the user has there
+/// now, which a re-record adopts as the prior so `bx rm` keeps their edit and
+/// takes only bx's lines.
+///
+/// `None` — the change cannot be told apart from bx's own lines — unless both
+/// the stored and the incoming mechanism are the same [`Mechanism::Region`],
+/// the entry records its region's digest, and the region in `displaced` still
+/// hashes to it.
+pub(super) fn outside_region(
+    existing: &LedgerEntry,
+    mechanism: &Mechanism,
+    displaced: &[u8],
+) -> Option<Vec<u8>> {
+    let Mechanism::Region { comment } = existing.mechanism else {
+        return None;
+    };
+    let recorded = existing.region?;
+    if *mechanism != existing.mechanism
+        || crate::plan::region::digest(displaced, comment) != Some(recorded)
+    {
+        return None;
+    }
+    crate::plan::region::without(displaced, comment)
 }
 
 #[cfg(test)]
@@ -817,6 +890,33 @@ mod tests {
         let old: BeforeEnvelope =
             rmp_serde::from_slice(&flagged).expect("an older build decodes it");
         assert_eq!(old.payload.entries.len(), 2);
+
+        // `region` came after it, under the same rule: a region's digest is
+        // written once a write records one, an older build still decodes the
+        // ledger, and an entry without it reads back as having none.
+        let region = Mechanism::Region { comment: '#' };
+        let whole = b"mine\n# >>> bx >>>\nbx\n# <<< bx <<<\n";
+        let mut with = entry("~/.zshrc", whole).with_region(whole);
+        assert_eq!(with.region, None, "an `Own` entry has no region");
+        with.mechanism = region.clone();
+        ledger.record(with.with_region(whole)).expect("record");
+        let mut without = entry("~/.bashrc", whole);
+        without.mechanism = region;
+        ledger.record(without).expect("record");
+        ledger.save().expect("save");
+        let old: BeforeEnvelope =
+            rmp_serde::from_slice(&std::fs::read(dir.ledger()).expect("read"))
+                .expect("an older build decodes it");
+        assert_eq!(old.payload.entries.len(), 4);
+        let reread = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert_eq!(
+            reread.get(&target("~/.zshrc")).expect("entry").region,
+            Some(ContentHash::of(b"# >>> bx >>>\nbx\n# <<< bx <<<\n"))
+        );
+        assert_eq!(
+            reread.get(&target("~/.bashrc")).expect("entry").region,
+            None
+        );
     }
 
     #[test]

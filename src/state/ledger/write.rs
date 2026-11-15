@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::entry::{
     History, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, Withdrawal,
-    check_created_dirs, is_ancestor, prior_conflict,
+    check_created_dirs, is_ancestor, outside_region, prior_conflict,
 };
 use super::view::LedgerView;
 use super::{KIND, VERSION};
@@ -174,17 +174,25 @@ impl Ledger {
     ///   [`LedgerEntry::superseded_absent`]: it had no bytes to keep, but that
     ///   there was no file before bx is still part of the history.
     ///
-    ///   **Only for a file bx owns whole.** When the stored or the incoming
-    ///   [`Mechanism`] is a `Region` or an `Include`, those bytes hold bx's own
-    ///   previous region or include line as well as the user's edit, and
-    ///   adopting them would make `bx rm` write bx's stale lines back into the
-    ///   user's file. Stripping them needs the grammar the writer uses — the
-    ///   region's delimiter lines, and where an include line is placed — and no
-    ///   such writer exists yet, so `record` refuses with
-    ///   [`Error::PriorConflict`], stores nothing, and leaves the entry exactly
-    ///   as it was. `plan` reports the same target as a conflict from `written`
-    ///   alone, so an apply that shares its function never reaches this call.
-    ///   The way out is for the user to put the file back as bx last wrote it.
+    ///   **Whole, only for a file bx owns whole.** When the stored or the
+    ///   incoming [`Mechanism`] is a `Region` or an `Include`, those bytes hold
+    ///   bx's own previous region or include line as well as the user's edit,
+    ///   and adopting them would make `bx rm` write bx's stale lines back into
+    ///   the user's file.
+    ///
+    ///   A `Region` both sides name, whose entry records the region's digest
+    ///   ([`LedgerEntry::region`]) and whose region in the displaced bytes
+    ///   still hashes to it, was edited only around the region. Those bytes
+    ///   are adopted with the region cut out, by the grammar the writer uses,
+    ///   so `bx rm` keeps the user's edit and takes only bx's lines.
+    ///
+    ///   Anything else — an include line, an edit inside the region, or a
+    ///   region entry with no digest of its own — cannot be told apart from
+    ///   bx's lines, so `record` refuses with [`Error::PriorConflict`], stores
+    ///   nothing, and leaves the entry exactly as it was. `plan` reports the
+    ///   same target as a conflict, so an apply that shares its function never
+    ///   reaches this call. The way out is for the user to put the file back as
+    ///   bx last wrote it.
     ///
     /// The comparison is on content only. A file whose bytes still match
     /// `written` but whose mode the user changed is treated as bx's own output,
@@ -273,6 +281,7 @@ impl Ledger {
             LedgerEntry {
                 path: entry.path,
                 written: entry.written,
+                region: entry.region,
                 mode: entry.mode,
                 mechanism: entry.mechanism,
                 prior,
@@ -301,10 +310,14 @@ impl Ledger {
         let PriorBytes::Bytes { bytes, mode } = incoming else {
             return Ok(kept());
         };
-        let digest = ContentHash::of(&bytes);
-        if digest == existing.written {
+        if ContentHash::of(&bytes) == existing.written {
             return Ok(kept());
         }
+        // A region whose own bytes are as bx wrote them was edited around:
+        // what the user has is the file without bx's lines, and that is what
+        // `bx rm` puts back. `prior_conflict` refused every other shared file.
+        let bytes = outside_region(existing, mechanism, &bytes).unwrap_or(bytes);
+        let digest = ContentHash::of(&bytes);
 
         // A third party wrote these bytes and this apply displaces them: they
         // reach `restore/` before anything else is decided.
@@ -381,9 +394,8 @@ impl Ledger {
     /// `bx rm` then leaves the file, bx's line in it, rather than removing it.
     /// So it must run only because the user chose it, and since no command
     /// offers that choice, [`Error::PriorConflict`]'s message does not name
-    /// it. Restoring the user's
-    /// edit without bx's lines needs the region writer's delimiter grammar,
-    /// which does not exist yet.
+    /// it. An edit only around a region needs none of this: `record` adopts
+    /// it without bx's lines by itself.
     ///
     /// Returns `Ok(None)`, changing nothing, when bx records no entry for
     /// `path`.
@@ -429,6 +441,7 @@ impl Ledger {
         entry.superseded = history.superseded;
         entry.superseded_absent = history.absent;
         entry.written = digest;
+        entry.region = super::entry::region_of(&entry.mechanism, bytes);
         Ok(Some(entry))
     }
 

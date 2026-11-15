@@ -1452,20 +1452,121 @@ mod env_placement {
     }
 
     #[test]
-    fn a_region_is_rewritten_only_while_the_file_is_as_bx_left_it() {
+    fn a_region_is_rewritten_only_while_its_own_bytes_are_as_bx_left_them() {
         let old = "top\n# >>> bx >>>\nsource ~/.old\n# <<< bx <<<\n";
         // bx's own older region, in a file nobody has touched since.
         let change = zshrc_row(None, Some(old.as_bytes()));
         assert_eq!(change.action, Action::Modify, "{change:?}");
-        // The same, after the user edited the file.
-        let change = zshrc_row(Some(&format!("{old}more\n")), Some(old.as_bytes()));
+        // The same, after the user edited the file around the region: the
+        // region is still bx's, and only it changes.
+        let change = zshrc_row(Some(&format!("mine\n{old}more\n")), Some(old.as_bytes()));
+        assert_eq!(change.action, Action::Modify, "{change:?}");
+        assert_eq!(change.note, None, "{change:?}");
+        // An edit inside the region is the user's act on bx's lines.
+        let inside = old.replace("source ~/.old\n", "source ~/.old\nmine\n");
+        let change = zshrc_row(Some(&inside), Some(old.as_bytes()));
         assert_eq!(change.action, Action::Conflict, "{change:?}");
         assert!(
             change
                 .note
                 .as_deref()
-                .is_some_and(|n| n.contains("edited since")),
+                .is_some_and(|n| n.contains("bx's region was edited since")),
             "{change:?}"
+        );
+    }
+
+    #[test]
+    fn a_region_entry_with_no_digest_of_its_own_is_judged_by_the_whole_file() {
+        // A ledger written before bx recorded a region's own digest: any
+        // edit to the file, beside the region too, leaves the region alone.
+        let old = "top\n# >>> bx >>>\nsource ~/.old\n# <<< bx <<<\n";
+        let home = guarded_home();
+        own(
+            home.path(),
+            ".zshrc",
+            old.as_bytes(),
+            Mechanism::Region { comment: '#' },
+        );
+        let state = crate::state::StateDir::resolve(home.path());
+        let key = Portable::parse_in("~/.zshrc", home.path()).expect("a path");
+        {
+            let lock = crate::state::ExclusiveLock::acquire(&state).expect("the lock");
+            let mut ledger = crate::state::Ledger::open(&state, &lock, home.path())
+                .expect("open")
+                .value;
+            let stored = ledger.get(&key).expect("the entry").clone();
+            assert!(stored.region.is_some(), "a write records its region");
+            ledger
+                .record(crate::state::NewEntry::new(
+                    key.clone(),
+                    stored.written,
+                    stored.mode,
+                    stored.mechanism,
+                    crate::state::PriorBytes::Absent,
+                ))
+                .expect("re-record without the region's digest");
+            ledger.save().expect("save");
+        }
+        home.write(".zshrc", &format!("{old}more\n"));
+        let report = plan(&home, &env("EDITOR", "nvim", "interactive"));
+        let change = row(&report, "~/.zshrc");
+        assert_eq!(change.action, Action::Conflict, "{change:?}");
+        assert!(
+            change
+                .note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("edited since bx last wrote it")),
+            "{change:?}"
+        );
+        // Put back as bx left it, the region is rewritten, and the write
+        // records the digest the entry lacked.
+        home.write(".zshrc", old);
+        apply(&home, &env("EDITOR", "nvim", "interactive"));
+        let ledger = LedgerView::read(&state, home.path())
+            .expect("the ledger")
+            .value;
+        assert_eq!(
+            ledger.get(&key).and_then(|entry| entry.region),
+            crate::plan::region::digest(read(&home, ".zshrc").as_bytes(), '#')
+        );
+    }
+
+    #[test]
+    fn a_region_edited_around_is_rewritten_alone_and_rm_keeps_the_users_edit() {
+        // Issue 435: an edit outside the markers followed by a changed region
+        // is a modify, keeps every byte of the edit, converges, and `bx rm`
+        // takes back only bx's region.
+        let old = "alias ll='ls -l'\n# >>> bx >>>\nsource ~/.old\n# <<< bx <<<\n";
+        let home = guarded_home();
+        home.write(".zshrc", "alias ll='ls -l'\n");
+        own(
+            home.path(),
+            ".zshrc",
+            old.as_bytes(),
+            Mechanism::Region { comment: '#' },
+        );
+        let edited = format!("export FOO=1\n{old}bindkey -v\n");
+        home.write(".zshrc", &edited);
+
+        let layer = env("EDITOR", "nvim", "interactive");
+        let applied = apply(&home, &layer);
+        assert_eq!(row(&applied, "~/.zshrc").action, Action::Modify);
+        assert_eq!(
+            read(&home, ".zshrc"),
+            format!("export FOO=1\nalias ll='ls -l'\n{ZSHRC_REGION}bindkey -v\n")
+        );
+        assert_converges(&home, &layer);
+
+        assert_rm_restores(
+            &home,
+            &ZSH_TARGETS,
+            &[
+                (".local/share/bx/zshrc.zsh", None),
+                (
+                    ".zshrc",
+                    Some("export FOO=1\nalias ll='ls -l'\nbindkey -v\n"),
+                ),
+            ],
         );
     }
 

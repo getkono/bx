@@ -423,6 +423,7 @@ mod tests {
         LedgerEntry {
             path: Portable::parse_in(&format!("~/{rel}"), home.path()).expect("portable"),
             written: ContentHash::of(written),
+            region: None,
             mode: Mode::from_bits(mode),
             mechanism,
             prior: Prior::Absent,

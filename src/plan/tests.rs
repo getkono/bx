@@ -691,11 +691,10 @@ fn decision_22_a_mode_the_user_changed_on_a_file_bx_owns_is_a_conflict() {
 
     assert_eq!(report.actions(), vec![Action::Conflict]);
     assert!(
-        report.changes[0]
-            .note
-            .as_deref()
-            .is_some_and(|note| note.starts_with("its mode changed since bx wrote it")),
-        "{:?}",
+        report.changes[0].note.as_deref().is_some_and(|note| note
+            .starts_with("its mode changed since bx wrote it")
+            && !note.contains(decide::ASK)),
+        "a mode change alone is skipped, not asked about: {:?}",
         report.changes[0].note
     );
     let applied = apply(&inputs);

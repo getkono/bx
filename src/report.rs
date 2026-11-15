@@ -32,9 +32,7 @@ pub enum Action {
     /// the deletion stands, as a deletion against an unchanged base does in
     /// git. Not pending work, so `apply` twice still converges, and never
     /// hidden: its row reads like `git status`'s `deleted:`, and at a
-    /// terminal a writing run asks whether to restore it. A tracked target
-    /// deleted on one side since the last sync, while the other side still
-    /// holds what the two agreed on, is left on both sides this way too.
+    /// terminal a writing run asks whether to restore it.
     Unchanged,
     /// bx wrote this file, the ledger still owns it, nothing declares it any
     /// more, and `apply` will not take it back: the configuration declares
@@ -51,6 +49,11 @@ pub enum Action {
     /// The target does not exist and will be created.
     Create,
     /// bx owns the target and its content differs; it will be updated.
+    ///
+    /// Also a tracked target whose repo copy was deleted since the last sync
+    /// while this machine's still holds what the two agreed on: the deletion
+    /// is carried here, and `apply` removes this machine's copy, journalled
+    /// and claimed, so `bx rm` puts it back.
     Modify,
     /// bx wrote this file, nothing declares it any more — its `[[target]]`
     /// was deleted, switched off or gated off here, or the repo file a `tree`
@@ -73,6 +76,10 @@ pub enum Action {
     /// copy into the config repo and commits it. Not `apply`'s work, so it is
     /// neither pending nor in need of attention, and a bare `apply` over it
     /// still reports a converged machine.
+    ///
+    /// Also a tracked target this machine deleted while the repo's copy still
+    /// holds what the two last agreed on: `bx sync` removes the repo's copy,
+    /// claimed so `bx rm` puts it back, and commits the removal.
     Sync,
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.

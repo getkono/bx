@@ -99,6 +99,21 @@ pub fn clone_removing() -> ContentHash {
     ContentHash::of(b"removing")
 }
 
+/// What a [`Mechanism::Own`] entry records as [`LedgerEntry::written`] once
+/// bx removed the file and kept the entry: [`ContentHash::ZERO`], which no
+/// file's bytes hash to.
+///
+/// A tracked target deleted on one side since the last sync, while the other
+/// side still holds what the two agreed on, has its deletion carried to the
+/// other side: that removal is bx's write, so the entry stays, with the bytes
+/// it removed as its prior, and `bx rm` puts them back. What is on disk there
+/// is then what bx left while nothing is, and a file found there since is
+/// someone else's, as any edit of a file bx owns is.
+#[must_use]
+pub const fn removed_written() -> ContentHash {
+    ContentHash::ZERO
+}
+
 /// A pointer to the bytes that were at a target before bx wrote it.
 ///
 /// The blob is stored under its own digest, so two targets that displaced
@@ -151,6 +166,8 @@ pub struct LedgerEntry {
     /// touched the file and a rewrite is a `Modify`; if they do not, someone
     /// else has, and it is a `Conflict` — unless [`LedgerEntry::region`] says
     /// the edit was beside bx's region rather than in it.
+    ///
+    /// [`removed_written`] where bx removed the file and kept the entry.
     pub written: ContentHash,
     /// For a [`Mechanism::Region`], the digest of the region bx last wrote,
     /// delimiters included.

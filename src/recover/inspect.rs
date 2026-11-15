@@ -6,7 +6,9 @@ use super::{ABANDON, Error, Standing, Unfinished};
 use crate::fs::{self, Kind, Mode};
 use crate::journal::{Intent, Loaded, Written};
 use crate::paths::Portable;
-use crate::state::{ContentHash, LedgerView, NewEntry, Prior, PriorBytes, RestoreRef, StateDir};
+use crate::state::{
+    ContentHash, LedgerView, NewEntry, Prior, PriorBytes, RestoreRef, StateDir, removed_written,
+};
 
 /// What recovery does about one intent.
 pub(super) enum Step {
@@ -213,9 +215,19 @@ pub(super) fn decide(
              and the next writing bx run records it"
         )
     };
-    let (Written::Present { digest, mode }, Some(mechanism)) =
-        (intent.after, intent.mechanism.clone())
-    else {
+    let written = match (intent.after, intent.mechanism.clone(), &intent.before) {
+        (Written::Present { digest, mode }, Some(mechanism), _) => Some((digest, mode, mechanism)),
+        // A removal that kept its entry — a tracked target's deletion carried
+        // to its other side — is recorded as the session records it: at the
+        // absence, at the mode of the bytes it removed, which become its prior.
+        (Written::Absent, Some(mechanism), Prior::Existed(reference))
+            if !intent.dir && !intent.link =>
+        {
+            Some((removed_written(), reference.mode, mechanism))
+        }
+        _ => None,
+    };
+    let Some((digest, mode, mechanism)) = written else {
         // A removal, or a target the session released: nothing for bx to own.
         let mut note = recorded();
         if intent.after == Written::Absent {

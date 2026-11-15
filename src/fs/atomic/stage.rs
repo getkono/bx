@@ -646,7 +646,19 @@ impl Unpublished {
 /// [`Error::MissingParent`] when the destination's parent does not exist, and
 /// whatever [`observe`], [`stage`] or [`Staged::commit`] returns.
 pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Error> {
-    let planned = observe(path)?;
+    write_over(&observe(path)?, bytes, mode)
+}
+
+/// [`write_atomically`] to `planned.path`, refusing unless it is still what
+/// `planned` observed: the stamp [`stage`] checks, for a caller that read the
+/// file well before it writes it and must not replace a save made in between.
+///
+/// # Errors
+///
+/// [`Error::Changed`] when the destination is no longer what `planned`
+/// observed, and otherwise what [`write_atomically`] returns.
+pub fn write_over(planned: &Observed, bytes: &[u8], mode: Mode) -> Result<(), Error> {
+    let path = &planned.path;
     // A parent that is there but does not resolve, or is a link, is left to the
     // verdicts `stage` already has for it; only "nothing is there" is this one.
     if let Some(parent) = &planned.parent
@@ -654,7 +666,7 @@ pub fn write_atomically(path: &Path, bytes: &[u8], mode: Mode) -> Result<(), Err
     {
         return Err(Error::MissingParent(parent.path.clone()));
     }
-    stage(path, mode, &planned, &mut CreatedDirs::new())?.commit(bytes)
+    stage(path, mode, planned, &mut CreatedDirs::new())?.commit(bytes)
 }
 
 /// Set the mode of an existing file or directory, in place, unconditionally.

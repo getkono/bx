@@ -595,11 +595,16 @@ pub fn refuse_edited(git: &Git, repo: &Path, edits: &[Edit]) -> Result<(), crate
 ///
 /// # Errors
 ///
-/// [`crate::update::Error::Write`] when a layer cannot be written, and
+/// [`crate::update::Error::LayerEdited`] when a layer no longer holds the
+/// bytes an edit was made from, or changed between bx's read and its write
+/// (`adopt::replace_layer`, the one write every layer edit makes), with that
+/// layer left as it is;
+/// [`crate::update::Error::Write`] when a layer cannot be written; and
 /// [`crate::update::Error::Sync`] when git refuses the commit, as a failing
 /// hook makes it. A commit git refuses puts every layer back as it was, and
 /// unstages it, so a later `apply` never moves a checkout to a commit the
-/// configuration does not name.
+/// configuration does not name; a layer saved since bx wrote it is not put
+/// back, and keeps the save.
 pub fn write_and_commit(
     git: &Git,
     repo: &Path,
@@ -623,22 +628,47 @@ pub fn write_and_commit(
             )
         })
         .collect();
-    let write = |at: usize, bytes: &str| {
-        crate::fs::write_atomically(&edits[at].file, bytes.as_bytes(), modes[at])
-            .map_err(crate::update::Error::Write)
+    // Read a layer, refusing it unless it holds `expected`: the observation a
+    // write over it is stamped against.
+    let read = |at: usize, expected: &str| {
+        let file = &edits[at].file;
+        let read = crate::fs::observe(file).map_err(crate::update::Error::Write)?;
+        if read.kind != crate::fs::Kind::File || read.bytes.as_deref() != Some(expected.as_bytes())
+        {
+            return Err(crate::update::Error::LayerEdited(file.clone()));
+        }
+        Ok(read)
+    };
+    // Replace a layer read as `read` with `bytes`, unless it changed since.
+    let write = |at: usize, read: &crate::fs::Observed, bytes: &str| {
+        crate::adopt::replace_layer(read, bytes, modes[at]).map_err(|error| match error {
+            crate::fs::Error::Changed { .. } => {
+                crate::update::Error::LayerEdited(edits[at].file.clone())
+            }
+            error => crate::update::Error::Write(error),
+        })
+    };
+    // Put back each layer bx wrote, as far as it goes: one changed since bx
+    // wrote it is the user's again, and stays as it is.
+    let put_back = |written: &[Edit]| {
+        for (at, edit) in written.iter().enumerate() {
+            if let Ok(read) = read(at, &edit.after) {
+                let _ = write(at, &read, &edit.before);
+            }
+        }
     };
     // What was shown is what is replaced: a layer edited since — while the
-    // question waited — is the user's, and none is written.
-    for edit in edits {
-        if std::fs::read_to_string(&edit.file).ok().as_deref() != Some(edit.before.as_str()) {
-            return Err(crate::update::Error::LayerEdited(edit.file.clone()));
-        }
-    }
+    // question waited — is the user's, and none is written. One saved after
+    // this read is refused by the write's stamp, and the ones before it put
+    // back.
+    let reads = edits
+        .iter()
+        .enumerate()
+        .map(|(at, edit)| read(at, &edit.before))
+        .collect::<Result<Vec<_>, _>>()?;
     for (at, edit) in edits.iter().enumerate() {
-        if let Err(error) = write(at, &edit.after) {
-            for (back, written) in edits[..at].iter().enumerate() {
-                let _ = write(back, &written.before);
-            }
+        if let Err(error) = write(at, &reads[at], &edit.after) {
+            put_back(&edits[..at]);
             return Err(error);
         }
     }
@@ -663,9 +693,7 @@ pub fn write_and_commit(
     committed.map_err(|error: git::Error| {
         let _ = git.query(repo, &with(&["reset", "--quiet"], &files));
         // Put back as far as it goes; git's refusal is what is said.
-        for (at, edit) in edits.iter().enumerate() {
-            let _ = write(at, &edit.before);
-        }
+        put_back(edits);
         error.into()
     })
 }

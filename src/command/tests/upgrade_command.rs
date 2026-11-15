@@ -523,6 +523,38 @@ fn a_pin_commit_git_refuses_puts_the_layer_back_and_moves_no_checkout() {
 }
 
 #[test]
+fn a_layer_saved_while_git_refuses_the_pin_commit_is_not_put_back() {
+    let home = guarded_home();
+    let (repo, first, _) = released(&home);
+    let hook = repo.join(".git/hooks/commit-msg");
+    // The hook runs at the repo's top level, after bx wrote the layer.
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ngrep -q 'upgrade pinned' \"$1\" || exit 0\n\
+         printf '# saved while git ran\\n' >> bx.toml\nexit 1\n",
+    )
+    .expect("a hook");
+    crate::fs::set_mode(&hook, crate::fs::Mode::from_bits(0o755)).expect("executable");
+    let layer = std::fs::read_to_string(repo.join("bx.toml")).expect("bx.toml");
+
+    let error = upgrade(
+        &home,
+        &[],
+        Upgrading::Upgrade { yes: true },
+        &mut Vec::new(),
+    )
+    .expect_err("refused");
+    assert!(matches!(error, update::Error::Sync(_)), "{error}");
+    let now = std::fs::read_to_string(repo.join("bx.toml")).expect("bx.toml");
+    assert!(
+        now.ends_with("# saved while git ran\n")
+            && now != format!("{layer}# saved while git ran\n"),
+        "the save over bx's edit stands, not put back: {now}"
+    );
+    assert_eq!(rev(home.path(), &home.child(PINNED), "HEAD"), first);
+}
+
+#[test]
 fn a_layer_edited_while_the_question_waits_is_kept_and_nothing_moves() {
     let home = guarded_home();
     let (repo, first, _) = released(&home);

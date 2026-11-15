@@ -543,7 +543,9 @@ impl Answers {
     /// The answers are set again on the file as it stands once the lock is
     /// held, not on the copy read before the prompts, so an edit made while
     /// `init` was asking — by hand, or by another `bx init` — survives, and
-    /// only the names answered here change.
+    /// only the names answered here change. The write is stamped against that
+    /// read ([`write_local`]), so a save landing between it and the write is
+    /// refused rather than replaced.
     ///
     /// A state directory inside the repo never reaches this: [`Self::load`]
     /// runs the loader's own [`layers::layer_paths`], which refuses it, and
@@ -558,7 +560,8 @@ impl Answers {
         }
         state.ensure()?;
         let _lock = ExclusiveLock::acquire(state)?;
-        let current = read_local(&self.path)?;
+        let read = fs::observe(&self.path)?;
+        let current = observed_local(&read)?;
         let mut doc = parse_local(&self.path, current.as_deref())?;
         for (name, answer) in &self.given {
             local::set(&mut doc, name, answer);
@@ -567,9 +570,40 @@ impl Answers {
         if current.as_deref() == Some(text.as_str()) {
             return Ok(None);
         }
-        fs::write_atomically(&self.path, text.as_bytes(), Mode::PRIVATE_FILE)?;
+        write_local(&read, &text)?;
         Ok(Some(self.path.clone()))
     }
+}
+
+/// The text of the `local.toml` that `read` observed, or `None` when there
+/// was none.
+fn observed_local(read: &fs::Observed) -> Result<Option<String>, Error> {
+    let refuse = |why: String| Error::Local {
+        path: read.path.clone(),
+        why,
+    };
+    match (read.kind, &read.bytes) {
+        (fs::Kind::Absent, _) => Ok(None),
+        (fs::Kind::File, Some(bytes)) => String::from_utf8(bytes.clone())
+            .map(Some)
+            .map_err(|_| refuse("is not UTF-8".to_string())),
+        (kind, _) => Err(refuse(format!("is {kind}, not a file bx can edit"))),
+    }
+}
+
+/// Replace `local.toml` with `text` at `0600`, unless it changed since `read`
+/// observed it: the one layer write ([`adopt::replace_layer`]), so a save
+/// made after bx read the file stands and nothing is written.
+fn write_local(read: &fs::Observed, text: &str) -> Result<(), Error> {
+    adopt::replace_layer(read, text, Mode::PRIVATE_FILE).map_err(|error| match error {
+        fs::Error::Changed { .. } => Error::Local {
+            path: read.path.clone(),
+            why: "changed after bx read it, so the answers were not written and the file is as \
+                  it was saved; run `bx init` again"
+                .to_string(),
+        },
+        error => Error::from(error),
+    })
 }
 
 /// `local.toml`'s text, or `None` when there is none.
@@ -1027,6 +1061,68 @@ pub(crate) mod tests {
 
         assert!(answers.save(&state).expect("save").is_none());
         assert_eq!(mode_of(&local(&home)), 0o644, "not rewritten");
+    }
+
+    #[test]
+    fn a_local_toml_saved_after_bx_read_it_is_refused_and_keeps_the_save() {
+        let home = guarded_home();
+        home.write(".local/state/bx/local.toml", "# mine\n");
+        let read = fs::observe(&local(&home)).expect("bx reads local.toml");
+        let saved = "# mine\n# saved by an editor while bx worked\n";
+        std::fs::write(local(&home), saved).expect("an editor saves");
+
+        let error = write_local(&read, "[values]\nroot = \"~/s\"\n").expect_err("refused");
+        assert!(
+            matches!(&error, Error::Local { path, why }
+                if *path == local(&home) && why.contains("run `bx init` again")),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(local(&home)).expect("local.toml"),
+            saved,
+            "the editor's save stands"
+        );
+    }
+
+    #[test]
+    fn a_local_toml_unchanged_since_bx_read_it_takes_the_answers_at_0600() {
+        let home = guarded_home();
+        home.write(".local/state/bx/local.toml", "# mine\n");
+        chmod(&local(&home), 0o644);
+        let read = fs::observe(&local(&home)).expect("bx reads local.toml");
+        assert_eq!(
+            observed_local(&read).expect("text").as_deref(),
+            Some("# mine\n")
+        );
+
+        write_local(&read, "# mine\n[values]\n").expect("written");
+        assert_eq!(
+            std::fs::read_to_string(local(&home)).expect("local.toml"),
+            "# mine\n[values]\n"
+        );
+        assert_eq!(mode_of(&local(&home)), 0o600);
+    }
+
+    #[test]
+    fn a_local_toml_bx_cannot_edit_is_refused_before_it_is_written() {
+        let home = guarded_home();
+        home.write(".local/state/bx/local.toml", "");
+        std::fs::write(local(&home), [0xff, 0xfe]).expect("not UTF-8");
+        let read = fs::observe(&local(&home)).expect("observed");
+        let error = observed_local(&read).expect_err("not UTF-8");
+        assert!(
+            matches!(&error, Error::Local { why, .. } if why == "is not UTF-8"),
+            "{error}"
+        );
+
+        std::fs::remove_file(local(&home)).expect("rm");
+        std::fs::create_dir(local(&home)).expect("a directory where the file goes");
+        let read = fs::observe(&local(&home)).expect("observed");
+        let error = observed_local(&read).expect_err("a directory");
+        assert!(
+            matches!(&error, Error::Local { why, .. } if why.contains("not a file bx can edit")),
+            "{error}"
+        );
     }
 
     #[test]

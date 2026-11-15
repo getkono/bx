@@ -1787,3 +1787,47 @@ fn rm_of_a_tracked_target_whose_repo_copy_alone_conflicts_restores_neither_side(
     );
     assert_eq!(layer(&home), TRACKED_NESTED, "still declared");
 }
+
+#[test]
+fn a_layer_saved_after_bx_read_it_is_refused_and_keeps_the_save() {
+    let home = repo(MINE);
+    let path = home.child(".config/bx/bx.toml");
+    let opened = open_layer(&path).expect("bx reads the layer");
+    let saved = "# my own notes\n# saved by an editor while bx worked\n";
+    std::fs::write(&path, saved).expect("an editor saves");
+
+    let error = write_layer(&path, &opened, "# bx's edit\n", home.path()).expect_err("refused");
+    assert!(
+        matches!(&error, Error::Layer { path: named, why }
+            if *named == path && why.contains("run the command again")),
+        "{error}"
+    );
+    assert!(error.to_string().contains("bx.toml"), "{error}");
+    assert_eq!(layer(&home), saved, "the editor's save stands");
+}
+
+#[test]
+fn a_layer_made_after_bx_found_none_is_refused_and_kept() {
+    let home = repo(MINE);
+    let path = home.child(".config/bx/modules/new.toml");
+    std::fs::create_dir_all(path.parent().expect("a parent")).expect("modules");
+    let opened = open_layer(&path).expect("bx reads nothing there");
+    assert!(opened.text.is_empty());
+    std::fs::write(&path, MINE).expect("the user makes it");
+
+    let error = replace_layer(&opened.read, "# bx's edit\n", opened.mode).expect_err("refused");
+    assert!(matches!(error, fs::Error::Changed { .. }), "{error}");
+    assert_eq!(std::fs::read_to_string(&path).expect("kept"), MINE);
+}
+
+#[test]
+fn a_layer_unchanged_since_bx_read_it_takes_the_edit_at_its_mode() {
+    let home = repo(MINE);
+    let path = home.child(".config/bx/bx.toml");
+    chmod(&path, 0o640);
+    let opened = open_layer(&path).expect("bx reads the layer");
+
+    write_layer(&path, &opened, "# bx's edit\n", home.path()).expect("written");
+    assert_eq!(layer(&home), "# bx's edit\n");
+    assert_eq!(mode_of(&path), 0o640);
+}

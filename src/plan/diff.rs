@@ -387,8 +387,15 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
         out.push_str(&palette.paint(ATTENTION, &banner));
         out.push('\n');
     }
-    for change in &report.changes {
-        if view == View::Plan && change.action == Action::Unchanged && !interrupted(report) {
+    for (at, change) in report.changes.iter().enumerate() {
+        // A deletion that stands is unchanged, and still said, as `git
+        // status` says one: it is a question a writing run asks.
+        let asked = report.questions.iter().any(|question| question.row == at);
+        if view == View::Plan
+            && change.action == Action::Unchanged
+            && !interrupted(report)
+            && !asked
+        {
             continue;
         }
         row(&mut out, change, palette, home);

@@ -33,7 +33,7 @@ fn keep_mine_at_a_terminal_writes_nothing_and_puts_no_confirmation() {
         false,
         &mut out,
         &mut never,
-        Some(&mut |q| {
+        Some(&mut |q, _| {
             asked.push(q.to_string());
             Ok(Answer::Keep)
         }),
@@ -70,7 +70,7 @@ fn show_draws_the_three_way_view_and_asks_again_then_take_writes_once_confirmed(
             confirmed += 1;
             Ok(true)
         },
-        Some(&mut |_| Ok(answers.pop().expect("asked no more than answered"))),
+        Some(&mut |_, _| Ok(answers.pop().expect("asked no more than answered"))),
     )
     .expect("apply");
 
@@ -93,7 +93,7 @@ fn take_declined_at_the_confirmation_writes_nothing() {
         false,
         &mut Vec::new(),
         &mut || Ok(false),
-        Some(&mut |_| Ok(Answer::Take)),
+        Some(&mut |_, _| Ok(Answer::Take)),
     )
     .expect("apply");
 
@@ -104,8 +104,9 @@ fn take_declined_at_the_confirmation_writes_nothing() {
 #[test]
 fn yes_and_no_terminal_ask_nothing_and_keep_the_edit() {
     let home = edited_home();
-    let never_settled =
-        &mut |_: &str| -> Result<Answer, Error> { panic!("nothing should have been asked") };
+    let never_settled = &mut |_: &str, _: &Choices| -> Result<Answer, Error> {
+        panic!("nothing should have been asked")
+    };
 
     let mut out = Vec::new();
     let exit = apply_answering(
@@ -148,7 +149,7 @@ fn walking_away_from_the_question_is_a_cancel() {
         false,
         &mut out,
         &mut never,
-        Some(&mut |_| Err(Error::Canceled)),
+        Some(&mut |_, _| Err(Error::Canceled)),
     )
     .expect("a cancel is no error");
 
@@ -160,5 +161,57 @@ fn walking_away_from_the_question_is_a_cancel() {
 fn every_answer_is_offered_and_keep_is_the_default() {
     assert_eq!(CHOICES[0].1, Answer::Keep);
     let answers: Vec<Answer> = CHOICES.iter().map(|(_, answer)| *answer).collect();
+    assert_eq!(answers, vec![Answer::Keep, Answer::Take, Answer::Show]);
+}
+
+#[test]
+fn a_deleted_file_is_asked_whether_to_keep_it_deleted_and_restore_writes_it() {
+    let home = guarded_home();
+    seed(home.path(), &inline("~/.a", "bx\\n"));
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("bx writes it");
+    std::fs::remove_file(home.child(".a")).expect("the deletion");
+    let mut asked = Vec::new();
+    let mut offered = Vec::new();
+
+    // Kept deleted: nothing pending, so nothing is confirmed or written.
+    let exit = apply_answering(
+        &tty(home.path()),
+        false,
+        &mut Vec::new(),
+        &mut never,
+        Some(&mut |q, choices| {
+            asked.push(q.to_string());
+            offered.push(*choices);
+            Ok(Answer::Keep)
+        }),
+    )
+    .expect("apply");
+    assert_eq!(
+        exit,
+        Exit::Converged,
+        "a deletion that stands is not pending"
+    );
+    assert_eq!(
+        asked,
+        vec!["~/.a was deleted since bx last wrote it. Keep it deleted, or restore bx's?"]
+    );
+    assert_eq!(offered, vec![DELETED_CHOICES]);
+    assert!(!home.child(".a").exists());
+
+    let exit = apply_answering(
+        &tty(home.path()),
+        false,
+        &mut Vec::new(),
+        &mut || Ok(true),
+        Some(&mut |_, _| Ok(Answer::Take)),
+    )
+    .expect("apply");
+    assert_eq!(exit, Exit::Converged);
+    assert_eq!(std::fs::read(home.child(".a")).expect("restored"), b"bx\n");
+}
+
+#[test]
+fn keeping_a_deletion_is_the_default() {
+    let answers: Vec<Answer> = DELETED_CHOICES.iter().map(|(_, answer)| *answer).collect();
     assert_eq!(answers, vec![Answer::Keep, Answer::Take, Answer::Show]);
 }

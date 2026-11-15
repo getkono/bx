@@ -33,7 +33,7 @@ fn prompts_child() {
     assert!(matches!(answer, Err(Error::Prompt(NotTTY))), "{answer:?}");
     // Nor is there an answer about an edited file: inventing one could
     // write bx's bytes over the edit.
-    let settled = ask_edited("~/.a was edited");
+    let settled = ask_edited("~/.a was edited", &CHOICES);
     assert!(matches!(settled, Err(Error::Prompt(NotTTY))), "{settled:?}");
     assert!(
         ask_passphrase("~/.ssh/id_ed25519").is_none(),

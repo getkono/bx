@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::parent::{Write, created_dirs, locked_parent};
-use super::{Ctx, Made, Op, attached_as, join, portable_reason};
+use super::{ASK_DELETED, Ctx, Made, Op, attached_as, deleted, join, portable_reason};
 use crate::config::target::Target;
 use crate::fs::{self, Kind, Mode, Observed};
 use crate::plan::{Change, Diff, Error};
@@ -65,20 +65,29 @@ pub(super) fn decide_link(
         ),
         (None, Kind::Other) => (Action::Conflict, Some("not a symlink".to_string())),
     };
-    let (action, note) = link_ownership(action, &observed, ctx.ledger.get(&target.path), note);
+    let entry = ctx.ledger.get(&target.path);
+    let (action, note) = link_ownership(action, &observed, entry, note);
+    // A link bx made that was deleted since is settled as a file bx owns
+    // whole is, and asked about the same way.
+    let gone =
+        action == Action::Create && entry.is_some_and(|entry| entry.mechanism == Mechanism::Link);
+    let (action, note) = match entry {
+        Some(entry) if gone => deleted(entry, fs::link::digest(&text), Mode::LINK, note),
+        _ => (action, note),
+    };
     // Making a link writes an entry in its parent, as a file's write does.
-    let (action, note) = match (
-        action.is_pending(),
-        locked_parent(&observed, ctx.home, ctx.declared, Write::File),
-    ) {
+    let locked = locked_parent(&observed, ctx.home, ctx.declared, Write::File);
+    let ask = gone && locked.is_none();
+    let (action, note) = match (action.is_pending(), locked) {
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
+        _ if ask => (action, join([note, Some(ASK_DELETED.to_string())])),
         _ => (action, note),
     };
     // A link on either side has text to show; anything else is explained by
-    // the note alone.
+    // the note alone. A deletion that stands shows nothing.
     let diff = match action {
         Action::Create | Action::Modify => Some(Diff::link(observed.link.as_deref(), Some(&text))),
-        Action::Conflict if observed.kind == Kind::Symlink => {
+        Action::Conflict if observed.kind == Kind::Symlink || gone => {
             Some(Diff::link(observed.link.as_deref(), Some(&text)))
         }
         Action::Conflict
@@ -89,12 +98,14 @@ pub(super) fn decide_link(
         | Action::Release
         | Action::Blocked => None,
     };
+    // So does the restore a deleted target's question offers.
     let note = match action {
         Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
+        _ if gone && ask => join([note, created_dirs(&observed, ctx.home, ctx.declared)]),
         _ => note,
     };
     let change = row(action, diff, note);
-    let op = action.is_pending().then(|| Op {
+    let op = (action.is_pending() || ask).then(|| Op {
         target: target.path.clone(),
         dest,
         made: Made::Link(text),

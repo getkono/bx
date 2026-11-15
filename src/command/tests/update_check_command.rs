@@ -250,10 +250,10 @@ fn an_apply_leaves_an_existing_ask_due_and_check_due_alone() {
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     std::fs::write(stamps.ask_due(), "5\n").expect("ask-due");
     std::fs::write(stamps.check_due(), "6\n").expect("check-due");
-    std::fs::remove_file(home.child(".claude/skills/a")).expect("one write to make");
+    one_write_to_make(&home);
 
     apply(&env(home.path()), true, &mut Vec::new()).expect("apply");
-    assert!(home.child(".claude/skills/a").exists(), "the apply wrote");
+    assert!(home.child(".new").exists(), "the apply wrote");
     assert_eq!(
         std::fs::read_to_string(stamps.ask_due()).expect("ask-due"),
         "5\n"
@@ -281,10 +281,20 @@ fn an_apply_on_a_machine_that_never_ran_update_starts_the_interval() {
     locked_once(&home);
     let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
     std::fs::remove_dir_all(home.child(".local/state/bx/update")).expect("a new machine");
-    std::fs::remove_file(home.child(".claude/skills/a")).expect("one write to make");
+    one_write_to_make(&home);
     apply(&env(home.path()), true, &mut Vec::new()).expect("apply");
+    assert!(home.child(".new").exists(), "the apply wrote");
     assert!(Stamps::read(&stamps.ask_due()).is_some(), "seeded");
     assert!(!stamps.check_due().exists(), "nothing checks on its own");
+}
+
+/// Declare one more file, so the next apply has one write to make. Not a
+/// link bx made deleted by hand: that deletion stands, and writes nothing.
+fn one_write_to_make(home: &GuardedHome) {
+    let config = home.child(".config/bx/bx.toml");
+    let mut layer = std::fs::read_to_string(&config).expect("bx.toml");
+    layer.push_str(&crate::plan::tests::inline("~/.new", "new\\n"));
+    std::fs::write(config, layer).expect("bx.toml");
 }
 
 #[test]

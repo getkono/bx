@@ -240,6 +240,27 @@ path, `bx rm` when a conflict left something as it was, and
 when it did not carry the `<` rows it announced — declined, or refused for
 want of a terminal.
 
+## Does it replace your dotfiles manager?
+
+Yes. `bx` delivers and tracks your dotfiles — whole files, managed regions,
+symlinks, tracked files, secrets and externals — reversibly and idempotently,
+and it also manages your tools, their activations and your shell integration.
+
+That comes with one trade-off. A plain dotfiles manager copies files and is
+then out of the picture. To keep the result hermetic and deterministic, `bx`
+generates your shell integration — environment, `PATH`, activations, aliases,
+functions, plugins and keybindings — into its own files and sources them from
+one managed region in your rc file, so the code `bx` generated runs at every
+shell start for its features to work.
+
+That cost is measured, not taken on faith. It is benchmarked in CI on Linux
+and macOS and gated at a 5 ms budget (`mise run bench`; see
+[`bench/README.md`](bench/README.md)). The lines `bx` generates spawn no
+process and read no configuration file, and a cached activation replaces
+running each tool's `eval "$(tool init)"`, which usually costs a shell start
+more than sourcing what it printed. [Fast enough to forget](#fast-enough-to-forget)
+says what the budget covers.
+
 ## Requirements
 
 ### Your bytes, always

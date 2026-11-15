@@ -18,14 +18,16 @@
 //! The submodules hold what a decision consults: [`parent`] whether `apply`
 //! can write inside the directory a destination is in, [`dir`] and [`link`]
 //! the decisions for directory and symlink targets, [`guard`] Invariant 2's
-//! judgement of a generated body, and [`undeclared`] the row for a file bx
-//! wrote that nothing declares any more, with the write that takes it back.
+//! judgement of a generated body, [`undeclared`] the row for a file bx
+//! wrote that nothing declares any more, with the write that takes it back,
+//! and [`wordcode`] the tie between a zsh activation's file and its `.zwc`.
 
 mod dir;
 mod guard;
 mod link;
 mod parent;
 mod undeclared;
+mod wordcode;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +39,9 @@ pub(super) use self::guard::{guard_environment_d, guard_fragment};
 use self::link::decide_link;
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
 pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
+pub(super) use self::wordcode::Tied;
+#[cfg(test)]
+pub(super) use self::wordcode::{REWRITTEN, WAITS};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
 use crate::config::resolve::Resolution;
@@ -105,6 +110,10 @@ pub(super) struct Decided {
     /// the edit. Its row is a conflict, and `apply` makes the write only for
     /// a row the user answered with *take bx's* — never by default.
     pub held: Vec<(usize, Op)>,
+    /// Each zsh activation's wordcode whose file is one of
+    /// [`Decided::held`], with the write `apply` makes right after the
+    /// file's, and only once it does: see [`wordcode`].
+    pub tied: Vec<Tied>,
 }
 
 /// Decide every target of a configuration.
@@ -195,13 +204,17 @@ pub(super) fn decide_all(
         }
         rows[at] = Some(change);
     }
+    // Every target has its row, so a row's index is its target's.
+    let mut changes: Vec<Change> = rows.into_iter().flatten().collect();
+    let tied = wordcode::tie(resolutions, &mut changes, &mut ops, &mut held, ctx.home)?;
     Ok(Decided {
-        changes: rows.into_iter().flatten().collect(),
+        changes,
         ops,
         carries,
         agreed,
         declared,
         held,
+        tied,
     })
 }
 

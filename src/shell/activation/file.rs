@@ -21,7 +21,10 @@
 //! named as [`source`] is and relative to that directory — and reads back the
 //! `.zwc` beside it. That file's
 //! bytes become the [`wordcode`] target, written after the output's own file,
-//! so its modification time is not older than the file it compiles. `-f` and
+//! so its modification time is not older than the file it compiles. The plan
+//! writes the two together: a `.zwc` is never written while its file is not —
+//! a kept edit stays what zsh reads — and is written again, bytes unchanged,
+//! whenever its file is, so it never ends older than the file. `-f` and
 //! `-U` keep every alias out of the compiled code — `-f` reads none of the
 //! account's startup files, and `-U` would not expand an alias the system's
 //! `/etc/zshenv` defined — so the code is the same whatever aliases are
@@ -211,7 +214,8 @@ fn zcompile(host: &impl Host, zsh: &Path, stem: &str, output: &str) -> Result<Ve
 
 /// The targets the activation `name`'s `output` and its `wordcode` are
 /// written as: the output's own file first, so the `.zwc` written after it is
-/// never the older of the two.
+/// never the older of the two. The plan ties the `.zwc`'s write to the
+/// file's: see `plan::decide`'s `wordcode` module.
 #[must_use]
 pub fn targets(
     name: &str,

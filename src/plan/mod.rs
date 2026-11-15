@@ -459,9 +459,18 @@ fn decide_and_write(
             }
             // Each edit answered *take bx's* becomes the write its row was
             // decided with, and its row the modify that write is.
+            // A zsh activation's wordcode tied to a taken file is written
+            // right after it, so it is never the older of the two.
+            let mut tied = decided.tied;
             for (row, op) in taken.into_iter().rev() {
                 report.changes[row].action = Action::Modify;
                 report.changes[row].note = Some(TAKEN.to_string());
+                if let Some(at) = tied.iter().position(|tied| tied.source == row) {
+                    let tied = tied.remove(at);
+                    report.changes[tied.row].action = Action::Modify;
+                    report.changes[tied.row].note = tied.note;
+                    ops.insert(taken_at, tied.op);
+                }
                 ops.insert(taken_at, op);
             }
             // What each file bx writes whole will hold, kept once the session

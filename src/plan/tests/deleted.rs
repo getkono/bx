@@ -206,6 +206,8 @@ fn a_link_deleted_while_bx_still_wants_its_text_stands_and_restore_remakes_it() 
     assert_eq!(planned.actions(), vec![Action::Unchanged]);
     assert_eq!(exit(&planned, Mode::Plan), Exit::Converged);
     assert_eq!(the_question(&planned).row, 0);
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.ends_with(decide::ASK_DELETED), "{note}");
     assert_eq!(
         the_question(&planned).three_way.as_ref().map(|d| &d.kind),
         Some(&DiffKind::Link {
@@ -256,6 +258,79 @@ fn restoring_into_a_deleted_directory_announces_the_directory_it_creates() {
         std::fs::read(home.child(".config/tool/a")).expect("restored"),
         b"bx\n"
     );
+}
+
+#[test]
+fn restoring_a_link_into_a_deleted_directory_announces_the_directory_it_creates() {
+    let home = guarded_home();
+    let made = inputs(&home, &symlink("~/.config/tool/l", "bx"));
+    assert!(apply(&made).executed);
+    std::fs::remove_dir_all(home.child(".config/tool")).expect("the deletion");
+
+    let planned = plan(&made);
+    assert_eq!(planned.actions(), vec![Action::Unchanged]);
+    the_question(&planned);
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.ends_with("creates ~/.config/tool 0755"), "{note}");
+
+    let restored = answer(&made, &[0]);
+    assert_eq!(restored.actions(), vec![Action::Create]);
+    assert_eq!(text_of(&home.child(".config/tool/l")), Path::new("bx"));
+}
+
+/// A deletion whose restore could not land, because the directory it would
+/// be made in denies its owner write, is asked nothing and announces no
+/// directory: it stands, and is said to.
+#[test]
+fn a_deletion_beneath_a_directory_apply_cannot_write_is_not_asked_about() {
+    let home = guarded_home();
+    let declared = format!(
+        "{}{}",
+        inline("~/.config/tool/a", "bx\\n"),
+        symlink("~/.config/tool/l", "bx")
+    );
+    let inputs = inputs(&home, &declared);
+    assert!(apply(&inputs).executed);
+    std::fs::remove_dir_all(home.child(".config/tool")).expect("the deletion");
+    let config = home.child(".config");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o555)).expect("lock");
+
+    let planned = plan(&inputs);
+
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o755)).expect("unlock");
+    assert_eq!(
+        planned.actions(),
+        vec![Action::Unchanged, Action::Unchanged]
+    );
+    assert!(planned.questions.is_empty(), "{:?}", planned.questions);
+    for change in &planned.changes {
+        let note = change.note.as_deref().expect("a note");
+        assert!(note.starts_with(decide::DELETED), "{note}");
+        assert!(!note.contains(decide::ASK_DELETED), "{note}");
+        assert!(!note.contains("creates"), "{note}");
+    }
+}
+
+/// A file bx generates outside its own data directory is the user's to
+/// delete, as any file bx owns whole is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_generated_file_outside_bx_s_data_directory_follows_the_deletion_rule() {
+    let home = guarded_home();
+    let declared = "[[env]]\nname = \"EDITOR\"\nvalue = \"nvim\"\nkind = \"gui\"\n".to_string();
+    let inputs = inputs(&home, &declared);
+    assert!(apply(&inputs).executed);
+    let path = config::env::ENVIRONMENT_D;
+    std::fs::remove_file(home.child(&path[2..])).expect("the deletion");
+
+    let planned = plan(&inputs);
+    let row = planned
+        .changes
+        .iter()
+        .find(|change| change.target == path)
+        .expect("the file's row");
+    assert_eq!(row.action, Action::Unchanged, "{:?}", row.note);
+    assert!(the_question(&planned).deleted);
 }
 
 #[test]

@@ -99,7 +99,18 @@ any read is a failure.
 **`net`** — a hand-written rc file that activates the same four tools with
 `eval "$(tool init zsh)"` or `bash`, against bx's. **Reported, never gated**:
 which tools you integrate is your choice, so any threshold here would be
-arbitrary.
+arbitrary. For zsh both homes activate the tools' real output, as *Captured
+output* below says; bash's read the stubs' own.
+
+**`prompt`** — zsh only: the same two homes as zsh's `net`, each timed to its
+first prompt rather than to `-c exit`. The shell reads its commands from an
+input holding `exit`, so before it reads that line it runs its `precmd` hooks
+(mise's and starship's) and expands `PROMPT`, which starts starship. At the
+first prompt mise's hook spawns `mise hook-env` only if something after
+activation changed `PATH` or a `MISE_*` variable; otherwise it returns without
+spawning. `RPROMPT` is drawn only by the line editor,
+which a start without a terminal does not run, so its spawn is not counted.
+**Reported, never gated**, as `net` is.
 
 **`spawn`** — on macOS only, where the gated `overhead` is bx's own share: the
 bx home against `own`, the same home without the stub starship's continuation
@@ -138,6 +149,21 @@ spawn is the tool's, and bx does not control it.
 - **The stub output is real shell**, not comments, so the shell genuinely
   parses it; and it is shell zsh and bash both run cleanly, since the example
   activates each tool for both.
+- **Captured output.** The stubs' own output is a few kilobytes of plain
+  functions, and the real tools print far more and do work as it loads: mise's
+  output runs `mise hook-env` and two command substitutions, and fzf's opens
+  and closes with a capture of the shell's options. So zsh's `net` and `prompt`
+  read two more homes, `legacy-real` and `bx-real`, in which each stub prints
+  the real tool's output captured in `tests/fixtures/activation/` instead of
+  its own: `BX_BENCH_CAPTURED`, set in those homes and in the `bx apply` of
+  `bx-real`, names that directory. The stubs put themselves in place of the
+  capturing machine's paths, and the stub mise prints the `PATH` it ran with,
+  as the real one prints the `PATH` it inherited. They stay hermetic: the stub
+  mise answers `mise hook-env` itself, and the native starship stub answers
+  every prompt, so nothing needs the real tools installed. The run refuses to
+  measure unless bx cached every tool's captured output in `bx-real`. The gated
+  measurements keep the stubs' own output: the captured output's load-time
+  work is the tools', which bx does not control, and the budget is about bx.
 - **Primed.** Each fixture runs once before timing so `compinit`'s dump exists,
   and the `net` measurement warms up further before recording.
 - **Medians.** The gate reads a median of differences, so a start the
@@ -186,12 +212,13 @@ run.sh                    the harness
 fixtures/baseline/        the account's own zshrc and bashrc, no integrations
 fixtures/bx/              the example configuration, applied into a copy of baseline
 fixtures/legacy/          baseline + eval "$(tool init)" per tool
-stubs/                    stand-ins for starship, zoxide, mise, fzf
+stubs/                    stand-ins for starship, zoxide, mise, fzf, printing their
+                          own output, or the real tools' from tests/fixtures/activation
 results/                  hyperfine JSON per measurement, round and shell (gitignored)
 ```
 
 `BX_BENCH_RUNS` (default 50) sets the minimum runs per fixture of the `net`
-measurement, and the runs per fixture of the `overhead` measurement, two in
+and `prompt` measurements, and the runs per fixture of the `overhead` measurement, two in
 each of its rounds. `BX_BENCH_ROUNDS` sets the rounds directly; the macOS job
 sets it to 50, since its noisier runner needs more rounds for the same noise,
 and a round there is only four zsh or bash starts.

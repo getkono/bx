@@ -30,7 +30,11 @@
 #             never gated: the spawn is the tool's, not bx's.
 #   net       a hand-written `eval "$(tool init)"` rc file vs bx's. Reported,
 #             never gated: it depends on which tools are integrated, so a
-#             threshold would be arbitrary.
+#             threshold would be arbitrary. For zsh both homes activate the
+#             tools' real output, captured in tests/fixtures/activation.
+#   prompt    zsh only: the same two homes as zsh's net, each timed to its
+#             first prompt, so precmd hooks and the prompt's expansion count.
+#             Reported, never gated, as net is.
 #
 # And, gated, invariant 6 traced on the running shells: any process started
 # while bx's own startup lines ran alone, which must be none, and the files
@@ -135,13 +139,31 @@ bx) echo "Counting the stub starship's continuation spawn in the overhead." ;;
 own) echo "Gating bx's own share; the stub starship's continuation spawn is reported apart." ;;
 esac
 SEARCH="${WORK}/bin:${BENCH_DIR}/stubs:/usr/local/bin:/usr/bin:/bin"
+# The real tools' zsh output, which the stubs print instead of their own in the
+# homes named `*-real`: its size and its load-time work (mise's hook-env, which
+# the stub mise answers, and the substitutions mise and fzf run as they load)
+# are what a zsh start with the real tools pays. The gated measurements keep
+# the stubs' own output, since that load-time work is the tools', not bx's.
+CAPTURED="$(dirname "$BENCH_DIR")/tests/fixtures/activation"
+for out in mise-activate-zsh starship-init-zsh zoxide-init-zsh fzf-zsh; do
+	[ -r "${CAPTURED}/${out}.zsh" ] || {
+		echo "error: no captured activation output at ${CAPTURED}/${out}.zsh." >&2
+		exit 1
+	}
+done
+captured() { # captured <fixture>: the environment its tools print captured output in
+	case "$1" in
+	*-real) echo "BX_BENCH_CAPTURED=${CAPTURED}" ;;
+	esac
+}
 
-for f in baseline legacy bx; do
+for f in baseline legacy legacy-real bx; do
 	mkdir -p "${WORK}/${f}"
 done
 for rc in .zshrc .bashrc; do
 	cp "${BENCH_DIR}/fixtures/baseline/${rc}" "${WORK}/baseline/${rc}"
 	cp "${BENCH_DIR}/fixtures/legacy/${rc}" "${WORK}/legacy/${rc}"
+	cp "${BENCH_DIR}/fixtures/legacy/${rc}" "${WORK}/legacy-real/${rc}"
 	# The bx home starts as the baseline does.
 	cp "${BENCH_DIR}/fixtures/baseline/${rc}" "${WORK}/bx/${rc}"
 done
@@ -192,17 +214,32 @@ path = "~/.local/share/zsh/zsh-autosuggestions"
 enabled = false
 TOML
 
-bx() { # bx <args>: the real binary, in the bx home, with nothing inherited
-	env -i HOME="${WORK}/bx" PATH="$SEARCH" "$BX" "$@" >"${WORK}/bx.log" 2>&1 || {
+bx() { # bx <home> <args>: the real binary, in that home, with nothing inherited
+	home="$1"
+	shift
+	# shellcheck disable=SC2046 # one assignment or none; the paths hold no whitespace.
+	env -i HOME="${WORK}/${home}" PATH="$SEARCH" $(captured "$home") "$BX" "$@" \
+		>"${WORK}/bx.log" 2>&1 || {
 		status=$?
-		echo "error: \`bx $*\` exited ${status}:" >&2
+		echo "error: \`bx $*\` exited ${status} in the ${home} home:" >&2
 		cat "${WORK}/bx.log" >&2
 		exit 1
 	}
 }
-bx apply --yes
-# Converged, so what is measured is exactly what bx leaves in place.
-bx plan
+# The same home again, applied while the tools print their captured output.
+cp -R "${WORK}/bx" "${WORK}/bx-real"
+for home in bx bx-real; do
+	bx "$home" apply --yes
+	# Converged, so what is measured is exactly what bx leaves in place.
+	bx "$home" plan
+done
+# The real home measures the real output only if bx cached it, every tool's.
+for marker in _mise_hook_precmd prompt_starship_precmd __zoxide_hook fzf-file-widget; do
+	grep -qsF "$marker" "${WORK}/bx-real/.local/share/bx/"*.zsh || {
+		echo "error: bx cached no captured output holding ${marker} to measure." >&2
+		exit 1
+	}
+done
 
 # The hook is measured only if bx generated it: each shell's interactive file
 # must register it, or the number below says nothing about it.
@@ -213,10 +250,14 @@ for hook in 'precmd_functions+=(__bx_update)' "PROMPT_COMMAND+=('\${BX_UPDATE_HO
 	}
 done
 
+REACH="exit" # how far a start goes: `exit` at once, or to its first `prompt`
 startup() { # startup <shell> <fixture>: the command that starts it, as one line
-	case "$1" in
-	zsh) echo "zsh -d -i -c exit" ;;
-	bash) echo "bash --rcfile ${WORK}/${2}/.bashrc -i -c exit" ;;
+	case "$1-$REACH" in
+	zsh-exit) echo "zsh -d -i -c exit" ;;
+	# Reading its commands from the input `run` gives it, which is `exit`, zsh
+	# runs its precmd hooks and expands PROMPT before it reads that line.
+	zsh-prompt) echo "zsh -d -i" ;;
+	bash-exit) echo "bash --rcfile ${WORK}/${2}/.bashrc -i -c exit" ;;
 	esac
 }
 
@@ -473,7 +514,8 @@ prime() { # prime <shell> <fixture>...: start each once, so compinit's dump exis
 	shift
 	for f in "$@"; do
 		# shellcheck disable=SC2046
-		env -i HOME="${WORK}/${f}" PATH="$SEARCH" $(startup "$sh" "$f") >/dev/null 2>&1 || true
+		env -i HOME="${WORK}/${f}" PATH="$SEARCH" $(captured "$f") $(startup "$sh" "$f") \
+			>/dev/null 2>&1 || true
 	done
 }
 run() { # run <name> <shell> <warmup> <count> <fixture>...: one hyperfine, in that order
@@ -486,11 +528,14 @@ run() { # run <name> <shell> <warmup> <count> <fixture>...: one hyperfine, in th
 	for f in "$@"; do
 		# `env` rather than a `VAR=… cmd` prefix: --shell=none execs the
 		# command directly, so there is no shell to interpret an assignment.
-		cmds="${cmds} -n ${f} 'env -i HOME=${WORK}/${f} PATH=${SEARCH} $(startup "$sh" "$f")'"
+		cmds="${cmds} -n ${f} 'env -i HOME=${WORK}/${f} PATH=${SEARCH} $(captured "$f") $(startup "$sh" "$f")'"
 	done
-	eval "hyperfine --warmup ${warmup} ${count} --shell=none \
+	input="" # a start that reaches its first prompt reads `exit` there
+	[ "$REACH" = exit ] || input="--input ${WORK}/exit"
+	eval "hyperfine --warmup ${warmup} ${count} --shell=none ${input} \
 		--export-json '${RESULTS}/${name}-${sh}.json' ${cmds}" >/dev/null
 }
+echo exit >"${WORK}/exit"
 
 # bx's own share, which the macOS gate reads: the bx home as bx left it, but
 # with the cached starship output's continuation prompt set to the text the
@@ -535,12 +580,25 @@ measure() { # measure <shell> <name>: the overhead's rounds, as <name>-<round>
 	done
 }
 for sh in $SHELLS; do
-	prime "$sh" baseline legacy bx
+	prime "$sh" baseline legacy bx legacy-real bx-real
 	[ "$GATED" = bx ] || prime "$sh" "$GATED"
 	echo "Measuring bx's generated ${sh} startup files (budget ${BUDGET_MS} ms)..."
 	measure "$sh" overhead
-	echo "Measuring net effect vs a hand-written ${sh}rc..."
-	run net "$sh" 5 "--min-runs ${RUNS}" legacy bx
+	case "$sh" in
+	zsh)
+		# Only zsh's real output is captured, so only zsh's net reads it.
+		echo "Measuring net effect vs a hand-written ${sh}rc, with the tools' real output..."
+		run net "$sh" 5 "--min-runs ${RUNS}" legacy-real bx-real
+		echo "Measuring the time to a first ${sh} prompt, with the tools' real output..."
+		REACH="prompt"
+		run prompt "$sh" 5 "--min-runs ${RUNS}" legacy-real bx-real
+		REACH="exit"
+		;;
+	*)
+		echo "Measuring net effect vs a hand-written ${sh}rc..."
+		run net "$sh" 5 "--min-runs ${RUNS}" legacy bx
+		;;
+	esac
 	[ "$GATED" = bx ] || {
 		echo "Measuring the stub starship's continuation spawn in ${sh}..."
 		run spawn "$sh" 5 "--min-runs ${RUNS}" "$GATED" bx
@@ -566,7 +624,7 @@ def order(name):
     # The order run.sh gave the fixtures in: odd rounds are baseline bx bx
     # baseline, even rounds their mirror. In the rounds, "bx" is the fixture
     # the gate reads: on macOS, `own`, bx's home without the tool's spawn.
-    if name == "net":
+    if name in ("net", "prompt"):
         return ["legacy", "bx"]
     if name == "spawn":
         return ["own", "bx"]
@@ -658,10 +716,19 @@ for shell in shells:
         apart = medians("spawn", shell)
         info(f"  spawn      {apart['bx'] - apart['own']:7.2f} ms   "
              "the stub starship's continuation prompt; the tool's, not gated")
+    # A shell timed to its first prompt is one whose net reads the tools'
+    # captured real output too; the other's reads the stubs' own.
+    prompted = os.path.exists(f"{results}/prompt-{shell}.json")
     print()
-    print(f"  legacy     {net['legacy']:7.2f} ms   eval \"$(tool init)\" per tool")
+    print(f"  legacy     {net['legacy']:7.2f} ms   eval \"$(tool init)\" per tool"
+          + (", the tools' real output" if prompted else ""))
     print(f"  bx         {net['bx']:7.2f} ms   the same tools, cached by bx")
     print(f"  saved      {net['legacy'] - net['bx']:7.2f} ms")
+    if prompted:
+        first = medians("prompt", shell)
+        print(f"  legacy     {first['legacy']:7.2f} ms   the same, to the first prompt")
+        print(f"  bx         {first['bx']:7.2f} ms   the same, to the first prompt")
+        print(f"  saved      {first['legacy'] - first['bx']:7.2f} ms")
 
 print()
 for shell, overhead, why in failed:

@@ -1,4 +1,12 @@
 #!/bin/sh
 # Stand-in for zoxide: emits an init block of representative size, then exits.
 # The process spawn is the point — it is what `eval "\$(zoxide init zsh)"` costs.
+#
+# With BX_BENCH_CAPTURED naming tests/fixtures/activation, `zoxide init zsh`
+# prints the real tool's captured output instead. It starts zoxide only from
+# its chpwd hook and its commands, never as it loads or at a prompt.
+set -eu
+if [ -n "${BX_BENCH_CAPTURED-}" ] && [ "${2-}" = zsh ]; then
+	exec cat "${BX_BENCH_CAPTURED}/zoxide-init-zsh.zsh"
+fi
 exec "$(dirname "$0")/gen.sh" zoxide 20

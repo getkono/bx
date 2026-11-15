@@ -684,11 +684,11 @@ pub fn restore_undeclared_with(
 /// a removal that stops part way leaves an entry that is never taken for a
 /// finished checkout. Nor is it taken for an interrupted clone, whose
 /// directory holds only what bx put there: the user may have added to what
-/// is left before the next run, so the next `rm`, and the next `apply`,
-/// asks git about it again as [`external::kept_by_rm`] does, and removes it
-/// only when that keeps nothing. A clone bx never finished stays
-/// [`clone_written`] of `None` while it goes. The entry is forgotten and saved only once the
-/// directory is gone; the directories bx created for it are then removed
+/// is left before the next run, so the next `rm` or `apply` asks git about
+/// it again, as [`external::kept_by_rm`] does, and removes it only when that
+/// keeps nothing. A clone bx never finished stays [`clone_written`] of `None`
+/// while it goes. The entry is forgotten and saved only once the directory
+/// is gone; the directories bx created for it are then removed
 /// where empty, and a claim on one that still stands is handed to an entry
 /// beneath it, as a session hands a removed file's claims.
 ///

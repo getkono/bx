@@ -200,3 +200,60 @@ fn take_over_a_retargeted_link_and_rm_restores_the_users_text() {
     rm(&home);
     assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/theirs"));
 }
+
+/// Whether `report`'s only row is left with nothing to ask: no question, and
+/// no note saying `apply` asks.
+fn asks_nothing(report: &Report) -> bool {
+    let notes = report.changes[0].note.as_deref().unwrap_or_default();
+    report.questions.is_empty() && !notes.contains(decide::ASK)
+}
+
+#[test]
+fn a_file_bx_attached_to_another_way_is_refused_and_not_asked_about() {
+    let home = guarded_home();
+    own(
+        home.path(),
+        ".a",
+        b"# >>> bx >>>\nold\n# <<< bx <<<\n",
+        Mechanism::Region { comment: '#' },
+    );
+    home.write(".a", "theirs\n");
+
+    let planned = plan(&inputs(&home, &inline("~/.a", "bx\\n")));
+    assert_eq!(planned.actions(), vec![Action::Conflict]);
+    assert!(asks_nothing(&planned), "{:?}", planned.changes[0].note);
+}
+
+#[test]
+fn a_link_where_bx_owns_a_file_is_refused_and_not_asked_about() {
+    let home = guarded_home();
+    own(home.path(), ".tool", b"bx\n", Mechanism::Own);
+    std::fs::remove_file(home.child(".tool")).expect("unlink");
+    std::os::unix::fs::symlink("/opt/theirs", home.child(".tool")).expect("a link");
+
+    let planned = plan(&inputs(&home, &symlink("~/.tool", "/opt/two")));
+    assert_eq!(planned.actions(), vec![Action::Conflict]);
+    assert!(asks_nothing(&planned), "{:?}", planned.changes[0].note);
+}
+
+#[test]
+fn a_link_bx_made_and_nobody_touched_is_retargeted_without_asking() {
+    let home = guarded_home();
+    assert!(apply(&inputs(&home, &symlink("~/.tool", "/opt/one"))).executed);
+
+    let planned = plan(&inputs(&home, &symlink("~/.tool", "/opt/two")));
+    assert_eq!(planned.actions(), vec![Action::Modify]);
+    assert!(asks_nothing(&planned), "{:?}", planned.changes[0].note);
+}
+
+#[test]
+fn a_link_retargeted_to_the_text_bx_wants_is_unchanged_and_not_asked_about() {
+    let home = guarded_home();
+    assert!(apply(&inputs(&home, &symlink("~/.tool", "/opt/one"))).executed);
+    std::fs::remove_file(home.child(".tool")).expect("unlink");
+    std::os::unix::fs::symlink("/opt/two", home.child(".tool")).expect("retarget");
+
+    let planned = plan(&inputs(&home, &symlink("~/.tool", "/opt/two")));
+    assert_eq!(planned.actions(), vec![Action::Unchanged]);
+    assert!(asks_nothing(&planned), "{:?}", planned.changes[0].note);
+}

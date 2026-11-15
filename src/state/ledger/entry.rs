@@ -62,13 +62,20 @@ pub enum Mechanism {
     /// it — see [`clone_written`]. Its prior is always [`Prior::Absent`]: bx
     /// never clones into or over anything, so there was nothing there.
     ///
-    /// While bx is still populating the directory, or already removing it,
-    /// `written` is [`clone_written`] of `None`, the digest of the empty
-    /// string, which no commit id has. The entry is saved so before the first
-    /// byte of a clone lands and before the first byte of a removal goes, so a
-    /// run that stops part way leaves an entry that says the directory is
-    /// bx's and not a finished checkout: the next `apply` removes it and
-    /// clones again, and the next `rm` removes it.
+    /// While bx is still populating the directory, `written` is
+    /// [`clone_written`] of `None`, the digest of the empty string, which no
+    /// commit id has. The entry is saved so before the first byte of a clone
+    /// lands, so a run that stops part way leaves an entry that says the
+    /// directory is bx's and not a finished checkout: everything in it is
+    /// what bx put there, so the next `apply` removes it and clones again, and
+    /// the next `rm` removes it.
+    ///
+    /// While bx is removing a finished checkout, `written` is
+    /// [`clone_removing`] instead, saved before the first byte of the removal
+    /// goes. What a stopped removal leaves was the user's to add to in the
+    /// meantime, so the next run asks git about it again, as it would about
+    /// a finished checkout, and removes it only when nothing in it is
+    /// anyone's but the remote's.
     ///
     /// A unit variant, like [`Mechanism::Dir`], so the commit lives in the
     /// digest and every [`Mechanism`] stays the size it was. Added after
@@ -82,6 +89,14 @@ pub enum Mechanism {
 #[must_use]
 pub fn clone_written(rev: Option<&str>) -> ContentHash {
     ContentHash::of(rev.unwrap_or_default().as_bytes())
+}
+
+/// What a [`Mechanism::Clone`] entry records as [`LedgerEntry::written`] while
+/// bx removes a finished checkout: the digest of `removing`, which neither a
+/// commit id nor the empty string [`clone_written`] digests is.
+#[must_use]
+pub fn clone_removing() -> ContentHash {
+    ContentHash::of(b"removing")
 }
 
 /// A pointer to the bytes that were at a target before bx wrote it.

@@ -266,7 +266,7 @@ fn followed(externals: &[External], ledger: &LedgerView, home: &Path, git: &Git)
                 subject: external.path.to_string(),
                 origin: Some(external.origin.clone()),
                 note: format!(
-                    "follows `{}` and {why}; `git -C {} status` shows what is only here",
+                    "follows `{}` and {why}; `git -C {} status --ignored` shows what is only here",
                     follow.branch, external.path
                 ),
             });
@@ -626,12 +626,25 @@ mod tests {
         let externals = [external];
         assert_eq!(notes_of(&home, &externals), Vec::<String>::new());
 
+        // A file only the repository's ignore rules hide is work too, and the
+        // hint names the status that shows it.
+        std::fs::write(dest.join(".git/info/exclude"), ".env\n").unwrap();
+        std::fs::write(dest.join(".env"), "").unwrap();
+        assert_eq!(
+            notes_of(&home, &externals),
+            [
+                "~/ext follows `main` and holds 1 file(s) the repository ignores, which removing \
+              it would lose; `git -C ~/ext status --ignored` shows what is only here"
+            ]
+        );
+        std::fs::remove_file(dest.join(".env")).unwrap();
+
         std::fs::write(dest.join("scratch"), "").unwrap();
         assert_eq!(
             notes_of(&home, &externals),
             [
                 "~/ext follows `main` and has uncommitted changes or untracked files that removing \
-              it would lose; `git -C ~/ext status` shows what is only here"
+              it would lose; `git -C ~/ext status --ignored` shows what is only here"
             ]
         );
 
@@ -640,7 +653,7 @@ mod tests {
             notes_of(&home, &externals),
             [
                 "~/ext follows `main` and holds 1 commit(s) bx did not fetch, which removing it \
-              would lose; `git -C ~/ext status` shows what is only here"
+              would lose; `git -C ~/ext status --ignored` shows what is only here"
             ]
         );
     }

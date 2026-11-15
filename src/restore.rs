@@ -63,7 +63,7 @@ use crate::plan::external;
 use crate::recover;
 use crate::state::{
     self, Ledger, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, StateDir,
-    clone_written,
+    clone_removing, clone_written,
 };
 
 /// Everything that can go wrong restoring.
@@ -542,11 +542,12 @@ fn plan_restore_link(
 /// * nothing there is [`Restoration::AlreadyGone`];
 /// * a directory bx never finished cloning is [`Restoration::RemoveClone`] as
 ///   it stands — nothing in it was ever the user's;
-/// * a finished checkout is [`Restoration::RemoveClone`] only when
-///   `git status` shows nothing, ignored files aside, and every commit on any
-///   ref, `HEAD` and the stash is on a remote-tracking branch or is the
-///   commit bx left checked out. Anything else is a
-///   [`Restoration::Conflict`] naming it, and nothing is forgotten;
+/// * a finished checkout, and what a removal bx did not finish left of one,
+///   is [`Restoration::RemoveClone`] only when `git status` shows nothing,
+///   not even a file the repository ignores, and every commit on any ref,
+///   `HEAD` and the stash is on a remote-tracking branch or is the commit bx
+///   left checked out. Anything else is a [`Restoration::Conflict`] naming
+///   it, and nothing is forgotten;
 /// * anything that is not a directory is not what bx cloned: a conflict.
 fn plan_restore_clone(
     entry: &LedgerEntry,
@@ -679,11 +680,15 @@ pub fn restore_undeclared_with(
 /// forget it.
 ///
 /// Crash-safe by the ledger alone. Before the first byte goes, the entry is
-/// re-recorded as unfinished — [`clone_written`] of `None` — and saved, so a
-/// removal that stops part way leaves an entry the next `rm` removes whole
-/// and the next `apply` clones afresh, never a half-deleted directory taken
-/// for the user's checkout. The entry is forgotten and saved only once the
-/// directory is gone; the directories bx created for it are then removed
+/// re-recorded as a removal in progress — [`clone_removing`] — and saved, so
+/// a removal that stops part way leaves an entry that is never taken for a
+/// finished checkout. Nor is it taken for an interrupted clone, whose
+/// directory holds only what bx put there: the user may have added to what
+/// is left before the next run, so the next `rm` or `apply` asks git about
+/// it again, as [`external::kept_by_rm`] does, and removes it only when that
+/// keeps nothing. A clone bx never finished stays [`clone_written`] of `None`
+/// while it goes. The entry is forgotten and saved only once the directory
+/// is gone; the directories bx created for it are then removed
 /// where empty, and a claim on one that still stands is handed to an entry
 /// beneath it, as a session hands a removed file's claims.
 ///
@@ -708,10 +713,15 @@ pub(crate) fn remove_clone(
             Ok(Restored::AlreadyGone { target, dest })
         }
         Restoration::RemoveClone { dest, created_dirs } => {
+            let marker = if entry.written == clone_written(None) {
+                clone_written(None)
+            } else {
+                clone_removing()
+            };
             ledger
                 .record(NewEntry::new(
                     target.clone(),
-                    clone_written(None),
+                    marker,
                     entry.mode,
                     Mechanism::Clone,
                     PriorBytes::Absent,

@@ -1111,10 +1111,21 @@ fn zsh_loads_each_activation_compiled_as_the_tool_wrote_it_and_contains_a_broken
     let home = dir.path().display();
     let expected = format!("a'b $HOME|{home}/w|ok|zed\n");
     assert_eq!(sourced(&zsh, dir.path(), &file, probe), expected);
+    // The same without the wordcode: zsh reads the files themselves.
+    let activations = dir.path().join(".local/share/bx/activation");
+    let aside = dir.path().join("aside");
+    std::fs::rename(&activations, &aside).expect("moved");
+    std::fs::create_dir(&activations).expect("mkdir");
+    for name in ["quoted.zsh", "broken.zsh", "after.zsh"] {
+        std::fs::copy(aside.join(name), activations.join(name)).expect("copied");
+    }
+    assert_eq!(sourced(&zsh, dir.path(), &file, probe), expected);
+    std::fs::remove_dir_all(&activations).expect("removed");
+    std::fs::rename(&aside, &activations).expect("moved back");
 
     // What zsh loads is the wordcode: the file's text replaced, but left no
     // newer than its `.zwc`, is not read.
-    let quoted = dir.path().join(".local/share/bx/activation/quoted.zsh");
+    let quoted = activations.join("quoted.zsh");
     let mut zwc = quoted.clone().into_os_string();
     zwc.push(".zwc");
     let zwc = PathBuf::from(zwc);

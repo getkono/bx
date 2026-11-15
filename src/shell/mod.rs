@@ -82,8 +82,11 @@
 //! occurrence in an assigning position through [`crate::env_guard::check`]
 //! when its value is a readable literal, and refuses it when it is not, and
 //! [`activation::plan`] writes none of an output with a refusal. Every other
-//! line passes untouched. bx's own bytes there are one `eval` of a
-//! single-quoted literal holding the output, which set nothing. What the
+//! line passes untouched. bx's own bytes there set nothing: in zsh's file
+//! the guarded line a plugin is, sourcing the activation's own file
+//! ([`activation::file`]), which holds the output byte for byte beside the
+//! `.zwc` zsh compiled from it; in bash's one `eval` of a single-quoted
+//! literal holding the output. What the
 //! output's code runs later — `eval "$(mise hook-env)"` — is the tool's own
 //! behaviour at runtime, outside what bx emits.
 //!
@@ -106,8 +109,10 @@
 //! `starship init {shell}` — is run by [`activation::plan`] rather than at
 //! every shell start, once per shell it has a command for, trusted once two
 //! runs agree, and cached against the content of the tool's binary, so the
-//! `activations` and `completions` phases hold text, and bx's own lines in
-//! them start no process. There is no form that runs a tool's init at shell
+//! `activations` and `completions` phases hold text — in zsh's file a line
+//! sourcing a file of the output's own, which zsh loads from the wordcode
+//! the plan had it compile — and bx's own lines in them start no process.
+//! There is no form that runs a tool's init at shell
 //! start. The cached output is invariant 6's one exception: it is sourced
 //! exactly as the tool printed it, so what it runs still runs at every start,
 //! as it would under `eval "$(tool init)"` (starship's

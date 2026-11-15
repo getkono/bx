@@ -103,10 +103,12 @@
 //! has to run, and returns [`Step`]s that say which were reused, captured or
 //! omitted. `apply` does not decide again. It hands the same
 //! [`Plan`] to [`Plan::rendered`], whose text each interactive file carries
-//! and renders through [`contribute`], and to
-//! [`Plan::record`], which writes the captures into the cache it then saves. A
-//! second `plan` against an unchanged machine therefore reuses every entry,
-//! starts no process, and renders the same bytes.
+//! and renders through [`contribute`], to [`Plan::targets`], the files zsh's
+//! outputs and their wordcode are written as, and to
+//! [`Plan::record`], which writes the captures and the wordcode into the
+//! cache it then saves. A second `plan` against an unchanged machine
+//! therefore reuses every entry, starts no process — neither a tool nor zsh —
+//! and renders the same bytes.
 //!
 //! # Invariant 2
 //!
@@ -139,12 +141,17 @@
 //! `eval "$(mise hook-env)"` at every prompt — is the tool's own behaviour at
 //! runtime, not bytes bx emits, and is outside this judgement.
 //!
-//! What passes is rendered as **one `eval` statement whose single argument is
-//! a single-quoted literal** holding the tool's output byte for byte, so bx's
-//! own bytes set nothing and a malformed output fails inside its own `eval`
-//! rather than swallowing the rest of the file.
-//! `a_rendered_activation_is_one_eval_of_a_literal_and_sets_nothing_itself`
-//! holds the rendered bytes to that, and
+//! What passes is written **byte for byte**: for zsh into a file of its own,
+//! which zsh's interactive file sources with one guarded line, beside the
+//! `.zwc` zsh compiled from exactly those bytes ([`file`](mod@file)); for bash as **one
+//! `eval` statement whose single argument is a single-quoted literal** holding
+//! it. Either way bx's own bytes set nothing, and a malformed output fails
+//! inside its own file or its own `eval` rather than swallowing the rest of
+//! the interactive file.
+//! `a_rendered_activation_sets_nothing_itself_and_its_file_holds_the_output_byte_for_byte`
+//! holds the rendered bytes to that,
+//! `zsh_loads_each_activation_compiled_as_the_tool_wrote_it_and_contains_a_broken_one`
+//! runs them in zsh, compiled and not, and
 //! `every_assignment_to_a_relocating_variable_is_judged_by_the_guard` holds
 //! the search.
 

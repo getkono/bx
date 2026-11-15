@@ -121,6 +121,19 @@
 //! hook-env)"` — is the tool's own behaviour at runtime, outside what bx
 //! emits. [`crate::shell::activation::relocations`] is that search.
 //!
+//! For zsh that output is written to two generated files of its own,
+//! `~/.local/share/bx/activation/NAME.zsh` and its `.zwc`
+//! ([`crate::shell::activation::file`]), and both are that output, not new
+//! shell content of bx's: the first holds it byte for byte, and the second is
+//! zsh's own compilation of exactly those bytes, made by `zcompile` and never
+//! edited. The proof of their bytes is two tests:
+//! `a_rendered_activation_sets_nothing_itself_and_its_file_holds_the_output_byte_for_byte`
+//! holds the file to the judged output and the line the interactive file
+//! sources it with to the guarded `source` a plugin is, which sets nothing;
+//! and `zsh_loads_each_activation_compiled_as_the_tool_wrote_it_and_contains_a_broken_one`
+//! runs the interactive file in zsh with the `.zwc` and without it, to the
+//! same result. An output the search refuses writes neither file.
+//!
 //! Three files are under the no-assignment rule above. The first is the
 //! shell-init snippet: fixed text that sets no environment variable outside
 //! bx's own `BX_` namespace, and gets every other variable by sourcing a

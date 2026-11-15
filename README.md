@@ -384,6 +384,12 @@ says what the budget covers.
   on Linux the budget counts it, and on macOS the benchmark reports its cost
   apart and holds `bx`'s own share to the budget.
   Caching saves running the tool's init; it never changes what the init does.
+- For zsh, each tool's cached output is written byte for byte to a file of
+  its own under `~/.local/share/bx/activation/`, and `apply` has zsh compile
+  it to a `.zwc` beside it, so a shell start loads code zsh already parsed
+  instead of parsing the text again. A zsh of another version, or one with
+  no `.zwc`, reads the file itself. bash keeps one `eval` of the text, as it
+  has no compiled form to gain.
 - Beyond what your tools' output runs, the one process a shell ever starts on
   its own is an external's background
   check, after the first prompt, and only for an external you set to

@@ -1117,6 +1117,8 @@ fn t20_exit_follows_the_mode_and_whether_apply_wrote() {
     assert_eq!(exit(&carried, Mode::Sync), Exit::Converged);
 }
 
+/// A file bx owns whole that was edited since bx wrote it.
+mod edited;
 mod secrets;
 mod state_paths;
 mod tools;

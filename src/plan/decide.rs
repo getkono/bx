@@ -39,6 +39,7 @@ use self::parent::{Write, created_dirs, locked_parent, parent_note};
 pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
+use crate::config::env;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
@@ -506,10 +507,12 @@ pub(super) fn decide(
     };
     let claim = found == Action::Unchanged && action == Action::Modify;
     // A file bx owns whole that was deleted since bx wrote it, settled as git
-    // settles a deletion: see [`deleted`].
+    // settles a deletion: see [`deleted`]. A file bx generates for itself in
+    // its own data directory is not the user's to delete: see [`own_data`].
     let gone = matches!(target.attach, Attach::Own)
         && action == Action::Create
         && observed.kind == Kind::Absent
+        && !own_data(target)
         && entry.is_some_and(|entry| entry.mechanism == Mechanism::Own);
     let (action, note) = match entry {
         Some(entry) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
@@ -1227,6 +1230,24 @@ fn ownership(
         }
         _ => (action, note),
     }
+}
+
+/// Whether `target` is a file bx generates for itself in its own data
+/// directory, [`env::FRAGMENT_DIR`]: the shell fragments and bash's
+/// interactive file, which a region in the user's startup file sources.
+///
+/// The deletion rule ([`deleted`]) does not apply to one. Nothing the user
+/// wrote or declared is there, the guarded source line hides its loss, and
+/// every feature the configuration declares depends on it, so a deleted one is
+/// recreated like any missing file bx owns. That holds for a vacated
+/// fragment too, which the ledger still names.
+fn own_data(target: &Target) -> bool {
+    matches!(target.body, Body::Generated(_))
+        && target
+            .path
+            .as_str()
+            .strip_prefix(env::FRAGMENT_DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Settle a target bx made — a file it owns whole, or a symlink — that was

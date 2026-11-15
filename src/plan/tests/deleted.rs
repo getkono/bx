@@ -257,3 +257,48 @@ fn restoring_into_a_deleted_directory_announces_the_directory_it_creates() {
         b"bx\n"
     );
 }
+
+#[test]
+fn a_file_bx_generates_in_its_own_data_directory_is_recreated_not_asked_about() {
+    let home = guarded_home();
+    let env = |value: &str| {
+        format!("[[env]]\nname = \"EDITOR\"\nvalue = \"{value}\"\nkind = \"interactive\"\n")
+    };
+    let generated = [
+        config::env::Place::Zshrc.fragment(),
+        crate::shell::bash::FILE,
+    ];
+    let file = |path: &str| home.child(path.strip_prefix("~/").expect("under home"));
+    assert!(apply(&inputs(&home, &env("nvim"))).executed);
+    // Deleted while bx still wants what it wrote, and while it wants more.
+    for value in ["nvim", "vim"] {
+        for path in generated {
+            std::fs::remove_file(file(path)).expect("the deletion");
+        }
+        let inputs = inputs(&home, &env(value));
+
+        let planned = plan(&inputs);
+        assert!(planned.questions.is_empty(), "{:?}", planned.questions);
+        for path in generated {
+            let row = planned
+                .changes
+                .iter()
+                .find(|change| change.target == path)
+                .expect("the file's row");
+            assert_eq!(row.action, Action::Create, "{path}: {:?}", row.note);
+        }
+
+        // Approved with no answer, as `--yes` is: the files come back.
+        assert!(answer(&inputs, &[]).executed);
+        for path in generated {
+            assert!(file(path).exists(), "{path} is recreated");
+        }
+        let again = plan(&inputs);
+        assert!(
+            again.actions().iter().all(|a| *a == Action::Unchanged),
+            "{:?}",
+            again.actions()
+        );
+        assert!(again.questions.is_empty());
+    }
+}

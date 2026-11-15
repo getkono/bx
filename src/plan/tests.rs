@@ -230,9 +230,11 @@ fn t4_an_owned_file_edited_since_bx_wrote_it_is_a_conflict_not_overwritten() {
     let report = plan(&inputs);
     assert_eq!(report.actions(), vec![Action::Conflict]);
     assert_eq!(
-        report.changes[0].note.as_deref(),
-        Some("edited since bx last wrote it")
+        report.changes[0].note,
+        Some(format!("edited since bx last wrote it; {}", decide::ASK))
     );
+    assert_eq!(report.questions.len(), 1, "apply asks about it");
+    assert_eq!(report.questions[0].row, 0);
 
     let applied = apply(&inputs);
     assert!(!applied.executed, "nothing to write, so no session");

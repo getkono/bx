@@ -100,6 +100,11 @@ pub(super) struct Decided {
     pub agreed: Vec<Agreed>,
     /// The directories the session is to declare before its first write.
     pub declared: Declared,
+    /// Each file bx owns whole that was edited since bx wrote it, by index
+    /// into [`Decided::changes`], with the write that takes bx's bytes over
+    /// the edit. Its row is a conflict, and `apply` makes the write only for
+    /// a row the user answered with *take bx's* — never by default.
+    pub held: Vec<(usize, Op)>,
 }
 
 /// Decide every target of a configuration.
@@ -164,6 +169,7 @@ pub(super) fn decide_all(
     };
     let mut carries = Vec::new();
     let mut agreed = Vec::new();
+    let mut held = Vec::new();
     for (at, resolution) in resolutions.iter().enumerate() {
         if rows[at].is_some() {
             continue;
@@ -181,8 +187,13 @@ pub(super) fn decide_all(
             continue;
         }
         let (change, op) = decide(resolution, &files)?;
+        // A conflict that carries a write is an edited file's, held back
+        // until it is answered.
+        match op {
+            Some(op) if change.action == Action::Conflict => held.push((at, op)),
+            op => ops.extend(op),
+        }
         rows[at] = Some(change);
-        ops.extend(op);
     }
     Ok(Decided {
         changes: rows.into_iter().flatten().collect(),
@@ -190,6 +201,7 @@ pub(super) fn decide_all(
         carries,
         agreed,
         declared,
+        held,
     })
 }
 
@@ -213,6 +225,9 @@ pub(super) struct Op {
     /// Whether this is a tracked target's copy on this machine carried into
     /// the repo, which only `sync` writes.
     carry: bool,
+    /// Whether the bytes this write leaves are kept in `restore/` as the base
+    /// a later edit of them is diffed from: see [`Op::base`].
+    base: bool,
 }
 
 /// What an [`Op`] leaves at its destination.
@@ -242,6 +257,50 @@ impl Op {
     /// The target the write is for.
     pub(super) const fn target(&self) -> &Portable {
         &self.target
+    }
+
+    /// The bytes this write leaves, when `apply` keeps them in `restore/`
+    /// under their digest — which is the [`LedgerEntry::written`] the write
+    /// records — as the base a later edit of the file is measured from.
+    ///
+    /// Only a file bx owns whole keeps one, and only one whose body is not a
+    /// secret, so no plaintext reaches the state directory, and of at most
+    /// [`Base::KEPT_WHOLE`] bytes, the bound a tracked target's agreement is
+    /// kept whole under.
+    pub(super) fn base(&self) -> Option<&[u8]> {
+        match &self.made {
+            Made::Bytes(bytes) if self.base && self.claimed && !self.carry => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// The three-way view of a file edited since bx wrote it, which `apply`
+    /// asks about: `base`, the bytes bx last wrote, against what is on disk
+    /// now, then against what bx wants there.
+    ///
+    /// `None` where there is no such view to show: a write that is not a whole
+    /// file bx keeps a base for, no `base` kept, or a side that is not shown
+    /// line by line. The row's own diff is all there is then.
+    pub(super) fn three_way(&self, base: Option<&[u8]>) -> Option<Diff> {
+        let wanted = self.base()?;
+        let base = base?;
+        let disk = self.planned.bytes.as_deref()?;
+        let target = self.target.as_str();
+        let mut texts = Vec::new();
+        for (label, side) in [("on disk", disk), ("bx wants", wanted)] {
+            // A side still holding what bx wrote has nothing to show: the
+            // common case, a file edited while its body stayed as it was.
+            match Diff::labelled(target, ("bx wrote", label), Some(base), side, None) {
+                None => {}
+                Some(Diff {
+                    kind: super::diff::DiffKind::Text(text),
+                }) => texts.push(text),
+                Some(_) => return None,
+            }
+        }
+        (!texts.is_empty()).then_some(Diff {
+            kind: super::diff::DiffKind::Texts(texts),
+        })
     }
 
     /// The journal request that makes this write: bx owning the whole file,
@@ -411,18 +470,27 @@ pub(super) fn decide(
         _ => ownership(found, &observed, entry, note),
     };
     let claim = found == Action::Unchanged && action == Action::Modify;
+    // A file bx owns whole whose bytes someone else changed since: the one
+    // conflict `apply` asks about, at a terminal, rather than only skipping.
+    let edited = found == Action::Modify
+        && action == Action::Conflict
+        && matches!(target.attach, Attach::Own)
+        && entry.is_some_and(|entry| {
+            entry.mechanism == Mechanism::Own && observed.digest() != Some(entry.written)
+        });
 
     // A write into a directory its owner cannot write or search is refused
     // here, so `apply` never reaches `stage` for it. A row with no write is
     // left as it is: there is nothing to refuse. A claim is a write only so
     // the ledger can record it, and a file already right is no conflict: it
-    // stays unchanged and unclaimed until its directory takes a write.
-    let (action, note) = match (
-        action.is_pending(),
-        locked_parent(&observed, ctx.home, ctx.declared, Write::File),
-    ) {
+    // stays unchanged and unclaimed until its directory takes a write. An
+    // edited file is asked about only where its write could land.
+    let locked = locked_parent(&observed, ctx.home, ctx.declared, Write::File);
+    let ask = edited && locked.is_none();
+    let (action, note) = match (action.is_pending(), locked) {
         (true, Some(_)) if claim => (Action::Unchanged, unclaimed),
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
+        _ if ask => (action, join([note, Some(ASK.to_string())])),
         _ => (action, note),
     };
 
@@ -467,7 +535,11 @@ pub(super) fn decide(
         _ => note,
     };
     let change = row(action, diff, note);
-    let op = action.is_pending().then(|| Op {
+    // An edited file's row is a conflict that carries the write taking bx's
+    // bytes, which `apply` makes only once it is answered so: see
+    // [`Decided::held`].
+    let base = !secret && matches!(target.attach, Attach::Own) && bytes.len() <= Base::KEPT_WHOLE;
+    let op = (action.is_pending() || ask).then(|| Op {
         target: target.path.clone(),
         dest,
         made: match target.attach {
@@ -478,9 +550,14 @@ pub(super) fn decide(
         mode,
         claimed: true,
         carry: false,
+        base,
     });
     Ok((change, op))
 }
+
+/// The note an edited file's row ends with: what `apply` does about it.
+pub(super) const ASK: &str = "bx apply asks at a terminal whether to keep your edit or take bx's \
+                              bytes, keeping yours for bx rm";
 
 /// The whole file a region target leaves, and the mode it leaves it at.
 ///
@@ -920,6 +997,7 @@ fn track_onto_machine(
         mode,
         claimed: observed.kind == Kind::Absent || ctx.ledger.get(&target.path).is_some(),
         carry: false,
+        base: false,
     };
     Ok((row(action, diff, note), Some(op)))
 }
@@ -972,6 +1050,7 @@ fn track_into_repo(
         mode,
         claimed: true,
         carry: true,
+        base: false,
     };
     Ok((row(Action::Sync, diff, Some(note)), Some(op)))
 }
@@ -1004,6 +1083,15 @@ fn ownership(
             ))
         }
         (Action::Unchanged, None) => (Action::Modify, join([Some(CLAIM.to_string()), note])),
+        // Already what bx wants, and not what the ledger says bx left: the
+        // file was brought to the wanted bytes by someone else. Recorded again
+        // as a claim is, so the next change to the body is a modify rather
+        // than an edit nobody made.
+        (Action::Unchanged, Some(entry))
+            if entry.mechanism == Mechanism::Own && observed.digest() != Some(entry.written) =>
+        {
+            (Action::Modify, join([Some(REFRESH.to_string()), note]))
+        }
         (Action::Modify, None) => conflict("exists and bx does not own it".to_string()),
         (Action::Modify, Some(entry)) if observed.digest() != Some(entry.written) => {
             conflict("edited since bx last wrote it".to_string())
@@ -1022,6 +1110,11 @@ fn ownership(
 /// that already holds what the target wants.
 pub(super) const CLAIM: &str =
     "already holds what bx wants; bx takes ownership of it and leaves its bytes as they are";
+
+/// The note a refreshed claim's row carries: a file bx owns that already
+/// holds what the target wants, though not what bx last wrote.
+pub(super) const REFRESH: &str = "already holds what bx wants, though not what bx last wrote; bx \
+                                  records it as its own again and leaves its bytes as they are";
 
 /// How a ledger mechanism reads in a note.
 pub(super) const fn attached_as(mechanism: &Mechanism) -> &'static str {

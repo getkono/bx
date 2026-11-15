@@ -102,6 +102,7 @@ pub(super) fn decide_link(
         mode: Mode::LINK,
         claimed: true,
         carry: false,
+        base: false,
     });
     Ok((change, op))
 }

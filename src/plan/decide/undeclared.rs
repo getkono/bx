@@ -195,6 +195,7 @@ fn take_back(
             mode,
             claimed: false,
             carry: false,
+            base: false,
         }))
     };
     let then = |what: &str| format!("{UNDECLARED}, so apply {what}");

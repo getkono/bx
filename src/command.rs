@@ -141,7 +141,52 @@ pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 /// prompt abandoned with Esc or Ctrl-C is not an error: it is said in a line
 /// and exits [`Exit::Canceled`].
 pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
-    apply_with(env, yes, out, &mut confirm)
+    apply_answering(env, yes, out, &mut confirm, &mut ask_edited)
+}
+
+/// What the user answered about one file edited since bx wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// Leave the edit as it is and skip the file, as every conflict is.
+    Keep,
+    /// Write bx's bytes over the edit, which `bx rm` then restores.
+    Take,
+    /// Show the three-way view, then ask again.
+    Show,
+}
+
+/// The choices [`ask_edited`] offers, in the order it lists them: the first
+/// is the default, so a bare Enter keeps the edit.
+const CHOICES: [(&str, Answer); 3] = [
+    ("keep mine", Answer::Keep),
+    ("take bx's", Answer::Take),
+    ("show the three-way diff", Answer::Show),
+];
+
+/// Ask on the terminal what to do about the file `question` names.
+///
+/// What is typed ahead is discarded first, as [`confirm`] does, so a stray
+/// `y` never takes bx's bytes over an edit. Everything around this — which
+/// files are asked about, `yes`, no terminal, the view — is decided in
+/// [`converge_answering`] and tested through its `settle` seam.
+fn ask_edited(question: &str) -> Result<Answer, Error> {
+    discard_typeahead(std::io::stdin());
+    let labels: Vec<&str> = CHOICES.iter().map(|(label, _)| *label).collect();
+    let picked = inquire::Select::new(question, labels)
+        .with_starting_cursor(0)
+        .prompt()
+        .map_err(confirmation_failed)?;
+    Ok(CHOICES
+        .iter()
+        .find(|(label, _)| *label == picked)
+        .map_or(Answer::Keep, |(_, answer)| *answer))
+}
+
+/// The answer a run that asks nothing gives every edited file: keep it.
+/// `bx init`, `bx update` and `bx upgrade` settle their plans with it, so
+/// only `bx apply` and `bx sync` ever write over an edit.
+pub(crate) fn keep_mine(_: &str) -> Result<Answer, Error> {
+    Ok(Answer::Keep)
 }
 
 /// Ask on the terminal whether to write.
@@ -183,14 +228,28 @@ fn confirmation_failed(error: inquire::InquireError) -> Error {
     }
 }
 
-/// [`apply`], with the question asked through `ask`.
+/// [`apply`], with the question asked through `ask`, and every edited file
+/// kept.
+#[cfg(test)]
 fn apply_with(
     env: &Env,
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, Error> {
-    match converge(env, Mode::Apply, yes, out, ask) {
+    apply_answering(env, yes, out, ask, &mut keep_mine)
+}
+
+/// [`apply`], with the confirmation asked through `ask` and each question
+/// about an edited file through `settle`.
+fn apply_answering(
+    env: &Env,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, Error>,
+    settle: &mut dyn FnMut(&str) -> Result<Answer, Error>,
+) -> Result<Exit, Error> {
+    match converge(env, Mode::Apply, yes, out, ask, settle) {
         Ok(report) => Ok(plan::exit(&report, Mode::Apply)),
         // The question comes before the first write, so walking away from it
         // leaves the plan as it was shown.
@@ -212,13 +271,22 @@ fn converge(
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
+    settle: &mut dyn FnMut(&str) -> Result<Answer, Error>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
     let mut declined = false;
-    let report = converge_inputs(&inputs, env, mode, yes, out, ask, &mut |_, approved| {
-        declined = !approved;
-        approved
-    })?;
+    let report = converge_answering(
+        &inputs,
+        env,
+        mode,
+        yes,
+        out,
+        (ask, settle),
+        &mut |_, approved| {
+            declined = !approved;
+            approved
+        },
+    )?;
     // An offer judged against a bx.lock this machine no longer has — a sync
     // just brought in another machine's — is withdrawn and checked again, once
     // that lock is applied: approved, or with nothing to apply. A declined,
@@ -247,13 +315,57 @@ pub(crate) fn converge_inputs(
     ask: &mut dyn FnMut() -> Result<bool, Error>,
     decided: &mut dyn FnMut(&Report, bool) -> bool,
 ) -> Result<Report, Error> {
+    converge_answering(inputs, env, mode, yes, out, (ask, &mut keep_mine), decided)
+}
+
+/// The two kinds of question a writing run puts: the one confirmation, and
+/// one about each file edited since bx wrote it.
+type Prompts<'a> = (
+    &'a mut dyn FnMut() -> Result<bool, Error>,
+    &'a mut dyn FnMut(&str) -> Result<Answer, Error>,
+);
+
+/// [`converge_inputs`], with each file edited since bx wrote it asked about
+/// through `settle` before the one confirmation.
+///
+/// A file is asked about only at a terminal and without `yes`: with either
+/// missing every edited file is kept, as every conflict is, so `--yes` never
+/// writes over an edit. Each answer of *show* draws the three-way view and
+/// asks again. Where the questions were the only work and every answer kept
+/// the edit, the confirmation is not put and nothing is written.
+pub(crate) fn converge_answering(
+    inputs: &Inputs,
+    env: &Env,
+    mode: Mode,
+    yes: bool,
+    out: &mut dyn Write,
+    (ask, settle): Prompts<'_>,
+    decided: &mut dyn FnMut(&Report, bool) -> bool,
+) -> Result<Report, Error> {
     let mut shown = false;
-    let report = plan::run(inputs, mode, &mut |report| {
+    let report = plan::answered(inputs, mode, &mut |report| {
+        let asking = !yes && env.stdin_tty && !report.questions.is_empty();
+        // Nothing to write and nothing to ask: the plan is shown as any plan
+        // with nothing to do is, once the run returns.
+        if !report.work && !asking {
+            return Ok(plan::Approval::from(false));
+        }
         emit(out, report, View::Plan, env)?;
         // On screen before the question about it is put, whatever buffers
         // the output.
         out.flush().map_err(Error::Output)?;
         shown = true;
+        let mut taken = std::collections::BTreeSet::new();
+        if asking {
+            for question in &report.questions {
+                if settled(out, env, report, question, settle)? == Answer::Take {
+                    taken.insert(question.row);
+                }
+            }
+        }
+        if !report.work && taken.is_empty() {
+            return Ok(plan::Approval::from(false));
+        }
         let approved = if yes {
             true
         } else if env.stdin_tty {
@@ -261,7 +373,10 @@ pub(crate) fn converge_inputs(
         } else {
             return Err(Error::NeedsConfirmation);
         };
-        Ok(decided(report, approved))
+        Ok(plan::Approval {
+            approved: decided(report, approved),
+            taken,
+        })
     })?;
 
     if !shown {
@@ -293,6 +408,34 @@ pub(crate) fn converge_inputs(
         writeln!(out, "Nothing was applied.").map_err(Error::Output)?;
     }
     Ok(report)
+}
+
+/// Ask `settle` about the edited file `question` names until it answers keep
+/// or take, drawing the three-way view each time it answers show.
+fn settled(
+    out: &mut dyn Write,
+    env: &Env,
+    report: &Report,
+    question: &plan::Question,
+    settle: &mut dyn FnMut(&str) -> Result<Answer, Error>,
+) -> Result<Answer, Error> {
+    let change = &report.changes[question.row];
+    let asked = format!(
+        "{} was edited since bx last wrote it. Keep your edit, or take bx's bytes?",
+        report::escape(&change.target)
+    );
+    loop {
+        match settle(&asked)? {
+            Answer::Show => {
+                let palette = Palette::resolve(env.no_color, env.stdout_tty).within(env.columns);
+                let view =
+                    plan::render_row(change, question.three_way.as_ref(), palette, &env.home);
+                page(out, &view, env)?;
+                out.flush().map_err(Error::Output)?;
+            }
+            answer => return Ok(answer),
+        }
+    }
 }
 
 /// `bx sync`: fast-forward the config repo from its upstream, apply exactly as
@@ -328,7 +471,13 @@ pub(crate) fn converge_inputs(
 /// [`sync::Error::Busy`] while another sync, update or check holds
 /// `update/check.lock`, and [`sync::Error::Lock`] when it cannot be taken.
 pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Error> {
-    sync_with(env, yes, out, &Git::new(env), &mut confirm)
+    sync_answering(
+        env,
+        yes,
+        out,
+        &Git::new(env),
+        (&mut confirm, &mut ask_edited),
+    )
 }
 
 /// The line `sync` and `update` say after a pull that moved the branch.
@@ -354,13 +503,26 @@ pub(crate) fn committed_carry(carried: usize, pulled: &sync::Pulled) -> String {
     format!("Committed {carried} tracked file(s) to {}.", pulled.branch)
 }
 
-/// [`sync`], through `git`, with the question asked through `ask`.
+/// [`sync`], through `git`, with the question asked through `ask`, and every
+/// edited file kept.
+#[cfg(test)]
 fn sync_with(
     env: &Env,
     yes: bool,
     out: &mut dyn Write,
     git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
+) -> Result<Exit, sync::Error> {
+    sync_answering(env, yes, out, git, (ask, &mut keep_mine))
+}
+
+/// [`sync`], through `git`, with its questions put through `prompts`.
+fn sync_answering(
+    env: &Env,
+    yes: bool,
+    out: &mut dyn Write,
+    git: &Git,
+    (ask, settle): Prompts<'_>,
 ) -> Result<Exit, sync::Error> {
     // Held to the end, so no `bx update` in another shell commits or pushes
     // between this pull and this push, and this never runs inside its own.
@@ -376,7 +538,7 @@ fn sync_with(
     if pulled.recovered > 0 {
         writeln!(out, "{}", recovered_carry(&pulled)).map_err(sync::Error::Output)?;
     }
-    let report = match converge(env, Mode::Sync, yes, out, ask) {
+    let report = match converge(env, Mode::Sync, yes, out, ask, settle) {
         Ok(report) => report,
         // Nothing was carried, so there is nothing to commit, and a push is
         // for an apply that left nothing undone.
@@ -757,7 +919,7 @@ fn init_with(
         }
     }
 
-    let report = match converge(env, Mode::Apply, yes, out, confirm) {
+    let report = match converge(env, Mode::Apply, yes, out, confirm, &mut keep_mine) {
         Ok(report) => report,
         Err(Error::Canceled) => {
             return init_canceled(
@@ -1129,10 +1291,16 @@ fn show(env: &Env, view: View, out: &mut dyn Write) -> Result<Exit, Error> {
 fn emit(out: &mut dyn Write, report: &Report, view: View, env: &Env) -> Result<(), Error> {
     let palette = Palette::resolve(env.no_color, env.stdout_tty).within(env.columns);
     let text = plan::render(report, view, palette, &env.home);
-    if let Some(pager) = env.pager_for(&text) {
+    page(out, &text, env)
+}
+
+/// Write `text` to `out`, or through the pager when it is taller than the
+/// terminal.
+fn page(out: &mut dyn Write, text: &str, env: &Env) -> Result<(), Error> {
+    if let Some(pager) = env.pager_for(text) {
         // What is already written goes first, ahead of what the pager shows.
         out.flush().map_err(Error::Output)?;
-        if pager.page(&text).map_err(Error::Output)? {
+        if pager.page(text).map_err(Error::Output)? {
             return Ok(());
         }
     }

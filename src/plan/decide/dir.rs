@@ -90,6 +90,7 @@ pub(super) fn decide_dir(
         mode,
         claimed: true,
         carry: false,
+        base: false,
     });
     Ok((change, op))
 }

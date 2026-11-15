@@ -79,6 +79,41 @@ pub(crate) fn store_bytes(
     Ok(RestoreRef { digest, mode, len })
 }
 
+/// Keep `bytes`, which bx is about to write whole at a target, in
+/// `restore/` under their digest — the [`super::LedgerEntry::written`] the
+/// write records — as the base an edit of them is measured from.
+///
+/// Such a blob restores nothing: no [`Prior`] names it. Its entry's `written`
+/// digest does, so it is indexed by the entry it is the base of, and the
+/// three-way view of an edited file is [`kept`] read back. Losing one costs
+/// only that view, never a byte the user wrote.
+///
+/// # Errors
+///
+/// What [`StateDir::ensure`] and [`store_bytes`] return.
+pub(crate) fn keep(dir: &StateDir, bytes: &[u8]) -> Result<(), Error> {
+    dir.ensure()?;
+    store_bytes(dir, ContentHash::of(bytes), bytes, Mode::PRIVATE_FILE).map_err(Error::from)?;
+    Ok(())
+}
+
+/// The bytes [`keep`] kept under `digest`, when a blob of at most `limit`
+/// bytes is there and verifies against it; `None` otherwise, which the view
+/// that wanted them does without.
+#[must_use]
+pub(crate) fn kept(dir: &StateDir, digest: ContentHash, limit: u64) -> Option<Vec<u8>> {
+    let len = blob_len(&blob_path(dir, &digest)).filter(|len| *len <= limit)?;
+    read(
+        dir,
+        &RestoreRef {
+            digest,
+            mode: Mode::PRIVATE_FILE,
+            len,
+        },
+    )
+    .ok()
+}
+
 /// The bytes a restore snapshot holds.
 ///
 /// The digest is recomputed and checked. Silently restoring corrupted

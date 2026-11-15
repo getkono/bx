@@ -43,7 +43,7 @@ pub(crate) use decide::read_repo_file;
 #[cfg(test)]
 pub use diff::DiffKind;
 pub(crate) use diff::unified;
-pub use diff::{Diff, Palette, View, render};
+pub use diff::{Diff, Palette, View, render, render_row};
 pub use error::Error;
 pub use inputs::Inputs;
 
@@ -124,7 +124,50 @@ pub struct Report {
     /// interactive file was rendered with, and what an executed `apply`
     /// recorded in the fingerprint store.
     pub activations: activation::Plan,
+    /// Each file bx owns whole that was edited since bx wrote it, in row
+    /// order: the questions a writing run asks at a terminal. Its row is a
+    /// conflict, whose note says so in every mode.
+    pub questions: Vec<Question>,
+    /// Whether a writing run has work to write beside what its questions are
+    /// answered with. Set before `approve` is asked, so it can tell whether
+    /// to put the one confirmation once every question is answered *keep*.
+    pub work: bool,
 }
+
+/// A file bx owns whole that was edited since bx wrote it, which a writing
+/// run asks about: keep the edit, or take bx's bytes over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Question {
+    /// The row, by index into [`Report::changes`].
+    pub row: usize,
+    /// What bx last wrote there against what is on disk, then against what
+    /// bx wants there; `None` where it cannot be shown, and the row's own
+    /// diff is all there is.
+    pub three_way: Option<Diff>,
+}
+
+/// What a writing run's `approve` answers: whether to write, and which edited
+/// files to write bx's bytes over, by index into [`Report::changes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Approval {
+    /// Whether to write.
+    pub approved: bool,
+    /// Each [`Question::row`] answered *take bx's*. A row not named here is
+    /// skipped, as every conflict is.
+    pub taken: BTreeSet<usize>,
+}
+
+impl From<bool> for Approval {
+    fn from(approved: bool) -> Self {
+        Self {
+            approved,
+            taken: BTreeSet::new(),
+        }
+    }
+}
+
+/// The note an edited file's row carries once its answer took bx's bytes.
+const TAKEN: &str = "edited since bx last wrote it; you took bx's bytes, and bx rm restores yours";
 
 impl Report {
     /// Every row's action, in order, then every activation's.
@@ -170,6 +213,41 @@ pub fn run(
     mode: Mode,
     approve: &mut dyn FnMut(&Report) -> Result<bool, Error>,
 ) -> Result<Report, Error> {
+    decide_and_write(inputs, mode, false, &mut |report| {
+        approve(report).map(Approval::from)
+    })
+}
+
+/// [`run`], with each edited file [`Report::questions`] names settled by what
+/// `approve` answers.
+///
+/// The questions are part of the plan: each is decided with every other row,
+/// its row says what `apply` asks, and the write an answer of *take bx's*
+/// makes is the one the decision produced. An answer selects that write; it
+/// never decides one. `approve` is asked when there is work to write or a
+/// question to answer, and a run whose only work was its questions, all
+/// answered *keep*, writes nothing and opens no session.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn answered(
+    inputs: &Inputs,
+    mode: Mode,
+    approve: &mut dyn FnMut(&Report) -> Result<Approval, Error>,
+) -> Result<Report, Error> {
+    decide_and_write(inputs, mode, true, approve)
+}
+
+/// [`answered`], which asks `approve` about a run whose only work is its
+/// questions only when `asks`: [`run`] answers none, so it is asked only when
+/// there is other work, as it always was.
+fn decide_and_write(
+    inputs: &Inputs,
+    mode: Mode,
+    asks: bool,
+    approve: &mut dyn FnMut(&Report) -> Result<Approval, Error>,
+) -> Result<Report, Error> {
     refuse_irregular_state_files(&inputs.state)?;
     let mut report = Report::default();
     look_at_state(inputs, &mut report)?;
@@ -192,13 +270,15 @@ pub fn run(
         if mode == Mode::Plan {
             return Ok(report);
         }
+        // Recovery is the work an approval is asked for.
+        report.work = true;
         // Refused on what `pending` found, before recovery runs at all, so a
         // blocked session rolls nothing back.
         let blocked: Vec<_> = interrupted.blocked().cloned().collect();
         if !blocked.is_empty() {
             return Err(recover::Error::Blocked { conflicts: blocked }.into());
         }
-        if approve(&report)? {
+        if approve(&report)?.approved {
             // A session that became blocked between `pending` and here is
             // still refused: this run is a writing one, and `recover` hands
             // that verdict back as a value only for a caller that reports it.
@@ -290,9 +370,30 @@ pub fn run(
     targets.append(&mut expansion.targets);
     let decided = decide::decide_all(&targets, &ctx)?;
     report.changes = decided.changes;
+    // What bx last wrote at each edited file, read back from where `apply`
+    // kept it, is the base of the view its question offers.
+    report.questions = decided
+        .held
+        .iter()
+        .map(|(row, op)| Question {
+            row: *row,
+            three_way: op.three_way(
+                ledger
+                    .get(op.target())
+                    .and_then(|entry| {
+                        state::restore::kept(&inputs.state, entry.written, track::Base::LIMIT)
+                    })
+                    .as_deref(),
+            ),
+        })
+        .collect();
+    let mut held = decided.held;
     // A tracked target's repo copy is written by `sync` alone, after every
     // other write; a bare `apply` announces the row and leaves it.
     let mut ops = decided.ops;
+    // Where a taken edit's write goes: after every other file's, before
+    // anything carried or taken back.
+    let taken_at = ops.len();
     if mode == Mode::Sync {
         ops.extend(decided.carries);
     }
@@ -324,19 +425,43 @@ pub fn run(
                 .steps()
                 .iter()
                 .any(|step| step.action().is_pending());
-            if ops.is_empty()
+            report.work = !(ops.is_empty()
                 && released.is_empty()
                 && clones.is_empty()
                 && undone_clones.is_empty()
                 && expansion.pending.is_empty()
-                && !captured
-            {
+                && !captured);
+            if !report.work && (report.questions.is_empty() || !asks) {
                 track::agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
-            if !approve(&report)? {
+            let approval = approve(&report)?;
+            let taken: Vec<_> = held
+                .drain(..)
+                .filter(|(row, _)| approval.taken.contains(row))
+                .collect();
+            if !report.work && taken.is_empty() {
+                track::agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
+            if !approval.approved {
+                return Ok(report);
+            }
+            // Each edit answered *take bx's* becomes the write its row was
+            // decided with, and its row the modify that write is.
+            for (row, op) in taken.into_iter().rev() {
+                report.changes[row].action = Action::Modify;
+                report.changes[row].note = Some(TAKEN.to_string());
+                ops.insert(taken_at, op);
+            }
+            // What each file bx writes whole will hold, kept once the session
+            // has landed it as the base a later edit is measured from. A run
+            // stopped before then loses only that view.
+            let kept: Vec<Vec<u8>> = ops
+                .iter()
+                .filter_map(decide::Op::base)
+                .map(<[u8]>::to_vec)
+                .collect();
             // Before the session, as `bx rm` removes one: a checkout's bytes
             // are git's, and no journal can roll its removal back.
             if !undone_clones.is_empty() {
@@ -360,6 +485,9 @@ pub fn run(
                 }
                 let progress = execute::progress(execute::steps(&ops, &released), inputs.progress);
                 execute::execute(ops, &released, session, &progress)?;
+                for base in &kept {
+                    state::restore::keep(&inputs.state, base)?;
+                }
             }
             if !clones.is_empty() {
                 inputs.state.ensure()?;

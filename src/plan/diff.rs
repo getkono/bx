@@ -405,6 +405,20 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
     out
 }
 
+/// Render one row and `diff` beneath it in place of its own: the view a
+/// question about an edited file shows when asked to, drawn as [`render`]
+/// draws every row.
+#[must_use]
+pub fn render_row(change: &Change, diff: Option<&Diff>, palette: Palette, home: &Path) -> String {
+    let mut out = String::new();
+    let shown = Change {
+        diff: diff.cloned().or_else(|| change.diff.clone()),
+        ..change.clone()
+    };
+    row(&mut out, &shown, palette, home);
+    out
+}
+
 /// Whether every row in this report is about an interrupted session rather
 /// than about a configured target.
 ///

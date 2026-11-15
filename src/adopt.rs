@@ -215,7 +215,7 @@ struct TreeDecl {
 fn trees_of(layers: &[Layer], values: &ResolvedValues) -> Result<Vec<TreeDecl>, Error> {
     let mut found = Vec::new();
     for layer in layers {
-        let (text, _) = open_layer(&layer.file)?;
+        let text = open_layer(&layer.file)?.text;
         for tree in config::parse_str(&text, &layer.file, values.home())?.trees {
             let Some(path) = resolved_path(tree.path.as_str(), values) else {
                 continue;
@@ -263,7 +263,7 @@ fn kept_elsewhere(
     if gated.is_empty() {
         return Ok(Vec::new());
     }
-    let (text, _) = open_layer(&layer.file)?;
+    let text = open_layer(&layer.file)?.text;
     Ok(config::parse_str(&text, &layer.file, home)?
         .targets
         .into_iter()
@@ -1190,16 +1190,29 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
     Ok(rows)
 }
 
+/// A layer file as bx read it, to edit it.
+struct Opened {
+    /// Its text. An absent file is empty.
+    text: String,
+    /// The mode it has now, which bx's edit keeps.
+    mode: Mode,
+    /// What was there when it was read, which bx's edit is stamped against
+    /// ([`replace_layer`]).
+    read: fs::Observed,
+}
+
 /// Read a layer file's text, with the mode it has now. An absent file is
 /// empty.
-fn open_layer(path: &Path) -> Result<(String, Mode), Error> {
-    let observed = fs::observe(path)?;
-    let text = match (observed.kind, observed.bytes) {
+fn open_layer(path: &Path) -> Result<Opened, Error> {
+    let read = fs::observe(path)?;
+    let text = match (read.kind, &read.bytes) {
         (Kind::Absent, _) => String::new(),
-        (Kind::File, Some(bytes)) => String::from_utf8(bytes).map_err(|_| Error::Layer {
-            path: path.to_path_buf(),
-            why: "is not UTF-8".to_string(),
-        })?,
+        (Kind::File, Some(bytes)) => {
+            String::from_utf8(bytes.clone()).map_err(|_| Error::Layer {
+                path: path.to_path_buf(),
+                why: "is not UTF-8".to_string(),
+            })?
+        }
         (kind, _) => {
             return Err(Error::Layer {
                 path: path.to_path_buf(),
@@ -1207,7 +1220,26 @@ fn open_layer(path: &Path) -> Result<(String, Mode), Error> {
             });
         }
     };
-    Ok((text, observed.mode.unwrap_or(Mode::DEFAULT_FILE)))
+    let mode = read.mode.unwrap_or(Mode::DEFAULT_FILE);
+    Ok(Opened { text, mode, read })
+}
+
+/// Replace a layer with `text`, at `mode`, unless it changed since `read`
+/// observed it.
+///
+/// The one write every edit bx makes to a hand-authored layer goes through:
+/// `bx add` and `bx rm` here, and `bx upgrade`'s pin rewrite
+/// ([`crate::pin::write_and_commit`]). A save an editor made between bx's
+/// read and its write is never replaced: the write is refused, and the layer
+/// holds what the editor saved. `read` is the observation the edit was made
+/// from, and its stamp is what [`fs::write_over`] checks.
+///
+/// # Errors
+///
+/// [`fs::Error::Changed`] when the layer is no longer what `read` observed,
+/// with nothing written, and otherwise what [`fs::write_over`] returns.
+pub(crate) fn replace_layer(read: &fs::Observed, text: &str, mode: Mode) -> Result<(), fs::Error> {
+    fs::write_over(read, text.as_bytes(), mode)
 }
 
 /// Parse a layer's text, keeping the spans an edit is made at.
@@ -1222,13 +1254,23 @@ fn parse_layer(path: &Path, text: &str) -> Result<Document<String>, Error> {
 ///
 /// The check is the loader's own parse of the one file, so an edit that would
 /// leave the repo unloadable is refused with the file as it was.
-fn write_layer(path: &Path, text: &str, mode: Mode, home: &Path) -> Result<(), Error> {
+///
+/// A layer that changed since `opened` read it is refused with nothing
+/// written ([`replace_layer`]), so the save that changed it stands.
+fn write_layer(path: &Path, opened: &Opened, text: &str, home: &Path) -> Result<(), Error> {
     config::parse_str(text, path, home).map_err(|e| Error::Layer {
         path: path.to_path_buf(),
         why: format!("bx's edit would not load, so it was not made: {e}"),
     })?;
-    fs::write_atomically(path, text.as_bytes(), mode)?;
-    Ok(())
+    replace_layer(&opened.read, text, opened.mode).map_err(|error| match error {
+        fs::Error::Changed { .. } => Error::Layer {
+            path: path.to_path_buf(),
+            why: "changed after bx read it, so bx's edit was not made and the file is as it was \
+                  saved; run the command again"
+                .to_string(),
+        },
+        error => Error::from(error),
+    })
 }
 
 /// Append a `[[target]]` for each adopted file to `bx.toml`.
@@ -1272,7 +1314,8 @@ fn declare(ctx: &Context, rows: &[Adoption]) -> Result<(), Error> {
     let added = added.to_string();
 
     let path = ctx.repo.join(GLOBAL_LAYER);
-    let (mut text, mode) = open_layer(&path)?;
+    let opened = open_layer(&path)?;
+    let mut text = opened.text.clone();
     if text.is_empty() {
         text.push_str(added.strip_prefix('\n').unwrap_or(&added));
     } else {
@@ -1281,7 +1324,7 @@ fn declare(ctx: &Context, rows: &[Adoption]) -> Result<(), Error> {
         }
         text.push_str(&added);
     }
-    write_layer(&path, &text, mode, &ctx.home)
+    write_layer(&path, &opened, &text, &ctx.home)
 }
 
 /// What `rm` did to one target.
@@ -1316,7 +1359,7 @@ fn beneath(path: &Portable, under: &Portable) -> bool {
 fn declarations(ctx: &Context, under: &Portable) -> Result<Vec<Declaration>, Error> {
     let mut found = Vec::new();
     for layer in &ctx.layers {
-        let (text, _) = open_layer(&layer.file)?;
+        let text = open_layer(&layer.file)?.text;
         let doc = parse_layer(&layer.file, &text)?;
         let Some(tables) = doc.get("target").and_then(Item::as_array_of_tables) else {
             continue;
@@ -1374,8 +1417,9 @@ fn undeclare(
     values: &ResolvedValues,
 ) -> Result<(), Error> {
     let home = values.home();
-    let (text, mode) = open_layer(layer)?;
-    let doc = parse_layer(layer, &text)?;
+    let opened = open_layer(layer)?;
+    let text = &opened.text;
+    let doc = parse_layer(layer, text)?;
     let Some(tables) = doc.get("target").and_then(Item::as_array_of_tables) else {
         return Ok(());
     };
@@ -1409,7 +1453,7 @@ fn undeclare(
     for range in ranges.into_iter().rev() {
         edited.replace_range(range, "");
     }
-    write_layer(layer, &edited, mode, home)
+    write_layer(layer, &opened, &edited, home)
 }
 
 /// `bx rm`: stop managing `target` and everything beneath it, restoring what

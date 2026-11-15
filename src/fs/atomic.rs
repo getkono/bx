@@ -195,7 +195,7 @@ pub use error::Error;
 pub use observe::{Observed, Parent, ParentState, Stamp, observe};
 pub use stage::{
     Filled, Staged, TEMP_PREFIX, Unpublished, refuse_stage, set_mode, stage, stage_as, temp_beside,
-    write_atomically,
+    write_atomically, write_over,
 };
 
 pub(super) use observe::parent_of;

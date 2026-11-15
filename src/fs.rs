@@ -37,7 +37,7 @@ pub(crate) use atomic::refuse_moved;
 pub use atomic::{
     CreatedDirs, Desired, Drift, Error, Filled, Observed, ParentState, TEMP_PREFIX, Unpublished,
     compare, compare_dir, ensure_dir, observe, refuse_stage, set_mode, stage, stage_as,
-    temp_beside, write_atomically,
+    temp_beside, write_atomically, write_over,
 };
 pub use link::{refuse_stage_link, stage_link, stage_link_as};
 pub use mode::{Kind, Mode};

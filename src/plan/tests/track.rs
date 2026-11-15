@@ -417,6 +417,79 @@ fn a_missing_side_is_filled_from_the_other_and_nothing_on_either_is_unchanged() 
 }
 
 #[test]
+fn a_side_deleted_since_the_last_sync_beside_an_agreed_other_is_never_copied_back() {
+    for deleted in ["machine", "repo"] {
+        let (home, inputs) = agreed_home("agreed\n");
+        let (gone, kept) = if deleted == "machine" {
+            (machine(home.path(), "lock"), copy(home.path(), "lock"))
+        } else {
+            (copy(home.path(), "lock"), machine(home.path(), "lock"))
+        };
+        std::fs::remove_file(&gone).expect("the deletion");
+        let before = snapshot(home.path(), &[".local/state/bx/lock"]);
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Unchanged], "{deleted}");
+        let note = planned.changes[0].note.as_deref().expect("a note");
+        assert!(note.starts_with("deleted: "), "{note}");
+        assert!(note.contains("the deletion stands"), "{note}");
+        assert_eq!(exit(&planned, Mode::Plan), Exit::Converged);
+
+        // Neither an apply nor a sync writes either side, twice over.
+        for _ in 0..2 {
+            let applied = apply(&inputs);
+            assert!(!applied.executed, "{deleted}");
+            let synced = sync(&inputs);
+            assert!(!synced.executed, "{deleted}");
+            assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), before);
+        }
+        assert!(!gone.exists(), "{deleted}: the deletion stands");
+        assert_eq!(read(&kept).as_deref(), Some("agreed\n"), "{deleted}");
+        assert_eq!(base(home.path(), "lock").as_deref(), Some(&b"agreed\n"[..]));
+    }
+}
+
+#[test]
+fn a_side_deleted_while_the_other_changed_since_the_last_sync_is_a_conflict() {
+    for deleted in ["machine", "repo"] {
+        let (home, inputs) = agreed_home("agreed\n");
+        let (gone, kept, label) = if deleted == "machine" {
+            (
+                machine(home.path(), "lock"),
+                copy(home.path(), "lock"),
+                "repo",
+            )
+        } else {
+            (
+                copy(home.path(), "lock"),
+                machine(home.path(), "lock"),
+                "this machine",
+            )
+        };
+        std::fs::remove_file(&gone).expect("the deletion");
+        put(&kept, "changed\n");
+        let before = snapshot(home.path(), &[".local/state/bx/lock"]);
+
+        let planned = plan(&inputs);
+        assert_eq!(planned.actions(), vec![Action::Conflict], "{deleted}");
+        assert_eq!(
+            text(&planned.changes[0]),
+            format!(
+                "--- ~/.lock (last sync)\n+++ ~/.lock ({label})\n@@ -1 +1 @@\n-agreed\n+changed\n"
+            ),
+            "measured from what the two last agreed on"
+        );
+
+        let applied = apply(&inputs);
+        assert!(!applied.executed);
+        let synced = sync(&inputs);
+        assert!(!synced.executed);
+        assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), before);
+        assert!(!gone.exists(), "{deleted}");
+    }
+}
+
+#[test]
 fn a_side_that_is_not_a_regular_file_is_a_conflict() {
     let home = guarded_home();
     std::fs::create_dir_all(machine(home.path(), "dir")).expect("a directory");

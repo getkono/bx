@@ -155,30 +155,42 @@ pub(crate) enum Answer {
     Show,
 }
 
-/// The choices [`ask_edited`] offers, in the order it lists them: the first
-/// is the default, so a bare Enter keeps the edit.
-const CHOICES: [(&str, Answer); 3] = [
+/// The answers a question about one file offers, each with its label, in the
+/// order they are listed: the first is the default.
+type Choices = [(&'static str, Answer); 3];
+
+/// The choices asked about an edited file: a bare Enter keeps the edit.
+const CHOICES: Choices = [
     ("keep mine", Answer::Keep),
     ("take bx's", Answer::Take),
     ("show the three-way diff", Answer::Show),
 ];
 
-/// Ask on the terminal what to do about the file `question` names.
+/// The choices asked about a target deleted since bx made it: a bare Enter
+/// keeps it deleted, and *restore* is [`Answer::Take`].
+const DELETED_CHOICES: Choices = [
+    ("keep it deleted", Answer::Keep),
+    ("restore bx's", Answer::Take),
+    ("show what restoring writes", Answer::Show),
+];
+
+/// Ask on the terminal what to do about the file `question` names, offering
+/// `choices`.
 ///
 /// What is typed ahead is discarded first, as [`confirm`] does, so a stray
 /// `y` never takes bx's bytes over an edit. Everything around this — which
 /// files are asked about, `yes`, no terminal, the view — is decided in
 /// [`converge_answering`] and tested through its `settle` seam.
-fn ask_edited(question: &str) -> Result<Answer, Error> {
+fn ask_edited(question: &str, choices: &Choices) -> Result<Answer, Error> {
     discard_typeahead(std::io::stdin());
-    let labels: Vec<&str> = CHOICES.iter().map(|(label, _)| *label).collect();
-    // The pick is read by its position in `CHOICES`, which is the order its
+    let labels: Vec<&str> = choices.iter().map(|(label, _)| *label).collect();
+    // The pick is read by its position in `choices`, which is the order its
     // labels were offered in, so no label is compared to find its answer.
     let picked = inquire::Select::new(question, labels)
         .with_starting_cursor(0)
         .raw_prompt()
         .map_err(confirmation_failed)?;
-    Ok(CHOICES
+    Ok(choices
         .get(picked.index)
         .map_or(Answer::Keep, |(_, answer)| *answer))
 }
@@ -312,9 +324,9 @@ pub(crate) fn converge_inputs(
     converge_answering(inputs, env, mode, yes, out, (ask, None), decided)
 }
 
-/// The question about one file edited since bx wrote it, put as the text
-/// that asks it.
-type Settle<'a> = dyn FnMut(&str) -> Result<Answer, Error> + 'a;
+/// The question about one file edited or deleted since bx wrote it, put as
+/// the text that asks it and the answers it offers.
+type Settle<'a> = dyn FnMut(&str, &Choices) -> Result<Answer, Error> + 'a;
 
 /// The two kinds of question a writing run puts: the one confirmation, and
 /// one about each file edited since bx wrote it — `None` for a run that never
@@ -410,8 +422,8 @@ pub(crate) fn converge_answering(
     Ok(report)
 }
 
-/// Ask `settle` about the edited file `question` names until it answers keep
-/// or take, drawing the three-way view each time it answers show.
+/// Ask `settle` about the edited or deleted file `question` names until it
+/// answers keep or take, drawing its view each time it answers show.
 fn settled(
     out: &mut dyn Write,
     env: &Env,
@@ -420,12 +432,24 @@ fn settled(
     settle: &mut Settle<'_>,
 ) -> Result<Answer, Error> {
     let change = &report.changes[question.row];
-    let asked = format!(
-        "{} was edited since bx last wrote it. Keep your edit, or take bx's bytes?",
-        report::escape(&change.target)
-    );
+    let target = report::escape(&change.target);
+    let (asked, choices) = if question.deleted {
+        (
+            format!(
+                "{target} was deleted since bx last wrote it. Keep it deleted, or restore bx's?"
+            ),
+            &DELETED_CHOICES,
+        )
+    } else {
+        (
+            format!(
+                "{target} was edited since bx last wrote it. Keep your edit, or take bx's bytes?"
+            ),
+            &CHOICES,
+        )
+    };
     loop {
-        match settle(&asked)? {
+        match settle(&asked, choices)? {
             Answer::Show => {
                 let palette = Palette::resolve(env.no_color, env.stdout_tty).within(env.columns);
                 let view =

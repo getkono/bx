@@ -26,6 +26,15 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     /// Already converged. Hidden unless the user asks for detail.
+    ///
+    /// Also a file bx owns whole, or a symlink bx made, that was deleted
+    /// since while the configuration still wants exactly what bx made there:
+    /// the deletion stands, as a deletion against an unchanged base does in
+    /// git. Not pending work, so `apply` twice still converges, and never
+    /// hidden: its row reads like `git status`'s `deleted:`, and at a
+    /// terminal a writing run asks whether to restore it. A tracked target
+    /// deleted on one side since the last sync, while the other side still
+    /// holds what the two agreed on, is left on both sides this way too.
     Unchanged,
     /// bx wrote this file, the ledger still owns it, nothing declares it any
     /// more, and `apply` will not take it back: the configuration declares
@@ -67,6 +76,12 @@ pub enum Action {
     Sync,
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.
+    ///
+    /// Also a modify/delete conflict, as git names one: a file bx owns whole,
+    /// or a symlink bx made, deleted since while the configuration now wants
+    /// something else there; or a tracked target deleted on one side since
+    /// the last sync and changed on the other. Nothing is re-created unless a
+    /// writing run's question about it is answered *restore*.
     Conflict,
     /// A prerequisite this target needs is absent: a missing tool, or a declared
     /// value this account has not answered. Reported and skipped until the user

@@ -358,9 +358,14 @@ says what the budget covers.
   edited since bx wrote it: keep your edit (the default), take bx's bytes, or
   show a three-way diff — what bx wrote against what is on disk, then against
   what bx wants. Taking bx's bytes keeps yours, and `bx rm` puts them back
-  exactly. With `--yes`, or with no terminal, nothing is asked and every
-  edited file is kept. Any other conflict you settle by hand, in the file or
-  in your configuration, and the next `plan` reads what you decided.
+  exactly. They ask the same about a file bx owns whole whose mode you
+  changed, about bx's region in a file of yours that you edited between its
+  markers, and about a symlink bx made that you pointed elsewhere; showing one
+  of these shows its row's diff. Taking bx's keeps your mode, your whole file,
+  or your link's target, and `bx rm` puts that back exactly. With `--yes`, or
+  with no terminal, nothing is asked and every edit is kept. Any other
+  conflict you settle by hand, in the file or in your configuration, and the
+  next `plan` reads what you decided.
 - A file or link bx made that you deleted is never silently re-created. While
   the configuration still wants what bx made there, the deletion stands; once
   it wants something else, it is a modify/delete conflict. Either way, at a

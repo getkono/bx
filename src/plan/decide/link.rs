@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use super::parent::{Write, created_dirs, locked_parent};
-use super::{ASK_DELETED, Ctx, Made, Op, attached_as, deleted, join, portable_reason};
+use super::{ASK, ASK_DELETED, Ctx, Made, Op, attached_as, deleted, join, portable_reason};
 use crate::config::target::Target;
 use crate::fs::{self, Kind, Mode, Observed};
 use crate::plan::{Change, Diff, Error};
@@ -22,7 +22,9 @@ use crate::state::{LedgerEntry, Mechanism};
 ///   adopted as it stands, with nothing written or recorded, as a file already
 ///   holding a file target's bytes is;
 /// * a link holding other text is a modify only when bx made it and it still
-///   holds what bx left there, settled by [`link_ownership`];
+///   holds what bx left there, settled by [`link_ownership`]; one bx made
+///   that was retargeted since is a conflict `apply` asks about, whose answer
+///   *take bx's* keeps the user's text for `bx rm`;
 /// * a regular file, a directory or anything else is never replaced by a link.
 ///
 /// A modify is shown as the old and new text, never as a content diff.
@@ -66,7 +68,15 @@ pub(super) fn decide_link(
         (None, Kind::Other) => (Action::Conflict, Some("not a symlink".to_string())),
     };
     let entry = ctx.ledger.get(&target.path);
+    let found = action;
     let (action, note) = link_ownership(action, &observed, entry, note);
+    // A link bx made that somebody retargeted since is asked about as an
+    // edited file is: an answer of *take bx's* keeps their text for `bx rm`.
+    let retargeted = found == Action::Modify
+        && action == Action::Conflict
+        && entry.is_some_and(|entry| {
+            entry.mechanism == Mechanism::Link && observed.link_digest() != Some(entry.written)
+        });
     // A link bx made that was deleted since is settled as a file bx owns
     // whole is, and asked about the same way.
     let gone =
@@ -77,10 +87,11 @@ pub(super) fn decide_link(
     };
     // Making a link writes an entry in its parent, as a file's write does.
     let locked = locked_parent(&observed, ctx.home, ctx.declared, Write::File);
-    let ask = gone && locked.is_none();
+    let ask = (gone || retargeted) && locked.is_none();
+    let asked = if gone { ASK_DELETED } else { ASK };
     let (action, note) = match (action.is_pending(), locked) {
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
-        _ if ask => (action, join([note, Some(ASK_DELETED.to_string())])),
+        _ if ask => (action, join([note, Some(asked.to_string())])),
         _ => (action, note),
     };
     // A link on either side has text to show; anything else is explained by
@@ -352,8 +363,10 @@ mod tests {
         assert_eq!(planned.actions(), vec![Action::Conflict; 2]);
         assert_eq!(
             planned.changes[0].note.as_deref(),
-            Some("retargeted since bx made it")
+            Some(format!("retargeted since bx made it; {ASK}").as_str())
         );
+        let asked: Vec<_> = planned.questions.iter().map(|q| q.row).collect();
+        assert_eq!(asked, vec![0], "only the retargeted link is asked about");
         assert_eq!(
             planned.changes[1].note.as_deref(),
             Some("bx attached to this path as the whole file")

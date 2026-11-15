@@ -180,7 +180,12 @@ it yours.
   !  conflict   it exists, differs, and bx does not own it — or you edited
                 bx's output. Reported and skipped, never overwritten, unless
                 you answer `apply`'s question about an edited file with
-                "take bx's"; your bytes are kept for `bx rm`.
+                "take bx's"; your bytes are kept for `bx rm`. Also a file or
+                link bx made that you deleted while the configuration now
+                wants something else there, or a tracked file deleted on one
+                side since the last sync and changed on the other: git's
+                modify/delete conflict. Nothing is re-created unless you
+                answer "restore bx's".
   ?  blocked    something it needs is missing: a value with no answer, or
                 one switched off or invalid; a secret that does not decrypt
                 here; a followed external `bx.lock` holds no commit for; an
@@ -196,7 +201,13 @@ it yours.
                 like; it cannot be looked at; or it is a checkout holding
                 work, a file git ignores included. Left exactly as it is;
                 `bx rm` releases it.
-  =  unchanged  already converged (hidden unless you ask)
+  =  unchanged  already converged (hidden unless you ask). Also a file or
+                link bx made that you deleted while the configuration still
+                wants exactly what bx made: your deletion stands, as in git.
+                Shown like `git status`'s `deleted:`, never pending, and
+                `apply` asks at a terminal whether to restore it. A tracked
+                file deleted on one side since the last sync, with the other
+                side still as the two agreed, is left on both sides.
 ```
 
 `plan` and `apply` compute this with the same code, so `apply` can never do work
@@ -350,6 +361,11 @@ says what the budget covers.
   exactly. With `--yes`, or with no terminal, nothing is asked and every
   edited file is kept. Any other conflict you settle by hand, in the file or
   in your configuration, and the next `plan` reads what you decided.
+- A file or link bx made that you deleted is never silently re-created. While
+  the configuration still wants what bx made there, the deletion stands; once
+  it wants something else, it is a modify/delete conflict. Either way, at a
+  terminal, `apply` and `sync` ask whether to keep it deleted (the default) or
+  restore bx's, and `--yes` or no terminal keeps it deleted.
 - A file you brought to exactly what bx wants is recorded as bx's again, so
   the next change to its body is bx's to make, not a conflict.
 - `doctor` reports a declared tool that is not on `PATH`, a required value with

@@ -141,7 +141,7 @@ pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 /// prompt abandoned with Esc or Ctrl-C is not an error: it is said in a line
 /// and exits [`Exit::Canceled`].
 pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
-    apply_answering(env, yes, out, &mut confirm, &mut ask_edited)
+    apply_answering(env, yes, out, &mut confirm, Some(&mut ask_edited))
 }
 
 /// What the user answered about one file edited since bx wrote it.
@@ -180,13 +180,6 @@ fn ask_edited(question: &str) -> Result<Answer, Error> {
         .iter()
         .find(|(label, _)| *label == picked)
         .map_or(Answer::Keep, |(_, answer)| *answer))
-}
-
-/// The answer a run that asks nothing gives every edited file: keep it.
-/// `bx init`, `bx update` and `bx upgrade` settle their plans with it, so
-/// only `bx apply` and `bx sync` ever write over an edit.
-pub(crate) fn keep_mine(_: &str) -> Result<Answer, Error> {
-    Ok(Answer::Keep)
 }
 
 /// Ask on the terminal whether to write.
@@ -237,7 +230,7 @@ fn apply_with(
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, Error> {
-    apply_answering(env, yes, out, ask, &mut keep_mine)
+    apply_answering(env, yes, out, ask, None)
 }
 
 /// [`apply`], with the confirmation asked through `ask` and each question
@@ -247,7 +240,7 @@ fn apply_answering(
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
-    settle: &mut dyn FnMut(&str) -> Result<Answer, Error>,
+    settle: Option<&mut Settle<'_>>,
 ) -> Result<Exit, Error> {
     match converge(env, Mode::Apply, yes, out, ask, settle) {
         Ok(report) => Ok(plan::exit(&report, Mode::Apply)),
@@ -271,7 +264,7 @@ fn converge(
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
-    settle: &mut dyn FnMut(&str) -> Result<Answer, Error>,
+    settle: Option<&mut Settle<'_>>,
 ) -> Result<Report, Error> {
     let inputs = Inputs::load(env)?;
     let mut declined = false;
@@ -315,36 +308,42 @@ pub(crate) fn converge_inputs(
     ask: &mut dyn FnMut() -> Result<bool, Error>,
     decided: &mut dyn FnMut(&Report, bool) -> bool,
 ) -> Result<Report, Error> {
-    converge_answering(inputs, env, mode, yes, out, (ask, &mut keep_mine), decided)
+    converge_answering(inputs, env, mode, yes, out, (ask, None), decided)
 }
 
+/// The question about one file edited since bx wrote it, put as the text
+/// that asks it.
+type Settle<'a> = dyn FnMut(&str) -> Result<Answer, Error> + 'a;
+
 /// The two kinds of question a writing run puts: the one confirmation, and
-/// one about each file edited since bx wrote it.
-type Prompts<'a> = (
+/// one about each file edited since bx wrote it — `None` for a run that never
+/// asks one, `bx init`, `bx update` and `bx upgrade`, which keep every edit.
+type Prompts<'a, 'b> = (
     &'a mut dyn FnMut() -> Result<bool, Error>,
-    &'a mut dyn FnMut(&str) -> Result<Answer, Error>,
+    Option<&'a mut Settle<'b>>,
 );
 
 /// [`converge_inputs`], with each file edited since bx wrote it asked about
 /// through `settle` before the one confirmation.
 ///
-/// A file is asked about only at a terminal and without `yes`: with either
-/// missing every edited file is kept, as every conflict is, so `--yes` never
-/// writes over an edit. Each answer of *show* draws the three-way view and
-/// asks again. Where the questions were the only work and every answer kept
-/// the edit, the confirmation is not put and nothing is written.
+/// A file is asked about only at a terminal, without `yes`, and by a run
+/// with a `settle`: otherwise every edited file is kept, as every conflict
+/// is, so `--yes` never writes over an edit. Each answer of *show* draws the
+/// three-way view and asks again. Where the questions were the only work and
+/// every answer kept the edit, the confirmation is not put and nothing is
+/// written.
 pub(crate) fn converge_answering(
     inputs: &Inputs,
     env: &Env,
     mode: Mode,
     yes: bool,
     out: &mut dyn Write,
-    (ask, settle): Prompts<'_>,
+    (ask, mut settle): Prompts<'_, '_>,
     decided: &mut dyn FnMut(&Report, bool) -> bool,
 ) -> Result<Report, Error> {
     let mut shown = false;
     let report = plan::answered(inputs, mode, &mut |report| {
-        let asking = !yes && env.stdin_tty && !report.questions.is_empty();
+        let asking = settle.is_some() && !yes && env.stdin_tty && !report.questions.is_empty();
         // Nothing to write and nothing to ask: the plan is shown as any plan
         // with nothing to do is, once the run returns.
         if !report.work && !asking {
@@ -356,9 +355,9 @@ pub(crate) fn converge_answering(
         out.flush().map_err(Error::Output)?;
         shown = true;
         let mut taken = std::collections::BTreeSet::new();
-        if asking {
+        if let Some(settle) = settle.as_deref_mut().filter(|_| asking) {
             for question in &report.questions {
-                if settled(out, env, report, question, settle)? == Answer::Take {
+                if settled(out, env, report, question, &mut *settle)? == Answer::Take {
                     taken.insert(question.row);
                 }
             }
@@ -417,7 +416,7 @@ fn settled(
     env: &Env,
     report: &Report,
     question: &plan::Question,
-    settle: &mut dyn FnMut(&str) -> Result<Answer, Error>,
+    settle: &mut Settle<'_>,
 ) -> Result<Answer, Error> {
     let change = &report.changes[question.row];
     let asked = format!(
@@ -476,7 +475,7 @@ pub fn sync(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, sync::Err
         yes,
         out,
         &Git::new(env),
-        (&mut confirm, &mut ask_edited),
+        (&mut confirm, Some(&mut ask_edited)),
     )
 }
 
@@ -513,7 +512,7 @@ fn sync_with(
     git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, sync::Error> {
-    sync_answering(env, yes, out, git, (ask, &mut keep_mine))
+    sync_answering(env, yes, out, git, (ask, None))
 }
 
 /// [`sync`], through `git`, with its questions put through `prompts`.
@@ -522,7 +521,7 @@ fn sync_answering(
     yes: bool,
     out: &mut dyn Write,
     git: &Git,
-    (ask, settle): Prompts<'_>,
+    (ask, settle): Prompts<'_, '_>,
 ) -> Result<Exit, sync::Error> {
     // Held to the end, so no `bx update` in another shell commits or pushes
     // between this pull and this push, and this never runs inside its own.
@@ -919,7 +918,7 @@ fn init_with(
         }
     }
 
-    let report = match converge(env, Mode::Apply, yes, out, confirm, &mut keep_mine) {
+    let report = match converge(env, Mode::Apply, yes, out, confirm, None) {
         Ok(report) => report,
         Err(Error::Canceled) => {
             return init_canceled(

@@ -551,6 +551,7 @@ mod tests {
         let entry = |mechanism| LedgerEntry {
             path: Portable::try_from("~/.d".to_string()).expect("portable"),
             written: crate::state::dir_digest(),
+            region: None,
             mode: Mode::DEFAULT_DIR,
             mechanism,
             prior: crate::state::Prior::Absent,

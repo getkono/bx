@@ -34,7 +34,7 @@ mod interrupted;
 mod links;
 #[cfg(test)]
 mod properties;
-mod region;
+pub(crate) mod region;
 mod track;
 
 use std::collections::BTreeSet;

@@ -25,6 +25,7 @@ mod dir;
 mod guard;
 mod link;
 mod parent;
+mod track;
 mod undeclared;
 
 use std::collections::BTreeMap;
@@ -36,6 +37,7 @@ use self::guard::guard_generated;
 pub(super) use self::guard::{guard_environment_d, guard_fragment};
 use self::link::decide_link;
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
+use self::track::{Gone, one_side_deleted};
 pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
@@ -51,7 +53,7 @@ use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
 use crate::shell::activation::{self, Host as _};
-use crate::state::{LedgerEntry, LedgerView, Mechanism};
+use crate::state::{LedgerEntry, LedgerView, Mechanism, removed_written};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -510,11 +512,15 @@ pub(super) fn decide(
     // A file bx owns whole that was deleted since bx wrote it, settled as git
     // settles a deletion: see [`deleted`]. A file bx generates for itself in
     // its own data directory is not the user's to delete: see [`own_data`].
+    // Nor is one bx itself removed, as it carries a tracked target's deletion
+    // across: nothing there is what bx last left, and writing it is a create.
     let gone = matches!(target.attach, Attach::Own)
         && action == Action::Create
         && observed.kind == Kind::Absent
         && !own_data(target)
-        && entry.is_some_and(|entry| entry.mechanism == Mechanism::Own);
+        && entry.is_some_and(|entry| {
+            entry.mechanism == Mechanism::Own && entry.written != removed_written()
+        });
     let (action, note) = match entry {
         Some(entry) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
         _ => (action, note),
@@ -903,6 +909,10 @@ const TRACK_SHAPE: &str = "track mode carries this machine's whole file into the
 /// The repo's copy is the other way round: `sync` claims it as a whole file
 /// owned by bx, so the ledger keeps the bytes it held before tracking began,
 /// and `rm` puts them back.
+///
+/// A deletion carried to the other side claims the copy it removes, on
+/// either side, so `rm` puts back what it removed unless bx itself created
+/// that copy, whose prior stays absent: see [`one_side_deleted`].
 fn decide_track(
     target: &Target,
     ctx: &Ctx<'_>,
@@ -953,15 +963,22 @@ fn decide_track(
     let agreed = |bytes: &[u8], when| {
         Some(Agreed {
             target: target.path.clone(),
-            bytes: bytes.to_vec(),
+            bytes: Some(bytes.to_vec()),
             when,
         })
     };
     let (machine_bytes, repo_bytes) = (machine.bytes.as_deref(), repo.bytes.as_deref());
     let (m, r) = match (machine_bytes, repo_bytes) {
+        // Nothing on either side agrees on nothing: an agreement still kept
+        // from before both were deleted is forgotten. See [`Agreed::bytes`].
         (None, None) => {
             let note = "neither this machine nor the repo has it yet".to_string();
-            return Ok((row(Action::Unchanged, None, Some(note)), None, None));
+            let forgotten = ctx.bases.contains_key(&target.path).then(|| Agreed {
+                target: target.path.clone(),
+                bytes: None,
+                when: When::Now,
+            });
+            return Ok((row(Action::Unchanged, None, Some(note)), None, forgotten));
         }
         (Some(m), Some(r)) if m == r => {
             return Ok((
@@ -970,17 +987,25 @@ fn decide_track(
                 agreed(m, When::Now),
             ));
         }
-        // One side deleted since the two last agreed: never undone by copying
-        // the other side over it. See [`one_side_deleted`].
+        // One side deleted since the two last agreed: carried to the other
+        // side, never undone by copying the other side over it. See
+        // [`one_side_deleted`].
         (None, Some(present)) | (Some(present), None) if ctx.bases.contains_key(&target.path) => {
             let base = &ctx.bases[&target.path];
-            let sides = if machine_bytes.is_none() {
-                ("this machine's copy", "the repo's", "repo")
+            let (gone, kept) = if machine_bytes.is_none() {
+                (Gone::Machine, (copy, &repo))
             } else {
-                ("the repo's copy", "this machine's", "this machine")
+                (Gone::Repo, (target.path.clone(), &machine))
             };
-            let (action, diff, note) = one_side_deleted(shown, base, sides, present);
-            return Ok((row(action, diff, Some(note)), None, None));
+            return Ok(one_side_deleted(
+                &target.path,
+                gone,
+                kept,
+                base,
+                present,
+                ctx,
+                row,
+            ));
         }
         (None, Some(r)) => {
             let (change, op) = track_onto_machine(target, &machine, r, ctx, row)?;
@@ -1029,56 +1054,6 @@ fn decide_track(
             Diff::labelled(shown, ("repo", "this machine"), Some(r), m, None),
         ),
     }
-}
-
-/// The row of a tracked target one side of which was deleted since the two
-/// last agreed on `base`: `sides` names the copy deleted, then the side still
-/// holding `present` in words and as its diff labels it.
-///
-/// # Decision: a deletion is a change, as git takes one
-///
-/// | the side deleted | the other side | row |
-/// | --- | --- | --- |
-/// | deleted | as they agreed | unchanged: the deletion stands, and neither side is written |
-/// | deleted | changed since they agreed | conflict: deleted on one side, changed on the other |
-///
-/// Copying the present side over the deletion, as a first sync does, would
-/// undo the deletion; with an agreement recorded, bx can tell that one side
-/// deleted it, so it never does. A deletion that stands is not yet carried
-/// to the other side: that is a removal `bx rm` must be able to put back, and
-/// no write that keeps its ledger entry once it removes a file exists yet.
-/// With no agreement recorded, nothing tells a deletion from a copy that was
-/// never there, and [`decide_track`] copies the present side as before.
-fn one_side_deleted(
-    shown: &str,
-    base: &Base,
-    (deleted, kept, present_side): (&str, &str, &str),
-    present: &[u8],
-) -> (Action, Option<Diff>, String) {
-    if base.holds(present) {
-        let note = format!(
-            "deleted: {deleted} was deleted since the last sync, and the deletion stands; {kept} \
-             is left as it is"
-        );
-        return (Action::Unchanged, None, note);
-    }
-    let why = format!(
-        "{deleted} was deleted since the last sync, and {kept} changed since; bx merges \
-         neither. Delete the other copy too, or put one back, by hand"
-    );
-    let diff = match base {
-        Base::Bytes(base) => Diff::labelled(
-            shown,
-            ("last sync", present_side),
-            Some(base),
-            present,
-            None,
-        ),
-        // Too large to have been kept whole: the side still there is all
-        // there is to show.
-        Base::Digest(_) => Diff::labelled(shown, ("deleted", present_side), None, present, None),
-    };
-    (Action::Conflict, diff, why)
 }
 
 /// The row, and the write, that puts the repo's copy `bytes` of a tracked

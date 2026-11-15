@@ -63,7 +63,7 @@ use crate::plan::external;
 use crate::recover;
 use crate::state::{
     self, Ledger, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, StateDir,
-    clone_removing, clone_written,
+    clone_removing, clone_written, removed_written,
 };
 
 /// Everything that can go wrong restoring.
@@ -401,6 +401,14 @@ fn plan(
         }),
         // Edited, and nothing declares it: the file is the user's now.
         (Kind::File, _) if declared == Declared::No => Ok(Restoration::Keep { dest }),
+        // bx removed it, carrying a tracked target's deletion across, and a
+        // file has been put there since: whoever made it, it is not bx's.
+        (Kind::File, _) if entry.written == removed_written() => Ok(Restoration::Conflict {
+            note: "has been put back since bx removed it; restoring the file bx removed would \
+                   destroy it, so bx is leaving it and forgetting nothing"
+                .to_string(),
+            dest,
+        }),
         (Kind::File, _) => Ok(Restoration::Conflict {
             note: format!(
                 "has been edited since bx wrote it (bx left {}); \

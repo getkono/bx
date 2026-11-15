@@ -416,37 +416,297 @@ fn a_missing_side_is_filled_from_the_other_and_nothing_on_either_is_unchanged() 
     assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged; 3]);
 }
 
+/// The ledger entry bx keeps for `rel`, spelled under the home.
+fn entry(home: &Path, rel: &str) -> Option<crate::state::LedgerEntry> {
+    let ledger = LedgerView::read(&StateDir::resolve(home), home)
+        .expect("the ledger")
+        .value;
+    let key = Portable::parse_in(rel, home).expect("a path");
+    ledger.get(&key).cloned()
+}
+
+/// Assert that bx removed `rel` and kept its entry, with `prior` as the bytes
+/// `bx rm` puts back.
+fn removed_with_prior(home: &Path, rel: &str, prior: &[u8]) {
+    let entry = entry(home, rel).expect("the removal keeps its entry");
+    assert_eq!(entry.mechanism, Mechanism::Own, "{rel}");
+    assert_eq!(entry.written, crate::state::removed_written(), "{rel}");
+    let crate::state::Prior::Existed(reference) = &entry.prior else {
+        panic!("{rel}: no prior: {entry:?}");
+    };
+    let state = StateDir::resolve(home);
+    assert_eq!(
+        crate::state::restore::read(&state, reference).expect("the prior"),
+        prior,
+        "{rel}"
+    );
+}
+
 #[test]
-fn a_side_deleted_since_the_last_sync_beside_an_agreed_other_is_never_copied_back() {
-    for deleted in ["machine", "repo"] {
-        let (home, inputs) = agreed_home("agreed\n");
-        let (gone, kept) = if deleted == "machine" {
-            (machine(home.path(), "lock"), copy(home.path(), "lock"))
-        } else {
-            (copy(home.path(), "lock"), machine(home.path(), "lock"))
-        };
-        std::fs::remove_file(&gone).expect("the deletion");
-        let before = snapshot(home.path(), &[".local/state/bx/lock"]);
+fn a_machine_deletion_beside_an_agreed_repo_copy_is_carried_by_sync_alone() {
+    let (home, inputs) = agreed_home("agreed\n");
+    std::fs::remove_file(machine(home.path(), "lock")).expect("the deletion");
 
-        let planned = plan(&inputs);
-        assert_eq!(planned.actions(), vec![Action::Unchanged], "{deleted}");
-        let note = planned.changes[0].note.as_deref().expect("a note");
-        assert!(note.starts_with("deleted: "), "{note}");
-        assert!(note.contains("the deletion stands"), "{note}");
-        assert_eq!(exit(&planned, Mode::Plan), Exit::Converged);
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Sync]);
+    assert_eq!(exit(&planned, Mode::Plan), Exit::Converged, "sync's work");
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.starts_with("deleted: this machine's copy"), "{note}");
+    assert_eq!(
+        text(&planned.changes[0]),
+        "--- ~/.lock (repo)\n+++ ~/.lock (deleted)\n@@ -1 +0,0 @@\n-agreed\n"
+    );
 
-        // Neither an apply nor a sync writes either side, twice over.
-        for _ in 0..2 {
-            let applied = apply(&inputs);
-            assert!(!applied.executed, "{deleted}");
-            let synced = sync(&inputs);
-            assert!(!synced.executed, "{deleted}");
-            assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), before);
+    // A bare apply announces the removal and makes none of it.
+    let applied = apply(&inputs);
+    assert!(!applied.executed);
+    assert_eq!(
+        read(&copy(home.path(), "lock")).as_deref(),
+        Some("agreed\n")
+    );
+    assert_eq!(base(home.path(), "lock").as_deref(), Some(&b"agreed\n"[..]));
+
+    let synced = sync(&inputs);
+    assert!(synced.executed);
+    assert_eq!(exit(&synced, Mode::Sync), Exit::Converged);
+    assert!(
+        !copy(home.path(), "lock").exists(),
+        "the repo copy is removed"
+    );
+    assert!(!machine(home.path(), "lock").exists());
+    assert_eq!(kept(home.path(), "lock"), None, "nothing is agreed on");
+    removed_with_prior(home.path(), "~/.config/bx/files/lock", b"agreed\n");
+    assert!(
+        entry(home.path(), "~/.lock").is_none(),
+        "nothing on this machine"
+    );
+
+    // Twice over, nothing is left to do.
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+    assert!(!sync(&inputs).executed);
+    assert!(!apply(&inputs).executed);
+
+    // `bx rm` puts back the copy the removal took.
+    let state = StateDir::resolve(home.path());
+    let copy_key = Portable::parse_in("~/.config/bx/files/lock", home.path()).expect("a path");
+    crate::restore::restore(&state, home.path(), &[copy_key]).expect("rm");
+    assert_eq!(
+        read(&copy(home.path(), "lock")).as_deref(),
+        Some("agreed\n")
+    );
+    assert!(entry(home.path(), "~/.config/bx/files/lock").is_none());
+}
+
+#[test]
+fn a_repo_deletion_beside_an_agreed_machine_copy_is_carried_by_apply() {
+    let (home, inputs) = agreed_home("agreed\n");
+    std::fs::set_permissions(
+        machine(home.path(), "lock"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .expect("a private mode");
+    std::fs::remove_file(copy(home.path(), "lock")).expect("the deletion");
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Modify]);
+    assert_eq!(exit(&planned, Mode::Plan), Exit::Pending);
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.starts_with("deleted: the repo's copy"), "{note}");
+    assert_eq!(
+        text(&planned.changes[0]),
+        "--- ~/.lock (this machine)\n+++ ~/.lock (deleted)\n@@ -1 +0,0 @@\n-agreed\n"
+    );
+
+    let applied = apply(&inputs);
+    assert!(applied.executed);
+    assert!(
+        !machine(home.path(), "lock").exists(),
+        "this machine's is removed"
+    );
+    assert_eq!(kept(home.path(), "lock"), None, "nothing is agreed on");
+    // The copy was the tool's, never bx's, so its bytes become the prior.
+    removed_with_prior(home.path(), "~/.lock", b"agreed\n");
+
+    // Apply twice: the second plan is empty, and neither command writes.
+    let before = snapshot(home.path(), &[".local/state/bx/lock"]);
+    assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged]);
+    assert!(!apply(&inputs).executed);
+    assert!(!sync(&inputs).executed);
+    assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), before);
+
+    // `bx rm` puts back the bytes the removal took, at their mode.
+    let state = StateDir::resolve(home.path());
+    let key = Portable::parse_in("~/.lock", home.path()).expect("a path");
+    crate::restore::restore(&state, home.path(), &[key]).expect("rm");
+    assert_eq!(
+        read(&machine(home.path(), "lock")).as_deref(),
+        Some("agreed\n")
+    );
+    assert_eq!(mode_of(&machine(home.path(), "lock")), 0o600);
+    assert!(entry(home.path(), "~/.lock").is_none());
+}
+
+#[test]
+fn a_target_bx_removed_then_switched_to_apply_is_created_not_a_deletion() {
+    let (home, tracked) = agreed_home("agreed\n");
+    std::fs::remove_file(copy(home.path(), "lock")).expect("the deletion");
+    assert!(apply(&tracked).executed);
+    let removal = entry(home.path(), "~/.lock").expect("bx's removal");
+    assert_eq!(removal.written, crate::state::removed_written());
+
+    // The repo gains a copy again, now applied one way. Nothing at `~/.lock`
+    // is what bx last left, so the write is a create, not a git-style
+    // deletion the user made.
+    put(&copy(home.path(), "lock"), "fresh\n");
+    let applied = inputs(
+        &home,
+        "[[target]]\npath = \"~/.lock\"\nfile = \"files/lock\"\ndirection = \"apply\"\n",
+    );
+    let planned = plan(&applied);
+    assert_eq!(planned.actions(), vec![Action::Create], "{planned:?}");
+    assert!(apply(&applied).executed);
+    assert_eq!(
+        read(&machine(home.path(), "lock")).as_deref(),
+        Some("fresh\n")
+    );
+}
+
+#[test]
+fn a_copy_that_appears_after_a_carried_deletion_is_a_first_copy_never_removed_again() {
+    let (home, inputs) = agreed_home("agreed\n");
+    std::fs::remove_file(copy(home.path(), "lock")).expect("the deletion");
+    assert!(apply(&inputs).executed);
+
+    // The tool writes its file again, with the very bytes once agreed on.
+    put(&machine(home.path(), "lock"), "agreed\n");
+    let planned = plan(&inputs);
+    assert_eq!(
+        planned.actions(),
+        vec![Action::Sync],
+        "carried, not removed"
+    );
+    assert!(sync(&inputs).executed);
+    assert_eq!(
+        read(&copy(home.path(), "lock")).as_deref(),
+        Some("agreed\n")
+    );
+    assert_eq!(base(home.path(), "lock").as_deref(), Some(&b"agreed\n"[..]));
+
+    // A copy put back where bx removed one is not bx's: `rm` refuses to
+    // destroy it.
+    let state = StateDir::resolve(home.path());
+    let key = Portable::parse_in("~/.lock", home.path()).expect("a path");
+    let removal = entry(home.path(), "~/.lock").expect("still bx's removal");
+    assert_eq!(removal.written, crate::state::removed_written());
+    let refused = crate::restore::restore(&state, home.path(), &[key]).expect("rm");
+    let [crate::restore::Restored::Conflict { note, .. }] = refused.as_slice() else {
+        panic!("{refused:?}");
+    };
+    assert!(
+        note.starts_with("has been put back since bx removed it"),
+        "{note}"
+    );
+    assert_eq!(
+        read(&machine(home.path(), "lock")).as_deref(),
+        Some("agreed\n")
+    );
+    assert!(entry(home.path(), "~/.lock").is_some(), "forgets nothing");
+}
+
+#[test]
+fn both_copies_deleted_forget_their_agreement() {
+    let (home, inputs) = agreed_home("agreed\n");
+    std::fs::remove_file(copy(home.path(), "lock")).expect("the repo's");
+    std::fs::remove_file(machine(home.path(), "lock")).expect("this machine's");
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Unchanged]);
+    assert_eq!(base(home.path(), "lock").as_deref(), Some(&b"agreed\n"[..]));
+    assert!(!apply(&inputs).executed);
+    assert_eq!(kept(home.path(), "lock"), None);
+    assert!(
+        entry(home.path(), "~/.lock").is_none(),
+        "nothing was removed"
+    );
+}
+
+/// The home the removal crash child applies in. Passed per command.
+const REMOVAL_CRASH_HOME: &str = "BX_PLAN_REMOVAL_CRASH_HOME";
+
+/// A tracked target whose repo copy was deleted since the two agreed, so an
+/// apply removes this machine's.
+fn seed_removal_crash(home: &Path) {
+    std::fs::create_dir_all(home).expect("the crash home");
+    put(&machine(home, "lock"), "agreed\n");
+    put(&copy(home, "lock"), "agreed\n");
+    seed(home, &layer(&["lock"]));
+    run(&load(home), Mode::Apply, &mut |_| {
+        panic!("nothing to approve")
+    })
+    .expect("the agreeing apply");
+    std::fs::remove_file(copy(home, "lock")).expect("the deletion");
+}
+
+#[test]
+#[ignore = "spawned by the crash harness; it aborts on purpose"]
+fn removal_crash_child() {
+    let Some(home) = std::env::var_os(REMOVAL_CRASH_HOME) else {
+        return;
+    };
+    apply(&load(Path::new(&home)));
+}
+
+#[test]
+fn an_apply_killed_at_any_phase_of_a_carried_deletion_recovers_to_it() {
+    let guard = guarded_home();
+    // A removal is never staged or filled: these are the phases it reaches.
+    let boundaries = [
+        "before-stage",
+        "after-intent",
+        "after-publish",
+        "after-done",
+    ]
+    .map(|phase| (0, phase))
+    .into_iter()
+    .chain(finish_crash_phases().map(|phase| (1, phase)));
+    let mut crossed = 0;
+    for (index, phase) in boundaries {
+        let at = format!("{index}:{phase}");
+        let home = guard.child(format!("crash-{index}-{phase}"));
+        seed_removal_crash(&home);
+        let output = crate::testing::ignored_child("plan::tests::track::removal_crash_child")
+            .env("BX_CRASH_AT", &at)
+            .env(REMOVAL_CRASH_HOME, &home)
+            .env_remove("LLVM_PROFILE_FILE")
+            .output()
+            .expect("spawn the crash child");
+        assert!(!output.status.success(), "{at}: the child did not stop");
+
+        let inputs = load(&home);
+        let recovering = apply(&inputs);
+        assert!(
+            recovering.recovered.is_some(),
+            "{at}: nothing was recovered"
+        );
+        // Rolled back, the copy is there and nothing claims it; rolled
+        // forward, it is gone and its entry is kept, as the clean apply
+        // leaves both.
+        match read(&machine(&home, "lock")) {
+            Some(bytes) => {
+                assert_eq!(bytes, "agreed\n", "{at}");
+                assert!(entry(&home, "~/.lock").is_none(), "{at}");
+            }
+            None => removed_with_prior(&home, "~/.lock", b"agreed\n"),
         }
-        assert!(!gone.exists(), "{deleted}: the deletion stands");
-        assert_eq!(read(&kept).as_deref(), Some("agreed\n"), "{deleted}");
-        assert_eq!(base(home.path(), "lock").as_deref(), Some(&b"agreed\n"[..]));
+        // The next apply finishes what the interrupted one began.
+        apply(&inputs);
+        assert_eq!(plan(&inputs).actions(), vec![Action::Unchanged], "{at}");
+        assert!(!machine(&home, "lock").exists(), "{at}");
+        removed_with_prior(&home, "~/.lock", b"agreed\n");
+        assert_eq!(kept(&home, "lock"), None, "{at}");
+        crossed += 1;
     }
+    assert_eq!(crossed, 4 + finish_crash_phases().len());
 }
 
 #[test]

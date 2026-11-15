@@ -6,7 +6,9 @@ use super::{ABANDON, Error, Standing, Unfinished};
 use crate::fs::{self, Kind, Mode};
 use crate::journal::{Intent, Loaded, Written};
 use crate::paths::Portable;
-use crate::state::{ContentHash, LedgerView, NewEntry, Prior, PriorBytes, RestoreRef, StateDir};
+use crate::state::{
+    ContentHash, LedgerView, NewEntry, Prior, PriorBytes, RestoreRef, StateDir, removed_written,
+};
 
 /// What recovery does about one intent.
 pub(super) enum Step {
@@ -213,9 +215,19 @@ pub(super) fn decide(
              and the next writing bx run records it"
         )
     };
-    let (Written::Present { digest, mode }, Some(mechanism)) =
-        (intent.after, intent.mechanism.clone())
-    else {
+    let written = match (intent.after, intent.mechanism.clone(), &intent.before) {
+        (Written::Present { digest, mode }, Some(mechanism), _) => Some((digest, mode, mechanism)),
+        // A removal that kept its entry — a tracked target's deletion carried
+        // to its other side — is recorded as the session records it: at the
+        // absence, at the mode of the bytes it removed, which become its prior.
+        (Written::Absent, Some(mechanism), Prior::Existed(reference))
+            if !intent.dir && !intent.link =>
+        {
+            Some((removed_written(), reference.mode, mechanism))
+        }
+        _ => None,
+    };
+    let Some((digest, mode, mechanism)) = written else {
         // A removal, or a target the session released: nothing for bx to own.
         let mut note = recorded();
         if intent.after == Written::Absent {
@@ -1312,6 +1324,76 @@ mod tests {
         };
         assert_eq!(original.digest, ContentHash::of(b"user line\n"));
         assert_eq!(peek(&dest).expect("untouched").0, bx2.as_bytes());
+    }
+
+    #[test]
+    fn only_a_file_removal_that_kept_its_entry_is_rolled_forward_to_a_record() {
+        // A terminated journal whose one landed write removed `dest` under a
+        // mechanism. A file so removed is a tracked target's carried deletion:
+        // its entry is kept at `removed_written()`, with the removed bytes as
+        // its prior. A directory or a link so removed keeps nothing.
+        for (dir, link) in [(false, false), (true, false), (false, true)] {
+            let case = format!("dir {dir}, link {link}");
+            let home = guarded_home();
+            let state = StateDir::resolve(home.path());
+            state.ensure().expect("ensure");
+            let (portable, dest) = target(home.path(), ".conf");
+            let removed = b"the removed copy\n";
+            let digest = ContentHash::of(removed);
+            fs::write_atomically(
+                &state.restore().join(digest.to_hex()),
+                removed,
+                Mode::PRIVATE_FILE,
+            )
+            .expect("the snapshot");
+            raw_journal(
+                &state.journal(),
+                &[
+                    Record::Begin(Begin {
+                        kind: SessionKind::Apply,
+                        home: home.path().to_path_buf(),
+                        scope: Vec::new(),
+                    }),
+                    Record::Intent(Intent {
+                        before: Prior::Existed(RestoreRef {
+                            digest,
+                            mode: Mode::PRIVATE_FILE,
+                            len: u64::try_from(removed.len()).expect("a length"),
+                        }),
+                        after: Written::Absent,
+                        dir,
+                        link,
+                        ..intent(&portable, &dest, removed)
+                    }),
+                    Record::Done(Done {
+                        target: portable.clone(),
+                    }),
+                    Record::End(End { written: 1 }),
+                ],
+            );
+
+            assert_eq!(
+                recover(&state).expect("recover"),
+                Outcome::Recorded { entries: 1 },
+                "{case}",
+            );
+            let entry = LedgerView::read(&state, home.path())
+                .expect("read the ledger")
+                .value
+                .get(&portable)
+                .cloned();
+            if dir || link {
+                assert!(entry.is_none(), "{case}: {entry:?}");
+                continue;
+            }
+            let entry = entry.expect("a carried deletion keeps its entry");
+            assert_eq!(entry.written, removed_written());
+            assert_eq!(entry.mode, Mode::PRIVATE_FILE);
+            let Prior::Existed(prior) = &entry.prior else {
+                panic!("the removed bytes are the prior: {entry:?}");
+            };
+            assert_eq!(prior.digest, digest);
+        }
     }
 
     #[test]

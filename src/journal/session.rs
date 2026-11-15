@@ -15,7 +15,7 @@ use crate::paths::Portable;
 use crate::state::restore;
 use crate::state::{
     ContentHash, DIR_BYTES, ExclusiveLock, Ledger, LedgerView, Mechanism, NewEntry, Prior,
-    PriorBytes, StateDir, dir_digest, dir_prior,
+    PriorBytes, StateDir, dir_digest, dir_prior, removed_written,
 };
 
 /// A transaction over the state directory: the lock, the ledger, the journal.
@@ -115,10 +115,19 @@ pub enum Content {
     /// `End` frame, `created_dirs` are removed, deepest first, while they are
     /// empty directories and no entry the ledger still holds names them; one
     /// that is no longer a directory is left. Absence is not emptiness: a file
-    /// bx created is removed, never truncated. The target is always dropped
-    /// from the ledger — there is nothing left for bx to own. A claimed
-    /// directory that still stands then is handed to a surviving entry beneath
-    /// it: see [`Session::finish`].
+    /// bx created is removed, never truncated. With [`Ownership::Released`]
+    /// the target is dropped from the ledger — there is nothing left for bx to
+    /// own — and a claimed directory that still stands then is handed to a
+    /// surviving entry beneath it: see [`Session::finish`].
+    ///
+    /// With [`Ownership::Owned`] the removal is bx's own write, which `bx rm`
+    /// must be able to take back: the entry is kept, recorded at
+    /// [`crate::state::removed_written`] with the bytes removed as its prior,
+    /// as any write records what it displaced, and with the claims it already
+    /// held, so `created_dirs` are neither pruned nor recorded and a caller
+    /// names none. The Intent names the mechanism, so a terminated journal's
+    /// recovery records the entry rather than dropping it. A tracked target
+    /// whose deletion is carried to its other side is removed this way.
     Absent {
         /// Directories bx created for the target, deepest first.
         created_dirs: Vec<PathBuf>,
@@ -183,6 +192,18 @@ pub enum Content {
         /// removal, checked as [`Content::Absent`] checks its own.
         planned: fs::Observed,
     },
+}
+
+/// What [`Session::remove`] removes, and what becomes of the target's entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Removal {
+    /// A file, whose entry is dropped: [`Content::Absent`] released.
+    File,
+    /// A file, whose entry is kept, attached this way, recording the absence:
+    /// [`Content::Absent`] owned.
+    Kept(Mechanism),
+    /// A symlink, whose entry is dropped: [`Content::LinkAbsent`].
+    Link,
 }
 
 /// Whether bx owns what the write leaves behind.
@@ -428,7 +449,13 @@ impl Session {
             Content::Absent {
                 created_dirs,
                 planned,
-            } => self.remove(index, target, dest, created_dirs, &planned, false),
+            } => {
+                let removal = match ownership {
+                    Ownership::Owned(mechanism) => Removal::Kept(mechanism),
+                    Ownership::Released => Removal::File,
+                };
+                self.remove(index, target, dest, created_dirs, &planned, removal)
+            }
             Content::Dir { planned } => self.write_dir(target, dest, &planned, mode, &ownership),
             Content::DirAbsent {
                 created_dirs,
@@ -440,7 +467,7 @@ impl Session {
             Content::LinkAbsent {
                 created_dirs,
                 planned,
-            } => self.remove(index, target, dest, created_dirs, &planned, true),
+            } => self.remove(index, target, dest, created_dirs, &planned, Removal::Link),
         };
         if let Err(e) = applied {
             self.poisoned = true;
@@ -953,8 +980,8 @@ impl Session {
     /// What stays open is the window between that last look and the `unlink`
     /// call itself.
     ///
-    /// `link` says the target is a symlink: then only a link is removed, its
-    /// text is the prior stored, and the Intent is marked [`Intent::link`].
+    /// `removal` says what is removed and what becomes of its entry: see
+    /// [`Removal`].
     fn remove(
         &mut self,
         index: usize,
@@ -962,8 +989,9 @@ impl Session {
         dest: PathBuf,
         created_dirs: Vec<PathBuf>,
         planned: &Observed,
-        link: bool,
+        removal: Removal,
     ) -> Result<(), Error> {
+        let link = removal == Removal::Link;
         let observed = refuse_unplanned(&dest, planned)?;
         if link && observed.kind != fs::Kind::Symlink {
             return Err(fs::Error::NotALink {
@@ -980,6 +1008,25 @@ impl Session {
             .into());
         }
 
+        // A removal that keeps its entry records the absence it leaves, with
+        // the bytes it removes as the prior, and the ledger's refusal is asked
+        // before anything is stored or announced, as in `write`. Its mode is
+        // the one the removed file had, which is the one recovery reads back
+        // from the stored prior.
+        let kept = match removal {
+            Removal::Kept(mechanism) => {
+                let entry = NewEntry::new(
+                    target.clone(),
+                    removed_written(),
+                    observed.mode.unwrap_or(Mode::DEFAULT_FILE),
+                    mechanism.clone(),
+                    PriorBytes::of(&observed),
+                );
+                self.ledger.check_record(&entry)?;
+                Some((entry, mechanism))
+            }
+            Removal::File | Removal::Link => None,
+        };
         // Same as in `write`: the bytes the removal is about to displace are
         // made durable before the Intent frame that names them.
         let before = if link {
@@ -995,7 +1042,7 @@ impl Session {
             before,
             after: Written::Absent,
             created_dirs: created_dirs.clone(),
-            mechanism: None,
+            mechanism: kept.as_ref().map(|(_, mechanism)| mechanism.clone()),
             ledger_written: self.ledger.get(&target).map(|entry| entry.written),
             dir: false,
             link,
@@ -1010,13 +1057,21 @@ impl Session {
         // took two `fsync`s, and an editor may have saved in between.
         refuse_moved(planned, &fs::observe(&dest)?)?;
         unlink(&dest)?;
-        // Pruned only once the session's `End` is durable: see
-        // `Session::finish`.
-        self.released.extend(created_dirs);
-        // As in `write`: the entry goes only once the file has. The entry is
-        // dropped deliberately: its claims are the `created_dirs` the Intent
-        // already carries into `self.released` above.
-        let _ = self.ledger.forget(&target);
+        // As in `write`: the entry changes only once the file has gone.
+        match kept {
+            // Kept, and so are its claims: nothing is pruned.
+            Some((entry, _)) => {
+                self.ledger.record(entry)?;
+            }
+            None => {
+                // Pruned only once the session's `End` is durable: see
+                // `Session::finish`.
+                self.released.extend(created_dirs);
+                // Dropped deliberately: its claims are the `created_dirs` the
+                // Intent already carries into `self.released` above.
+                let _ = self.ledger.forget(&target);
+            }
+        }
         self.crash.reached(index, Phase::AfterPublish);
 
         self.journal.append(&Record::Done(Done { target }))?;

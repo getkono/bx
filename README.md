@@ -161,7 +161,11 @@ it yours.
   +  create     it does not exist yet
   ~  modify     bx owns it and the content differs — or it already holds
                 exactly what bx wants, and bx takes ownership of it
-                without changing a byte, so `bx rm` leaves it in place
+                without changing a byte, so `bx rm` leaves it in place.
+                Also a tracked file deleted from the repo since the last
+                sync while this machine's copy is still as the two agreed:
+                `apply` removes this machine's copy too, and `bx rm` puts
+                it back unless bx itself created that copy
   -  undo       bx wrote it, the configuration no longer declares it, and
                 it is still exactly what bx left: bx takes it back as
                 `bx rm` would. A file bx created is removed with the
@@ -176,7 +180,11 @@ it yours.
                 put back, or it is in the config repo, which is git's to
                 keep. Kept byte for byte; bx only stops managing it.
   <  sync       a tracked file this machine changed; `bx sync` carries
-                this machine's copy into the repo and commits it
+                this machine's copy into the repo and commits it. Also one
+                this machine deleted while the repo's copy is still as the
+                two agreed: `bx sync` removes the repo's copy and commits
+                the removal, and `bx rm` puts it back unless bx itself
+                created that copy
   !  conflict   it exists, differs, and bx does not own it — or you edited
                 bx's output. Reported and skipped, never overwritten, unless
                 you answer `apply`'s question about an edited file with
@@ -205,9 +213,7 @@ it yours.
                 link bx made that you deleted while the configuration still
                 wants exactly what bx made: your deletion stands, as in git.
                 Shown like `git status`'s `deleted:`, never pending, and
-                `apply` asks at a terminal whether to restore it. A tracked
-                file deleted on one side since the last sync, with the other
-                side still as the two agreed, is left on both sides.
+                `apply` asks at a terminal whether to restore it.
 ```
 
 `plan` and `apply` compute this with the same code, so `apply` can never do work

@@ -712,6 +712,34 @@ fn a_checkout_that_takes_on_work_after_plan_is_stopped_at_its_own_row() {
 }
 
 #[test]
+fn an_undeclared_checkout_holding_an_ignored_file_is_kept_with_a_note() {
+    use crate::plan::tests::inline;
+
+    // #436: undoing an external nothing declares keeps what git ignores.
+    let home = guarded_home();
+    let up = upstream(&home);
+    let dir = home.child("upstream");
+    std::fs::write(dir.join(".gitignore"), ".env\n").expect("an ignore file");
+    commit_all(home.path(), &dir, "ignore");
+    let rev = git_run(home.path(), &dir, &["rev-parse", "HEAD"]);
+    let kept = inline("~/.b", "b\\n");
+    apply(&home, &format!("{kept}{}", layer(&rev)));
+    std::fs::write(home.child(AT).join(".env"), "TOKEN=mine\n").expect("the user's file");
+
+    let row = row(&plan(&home, &kept), &format!("~/{AT}")).clone();
+    assert_eq!(row.action, Action::Undeclared, "{row:?}");
+    let note = row.note.expect("a note");
+    assert!(note.contains("the repository ignores"), "{note}");
+    apply(&home, &kept);
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join(".env")).expect("kept"),
+        "TOKEN=mine\n"
+    );
+    assert!(entry(&home).is_some(), "and nothing is forgotten");
+    let _ = up.first;
+}
+
+#[test]
 fn a_parent_that_cannot_be_made_at_apply_stops_the_clone_and_records_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -1118,7 +1146,7 @@ fn rm_leaves_a_clone_holding_anything_of_the_users() {
 }
 
 #[test]
-fn rm_ignores_what_the_repository_ignores_and_counts_a_rev_fetched_by_id() {
+fn rm_keeps_a_checkout_holding_what_the_repository_ignores_and_counts_a_rev_fetched_by_id() {
     let home = guarded_home();
     let up = upstream(&home);
     let dir = home.child("upstream");
@@ -1139,8 +1167,27 @@ fn rm_ignores_what_the_repository_ignores_and_counts_a_rev_fetched_by_id() {
     let applied = apply(&home, &layer(&loose));
     assert!(applied.stopped.is_empty(), "{applied:?}");
     assert_eq!(checked_out(&home), loose);
-    std::fs::write(home.child(AT).join("a.zsh.zwc"), "compiled").expect("an ignored file");
+    std::fs::create_dir(home.child(AT).join("cache")).expect("an ignored directory");
+    std::fs::write(home.child(AT).join("cache/a.zsh.zwc"), "compiled").expect("an ignored file");
+    std::fs::write(home.child(AT).join("b.zsh.zwc"), "compiled").expect("an ignored file");
 
+    // #436. A file git declines to track is still a byte someone wrote.
+    let done = rm(&home);
+    let [Restored::Conflict { note, .. }] = done.as_slice() else {
+        panic!("{done:?}");
+    };
+    assert!(
+        note.contains("holds 2 file(s) the repository ignores, which removing it would lose"),
+        "{note}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("cache/a.zsh.zwc")).expect("kept"),
+        "compiled"
+    );
+    assert!(entry(&home).is_some(), "and nothing is forgotten");
+
+    std::fs::remove_dir_all(home.child(AT).join("cache")).expect("the user's own cleanup");
+    std::fs::remove_file(home.child(AT).join("b.zsh.zwc")).expect("the user's own cleanup");
     let done = rm(&home);
     assert!(
         matches!(done.as_slice(), [Restored::Removed { .. }]),
@@ -1148,6 +1195,153 @@ fn rm_ignores_what_the_repository_ignores_and_counts_a_rev_fetched_by_id() {
     );
     assert!(!home.child(AT).exists());
     let _ = up.second;
+}
+
+/// Record the entry at [`AT`] as `written`, as an earlier run left it.
+fn record(home: &GuardedHome, written: crate::hash::ContentHash) {
+    let state = StateDir::resolve(home.path());
+    state.ensure().expect("the state directory");
+    let lock = ExclusiveLock::acquire(&state).expect("the lock");
+    let mut ledger = Ledger::open(&state, &lock, home.path())
+        .expect("open")
+        .value;
+    ledger
+        .record(NewEntry::new(
+            target(home),
+            written,
+            fs::Mode::DEFAULT_DIR,
+            Mechanism::Clone,
+            PriorBytes::Absent,
+        ))
+        .expect("record");
+    ledger.save().expect("save");
+}
+
+#[test]
+fn a_removal_that_stopped_part_way_is_asked_about_again_before_it_goes() {
+    // #436. What a removal left, with a file the user added before the next
+    // run: neither `rm` nor `apply` removes it unseen.
+    let home = guarded_home();
+    let up = upstream(&home);
+    apply(&home, &layer(&up.first));
+    record(&home, clone_removing());
+    std::fs::remove_file(home.child(AT).join("a.zsh")).expect("what the removal took");
+    std::fs::write(home.child(AT).join("mine"), "mine\n").expect("the user's file");
+
+    let row = only(&plan(&home, &layer(&up.first))).clone();
+    assert_eq!(row.action, Action::Conflict, "{row:?}");
+    let note = row.note.expect("a note");
+    assert!(
+        note.contains("is what an interrupted removal left, and has uncommitted changes"),
+        "{note}"
+    );
+    let applied = apply(&home, &layer(&up.first));
+    assert_eq!(only(&applied).action, Action::Conflict, "{applied:?}");
+    assert!(
+        !finished_clone(
+            &LedgerView::read(&StateDir::resolve(home.path()), home.path())
+                .expect("the ledger")
+                .value,
+            &target(&home)
+        ),
+        "a removal in progress is not a finished checkout"
+    );
+    let done = rm(&home);
+    assert!(
+        matches!(done.as_slice(), [Restored::Conflict { .. }]),
+        "{done:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("mine")).expect("kept"),
+        "mine\n"
+    );
+    assert_eq!(
+        entry(&home).expect("not forgotten").written,
+        clone_removing()
+    );
+
+    // With the user's file gone, what is left holds nothing of anyone's: a
+    // tracked file the removal already took is in the commit. `apply`
+    // replaces it with a fresh clone, and `rm` removes it.
+    std::fs::remove_file(home.child(AT).join("mine")).expect("the user's own cleanup");
+    let row = only(&plan(&home, &layer(&up.first))).clone();
+    assert_eq!(row.action, Action::Create, "{row:?}");
+    assert!(
+        row.note
+            .as_deref()
+            .is_some_and(|n| n.contains("removes what an interrupted removal left")),
+        "{row:?}"
+    );
+    let applied = apply(&home, &layer(&up.first));
+    assert!(applied.stopped.is_empty(), "{applied:?}");
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("a.zsh")).expect("cloned again"),
+        "one\n"
+    );
+    assert_eq!(
+        plan(&home, &layer(&up.first)).actions(),
+        [Action::Unchanged]
+    );
+
+    record(&home, clone_removing());
+    std::fs::remove_file(home.child(AT).join("a.zsh")).expect("what the removal took");
+    assert!(matches!(rm(&home).as_slice(), [Restored::Removed { .. }]));
+    assert!(!home.child(AT).exists());
+}
+
+#[test]
+fn what_an_interrupted_removal_left_that_takes_on_work_after_plan_is_not_removed() {
+    let home = guarded_home();
+    let up = upstream(&home);
+    apply(&home, &layer(&up.first));
+    record(&home, clone_removing());
+    let row = only(&plan(&home, &layer(&up.first))).clone();
+    assert_eq!(row.action, Action::Create, "{row:?}");
+
+    let applied = apply_after(&home, &layer(&up.first), || {
+        std::fs::write(home.child(AT).join("mine"), "mine\n").expect("the user's file");
+    });
+    let note = stopped_note(&applied);
+    assert!(
+        note.contains("is what an interrupted removal left, and has uncommitted changes"),
+        "{note}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(AT).join("mine")).expect("kept"),
+        "mine\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_removal_that_fails_part_way_leaves_its_own_marker() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = guarded_home();
+    let up = upstream(&home);
+    apply(&home, &layer(&up.first));
+    let held = home.child(AT).join(".git/held");
+    std::fs::create_dir(&held).expect("a directory");
+    std::fs::write(held.join("x"), "x").expect("a file in it");
+    std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    let denied = std::fs::remove_file(held.join("x")).is_err();
+    let removed = restore::restore_undeclared_with(
+        &StateDir::resolve(home.path()),
+        home.path(),
+        &[target(&home)],
+        &std::collections::BTreeSet::new(),
+        &git(home.path()),
+    );
+    std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    if !denied {
+        // Running as a user the mode does not stop: nothing to interrupt.
+        return;
+    }
+    assert!(removed.is_err(), "{removed:?}");
+    assert_eq!(
+        entry(&home).expect("the entry stays").written,
+        clone_removing(),
+        "a removal in progress, not an interrupted clone"
+    );
 }
 
 #[test]

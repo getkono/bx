@@ -167,8 +167,9 @@ it yours.
                 `bx rm` would. A file bx created is removed with the
                 directories it made for it, one it replaced gets its earlier
                 bytes and mode back, a link is unlinked, and a checkout
-                holding nothing its remote lacks is removed. The diff shows
-                sizes only, since a removed file may have been a secret.
+                holding nothing its remote lacks, not even a file git
+                ignores, is removed. The diff shows sizes only, since a
+                removed file may have been a secret.
   ^  release    bx wrote it, the configuration no longer declares it, and
                 there is nothing to take back: you edited it since, so it is
                 yours now, or it is already gone or already what bx would
@@ -193,7 +194,8 @@ it yours.
                 but bx will not take it back: the configuration declares
                 nothing at all, which is what an emptied `bx.toml` looks
                 like; it cannot be looked at; or it is a checkout holding
-                work. Left exactly as it is; `bx rm` releases it.
+                work, a file git ignores included. Left exactly as it is;
+                `bx rm` releases it.
   =  unchanged  already converged (hidden unless you ask)
 ```
 

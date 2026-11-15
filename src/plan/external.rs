@@ -42,6 +42,15 @@
 //! commit. A run that stops in between leaves an entry the next decision reads
 //! as interrupted: `plan` shows a create that removes what was left and clones
 //! again, and `apply` does that. The directory is never reported as converged.
+//!
+//! # Nor is an interrupted removal
+//!
+//! Removing a finished checkout records it first as [`clone_removing`], a
+//! marker of its own. What such a removal left may hold what the user put
+//! back or added since, so it is never removed unseen: the next decision
+//! asks [`kept_by_rm`] about it, and replaces it with a fresh clone only when
+//! nothing in it is anyone's but the remote's. Otherwise it is a conflict, and
+//! the directory stays exactly as it is.
 
 use std::path::{Path, PathBuf};
 
@@ -56,7 +65,7 @@ use crate::paths::{self, Portable};
 use crate::report::Action;
 use crate::state::{
     self, ExclusiveLock, Ledger, LedgerEntry, LedgerView, Mechanism, NewEntry, PriorBytes,
-    StateDir, clone_written,
+    StateDir, clone_removing, clone_written,
 };
 
 /// What a decision may read: nothing it could change.
@@ -257,6 +266,7 @@ fn decide(external: &External, rev: &str, ctx: &Ctx<'_>) -> Decision {
         ));
     }
     let interrupted = entry.is_some_and(|entry| entry.written == clone_written(None));
+    let removing = entry.filter(|entry| entry.written == clone_removing());
 
     match observed.kind {
         Kind::Absent => {
@@ -306,6 +316,27 @@ fn decide(external: &External, rev: &str, ctx: &Ctx<'_>) -> Decision {
                 created_dirs: Vec::new(),
             }),
         )),
+        Kind::Dir if removing.is_some() => {
+            match removing.and_then(|entry| kept_by_rm(ctx.git, &dest, entry)) {
+                None => Ok((
+                    row(
+                        Action::Create,
+                        Some(Diff::checkout(None, rev, url)),
+                        Some(format!(
+                            "removes what an interrupted removal left here, which holds nothing its \
+                         remote lacks, and clones {url} at {rev} again"
+                        )),
+                    ),
+                    Some(Work::Clone {
+                        replace: true,
+                        created_dirs: Vec::new(),
+                    }),
+                )),
+                Some(why) => conflict(format!(
+                    "is what an interrupted removal left, and {why}; bx left it as it is"
+                )),
+            }
+        }
         Kind::Dir => match entry {
             None => conflict(
                 "exists and bx did not clone it; bx never clones into, overwrites or adopts a \
@@ -529,9 +560,19 @@ fn clone(
     let interrupted = ledger
         .get(&op.target)
         .is_some_and(|entry| entry.written == clone_written(None));
+    // What an interrupted removal left is asked about again here, since the
+    // user may have added to it since `plan` looked.
+    let removing = ledger
+        .get(&op.target)
+        .filter(|entry| entry.written == clone_removing());
     match (replace, now.kind) {
         (false, Kind::Absent) => {}
-        (true, Kind::Dir) if interrupted => {
+        (true, Kind::Dir) if interrupted || removing.is_some() => {
+            if let Some(why) = removing.and_then(|entry| kept_by_rm(git, &op.dest, entry)) {
+                return Ok(Err(format!(
+                    "is what an interrupted removal left, and {why}; bx left it as it is"
+                )));
+            }
             std::fs::remove_dir_all(&op.dest).map_err(|source| journal::Error::Io {
                 path: op.dest.clone(),
                 source,
@@ -771,9 +812,11 @@ pub(crate) fn finished_clone_entry<'a>(
     ledger: &'a LedgerView,
     path: &Portable,
 ) -> Option<&'a LedgerEntry> {
-    ledger
-        .get(path)
-        .filter(|entry| entry.mechanism == Mechanism::Clone && entry.written != clone_written(None))
+    ledger.get(path).filter(|entry| {
+        entry.mechanism == Mechanism::Clone
+            && entry.written != clone_written(None)
+            && entry.written != clone_removing()
+    })
 }
 
 /// Whether the ledger records `path` as a clone of bx's, finished or not: a
@@ -795,17 +838,50 @@ fn dirty(git: &Git, dest: &Path) -> Result<bool, git::Error> {
 /// Why `rm` must leave the checkout at `dest`, or `None` when nothing in it
 /// is anyone's but the remote's.
 ///
-/// A file `git status` shows — changed, staged or untracked — and a commit
-/// that no remote-tracking branch holds, on any ref or in the stash, are the
-/// user's: removing the directory would lose them. The commit bx last left
-/// checked out is not counted, since bx fetched it. A file the repository
-/// ignores is not the user's either: the repository declares it disposable.
+/// A file `git status` shows — changed, staged, untracked or ignored — and a
+/// commit that no remote-tracking branch holds, on any ref or in the stash,
+/// are the user's: removing the directory would lose them. The commit bx last
+/// left checked out is not counted, since bx fetched it. A file the
+/// repository ignores is the user's too: git declining to track it — a
+/// plugin's `.env`, a local override, a cache of work — says nothing about
+/// whether anyone can make it again, and bx never deletes a byte the user
+/// wrote.
+///
+/// What a removal bx began left — an entry at [`clone_removing`] — is asked
+/// the same, except that a tracked file already gone is not counted: the
+/// commit holds it. The commit bx left checked out is not known for it any
+/// more, so a commit no remote-tracking branch holds keeps it, even that one.
 pub(crate) fn kept_by_rm(git: &Git, dest: &Path, entry: &LedgerEntry) -> Option<String> {
     if let Err(note) = own_checkout(git, dest) {
         return Some(note);
     }
-    match git.query(dest, &["status", "--porcelain", "--untracked-files=all"]) {
-        Ok(status) if status.is_empty() => {}
+    let status = git.query_whole(
+        dest,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+    );
+    // A tracked file a removal bx began already took is in the commit, and
+    // losing it loses nothing.
+    let removing = entry.written == clone_removing();
+    let status = status.map(|status| {
+        status
+            .lines()
+            .filter(|line| !(removing && line.starts_with(" D ")))
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+    match status {
+        Ok(lines) if lines.is_empty() => {}
+        Ok(lines) if lines.iter().all(|line| line.starts_with("!! ")) => {
+            return Some(format!(
+                "holds {} file(s) the repository ignores, which removing it would lose",
+                lines.len()
+            ));
+        }
         Ok(_) => {
             return Some(
                 "has uncommitted changes or untracked files that removing it would lose"

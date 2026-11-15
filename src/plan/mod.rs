@@ -485,8 +485,12 @@ fn decide_and_write(
                 }
                 let progress = execute::progress(execute::steps(&ops, &released), inputs.progress);
                 execute::execute(ops, &released, session, &progress)?;
+                // Best effort: every write has landed, and a base that could
+                // not be kept costs only the view, never the run.
                 for base in &kept {
-                    state::restore::keep(&inputs.state, base)?;
+                    if let Err(error) = state::restore::keep(&inputs.state, base) {
+                        tracing::warn!(%error, "the bytes bx wrote were not kept as a base");
+                    }
                 }
             }
             if !clones.is_empty() {

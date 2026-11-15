@@ -79,7 +79,7 @@ pub(crate) fn store_bytes(
     Ok(RestoreRef { digest, mode, len })
 }
 
-/// Keep `bytes`, which bx is about to write whole at a target, in
+/// Keep `bytes`, which bx has just written whole at a target, in
 /// `restore/` under their digest — the [`super::LedgerEntry::written`] the
 /// write records — as the base an edit of them is measured from.
 ///

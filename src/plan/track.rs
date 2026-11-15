@@ -35,8 +35,10 @@ impl Base {
     /// The largest agreement kept whole, in bytes.
     pub(super) const KEPT_WHOLE: usize = 64 * 1024;
 
-    /// [`Base::KEPT_WHOLE`], as a length on disk is measured.
-    pub(super) const LIMIT: u64 = 64 * 1024;
+    /// [`Base::KEPT_WHOLE`], as a length on disk is measured. Derived from it,
+    /// so the bound `restore::kept` reads under cannot drift from the one a
+    /// base is kept whole under.
+    pub(super) const LIMIT: u64 = Self::KEPT_WHOLE as u64;
 
     /// The tag of an agreement kept whole.
     const BYTES: u8 = b'=';

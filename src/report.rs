@@ -53,7 +53,9 @@ pub enum Action {
     /// Also a tracked target whose repo copy was deleted since the last sync
     /// while this machine's still holds what the two agreed on: the deletion
     /// is carried here, and `apply` removes this machine's copy, journalled
-    /// and claimed, so `bx rm` puts it back.
+    /// and claimed, so `bx rm` puts it back, unless bx itself created that
+    /// copy: then `bx rm` restores what was there before bx, which is
+    /// nothing.
     Modify,
     /// bx wrote this file, nothing declares it any more — its `[[target]]`
     /// was deleted, switched off or gated off here, or the repo file a `tree`
@@ -79,7 +81,8 @@ pub enum Action {
     ///
     /// Also a tracked target this machine deleted while the repo's copy still
     /// holds what the two last agreed on: `bx sync` removes the repo's copy,
-    /// claimed so `bx rm` puts it back, and commits the removal.
+    /// claimed so `bx rm` puts it back unless bx itself created that copy,
+    /// and commits the removal.
     Sync,
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.

@@ -165,7 +165,7 @@ it yours.
                 Also a tracked file deleted from the repo since the last
                 sync while this machine's copy is still as the two agreed:
                 `apply` removes this machine's copy too, and `bx rm` puts
-                it back
+                it back unless bx itself created that copy
   -  undo       bx wrote it, the configuration no longer declares it, and
                 it is still exactly what bx left: bx takes it back as
                 `bx rm` would. A file bx created is removed with the
@@ -183,7 +183,8 @@ it yours.
                 this machine's copy into the repo and commits it. Also one
                 this machine deleted while the repo's copy is still as the
                 two agreed: `bx sync` removes the repo's copy and commits
-                the removal, and `bx rm` puts it back
+                the removal, and `bx rm` puts it back unless bx itself
+                created that copy
   !  conflict   it exists, differs, and bx does not own it — or you edited
                 bx's output. Reported and skipped, never overwritten, unless
                 you answer `apply`'s question about an edited file with

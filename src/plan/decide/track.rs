@@ -94,13 +94,14 @@ pub(super) fn one_side_deleted(
         Gone::Machine => (
             Action::Sync,
             "deleted: this machine's copy was deleted since the last sync; bx sync removes the \
-             repo's and commits the removal, and bx rm puts it back",
+             repo's and commits the removal; bx rm puts it back unless bx itself created that \
+             copy",
             When::Synced,
         ),
         Gone::Repo => (
             Action::Modify,
             "deleted: the repo's copy was deleted since the last sync; apply removes this \
-             machine's, and bx rm puts it back",
+             machine's; bx rm puts it back unless bx itself created that copy",
             When::Applied,
         ),
     };

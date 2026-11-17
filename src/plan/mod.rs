@@ -330,6 +330,16 @@ fn decide_and_write(
         .iter()
         .map(|target| with_activations(target.clone(), &report.activations))
         .collect();
+    // Each zsh activation's own file and its wordcode, which zsh's
+    // interactive file sources, decided and written as any other file bx
+    // owns whole, and taken back once no activation renders them.
+    targets.extend(
+        report
+            .activations
+            .targets()
+            .into_iter()
+            .map(Resolution::Ready),
+    );
     let owned = |path: &paths::Portable| {
         ledger
             .get(path)
@@ -460,7 +470,9 @@ fn decide_and_write(
             // Each edit answered *take bx's* becomes the write its row was
             // decided with, and its row the modify that write is.
             // A deleted target answered *restore* becomes the create it was
-            // decided with.
+            // decided with. A zsh activation's wordcode tied to a taken file
+            // is written right after it, so it is never the older of the two.
+            let mut tied = decided.tied;
             for (row, op) in taken.into_iter().rev() {
                 let (action, note) = if op.deleted() {
                     (Action::Create, RESTORED)
@@ -469,6 +481,12 @@ fn decide_and_write(
                 };
                 report.changes[row].action = action;
                 report.changes[row].note = Some(note.to_string());
+                if let Some(at) = tied.iter().position(|tied| tied.source == row) {
+                    let tied = tied.remove(at);
+                    report.changes[tied.row].action = Action::Modify;
+                    report.changes[tied.row].note = tied.note;
+                    ops.insert(taken_at, tied.op);
+                }
                 ops.insert(taken_at, op);
             }
             // What each file bx writes whole will hold, kept once the session

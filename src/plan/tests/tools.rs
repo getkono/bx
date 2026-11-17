@@ -54,6 +54,10 @@ const STUB: &str = "[[activation]]\nname = \"stub\"\ncommand = [\"stub\", \"init
 
 const INTERACTIVE: &str = ".local/share/bx/zshrc.zsh";
 
+/// Where the stub activation's output is written, and its wordcode.
+const OUTPUT: &str = ".local/share/bx/activation/stub.zsh";
+const WORDCODE: &str = ".local/share/bx/activation/stub.zsh.zwc";
+
 #[test]
 fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
     let home = guarded_home();
@@ -65,9 +69,16 @@ fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
     // `plan` runs it twice, shows the capture, and writes nothing.
     let planned = plan(&inputs);
     assert_eq!(stub_runs(&home), 2);
+    // The interactive file, its `~/.zshrc` region, the output's own file,
+    // and the capture; no wordcode, since no zsh is on this `PATH`.
     assert_eq!(
         planned.actions(),
-        vec![Action::Create, Action::Modify, Action::Create]
+        vec![
+            Action::Create,
+            Action::Modify,
+            Action::Create,
+            Action::Create
+        ]
     );
     assert_eq!(exit(&planned, Mode::Plan), Exit::Pending);
     let shown = render(
@@ -90,16 +101,23 @@ fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
     let file = std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file");
     assert!(
         file.contains(
-            "\n# bx phase: completions\n# bx activation: stub\neval 'stub_hook() { :; }\n'\n"
+            "\n# bx phase: completions\n# bx activation: stub\n\
+             [[ -r ~/.local/share/bx/activation/stub.zsh ]] && \
+             source ~/.local/share/bx/activation/stub.zsh\n"
         ),
         "{file}"
     );
+    assert_eq!(
+        std::fs::read_to_string(home.child(OUTPUT)).expect("the output's file"),
+        "stub_hook() { :; }\n"
+    );
+    assert!(!home.child(WORDCODE).exists());
     let cache = std::fs::read(state.fingerprints()).expect("the cache is saved");
 
     // On an unchanged machine nothing runs and nothing is written.
     let again = plan(&inputs);
     assert_eq!(stub_runs(&home), 4);
-    assert_eq!(again.actions(), vec![Action::Unchanged; 3]);
+    assert_eq!(again.actions(), vec![Action::Unchanged; 4]);
     assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
     let quiet = render(
         &again,
@@ -138,7 +156,12 @@ fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
     assert!(lost.executed);
     assert_eq!(
         lost.actions(),
-        vec![Action::Unchanged, Action::Unchanged, Action::Create]
+        vec![
+            Action::Unchanged,
+            Action::Unchanged,
+            Action::Unchanged,
+            Action::Create
+        ]
     );
     assert_eq!(stub_runs(&home), 6);
     assert_eq!(
@@ -158,6 +181,7 @@ fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
         "user\n"
     );
     assert!(!home.child(INTERACTIVE).exists());
+    assert!(!home.child(OUTPUT).exists());
 }
 
 #[test]
@@ -259,22 +283,24 @@ fn a_capture_under_another_path_renders_the_same_file() {
 
     let applied = apply(&under(bin.display().to_string()));
     assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
-    let file = std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file");
-    assert!(
-        file.contains("eval 'export PATH='\\''/opt/stub/bin:'\\''\"$PATH\"\n'\n"),
-        "{file}"
-    );
+    let file = std::fs::read_to_string(home.child(OUTPUT)).expect("the output's file");
+    assert_eq!(file, "export PATH='/opt/stub/bin:'\"$PATH\"\n");
 
     std::fs::remove_file(state.fingerprints()).expect("lose the cache");
     let elsewhere = under(format!("{}:/nonexistent", bin.display()));
     let planned = plan(&elsewhere);
     assert_eq!(
         planned.actions(),
-        vec![Action::Unchanged, Action::Unchanged, Action::Create]
+        vec![
+            Action::Unchanged,
+            Action::Unchanged,
+            Action::Unchanged,
+            Action::Create
+        ]
     );
     apply(&elsewhere);
     assert_eq!(
-        std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file"),
+        std::fs::read_to_string(home.child(OUTPUT)).expect("the output's file"),
         file
     );
 }
@@ -434,6 +460,7 @@ fn an_absent_tool_is_blocked_and_everything_else_is_still_written() {
             Action::Create,
             Action::Create,
             Action::Create,
+            Action::Create,
             Action::Blocked
         ]
     );
@@ -454,4 +481,375 @@ fn an_absent_tool_is_blocked_and_everything_else_is_still_written() {
     let file = std::fs::read_to_string(home.child(INTERACTIVE)).expect("the file");
     assert!(file.contains("# bx activation: stub\n"), "{file}");
     assert!(!file.contains("gone"), "{file}");
+    assert!(home.child(OUTPUT).exists());
+    assert!(!home.child(".local/share/bx/activation/gone.zsh").exists());
+}
+
+#[test]
+fn a_zsh_activation_is_written_compiled_recompiled_and_taken_back_with_its_wordcode() {
+    let Some(zsh) = crate::shell::testing::installed("zsh") else {
+        return;
+    };
+    let home = guarded_home();
+    home.write(".zshrc", "user\n");
+    seed(home.path(), STUB);
+    stub_tool(&home);
+    // zsh's own directory after `~/bin`, so the plan finds a zsh to compile
+    // with.
+    let search = format!(
+        "{}:{}",
+        home.child("bin").display(),
+        zsh.parent().expect("zsh's directory").display()
+    );
+    let inputs = load(home.path()).with_host(activation::System::new(search, activation::TIMEOUT));
+    let state = StateDir::resolve(home.path());
+    let modified = |path: &str| {
+        std::fs::metadata(home.child(path))
+            .and_then(|meta| meta.modified())
+            .expect("written")
+    };
+
+    // The output's own file holds exactly the tool's bytes, and the wordcode
+    // zsh compiled from it is written after it, both as files bx owns.
+    let planned = plan(&inputs);
+    let rows: Vec<(&str, Action)> = planned
+        .changes
+        .iter()
+        .map(|change| (change.target.as_str(), change.action))
+        .collect();
+    assert_eq!(
+        rows[2..],
+        [
+            ("~/.local/share/bx/activation/stub.zsh", Action::Create),
+            ("~/.local/share/bx/activation/stub.zsh.zwc", Action::Create),
+        ]
+    );
+    let applied = apply(&inputs);
+    assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(OUTPUT)).expect("the output's file"),
+        b"stub_hook() { :; }\n"
+    );
+    let wordcode = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+    assert!(modified(WORDCODE) >= modified(OUTPUT));
+    let ledger = LedgerView::read(&state, home.path())
+        .expect("the ledger")
+        .value;
+    for path in [OUTPUT, WORDCODE] {
+        let entry = ledger
+            .get(&Portable::try_from(format!("~/{path}")).expect("portable"))
+            .expect("ledgered");
+        assert_eq!(entry.mechanism, Mechanism::Own, "{path}");
+    }
+    // zsh loads it: the hook the output defines is defined.
+    let out = std::process::Command::new(&zsh)
+        .args([
+            "-f",
+            "-c",
+            "source ~/.local/share/bx/zshrc.zsh; whence -w stub_hook",
+        ])
+        .env_clear()
+        .env("HOME", home.path())
+        .output()
+        .expect("zsh runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "stub_hook: function\n"
+    );
+
+    // A second apply has nothing to do, and runs neither the tool nor zsh.
+    let again = plan(&inputs);
+    assert!(
+        again.actions().iter().all(|a| *a == Action::Unchanged),
+        "{:?}",
+        again.actions()
+    );
+    assert_eq!(stub_runs(&home), 4);
+    assert!(!apply(&inputs).executed);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("unchanged"),
+        wordcode
+    );
+
+    // A tool printing something else rewrites both, the wordcode after.
+    std::fs::write(
+        home.child("bin/stub"),
+        "#!/bin/sh\nprintf 'stub_hook() { true; }\\n'\n",
+    )
+    .expect("an upgraded stub");
+    let upgraded = apply(&inputs);
+    assert_eq!(exit(&upgraded, Mode::Apply), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(OUTPUT)).expect("the output's file"),
+        b"stub_hook() { true; }\n"
+    );
+    let recompiled = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+    assert_ne!(recompiled, wordcode, "compiled again");
+    assert!(modified(WORDCODE) >= modified(OUTPUT));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+
+    // Switched off, in a configuration that still declares something, both
+    // are taken back; `rm` restores the rest.
+    seed(
+        home.path(),
+        &format!("{STUB}enabled = false\n[[target]]\npath = \"~/.a\"\ncontent = \"a\\n\"\n"),
+    );
+    let off = load(home.path()).with_host(activation::System::new(
+        home.child("bin").into_os_string(),
+        activation::TIMEOUT,
+    ));
+    apply(&off);
+    assert!(!home.child(OUTPUT).exists() && !home.child(WORDCODE).exists());
+    seed(home.path(), STUB);
+    apply(&inputs);
+    assert!(home.child(OUTPUT).exists() && home.child(WORDCODE).exists());
+    let targets = ledger_targets(&state, home.path());
+    crate::restore::restore(&state, home.path(), &targets).expect("restore");
+    assert!(!home.child(OUTPUT).exists() && !home.child(WORDCODE).exists());
+    assert!(!home.child(".local/share/bx/activation").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.child(".zshrc")).expect(".zshrc"),
+        "user\n"
+    );
+}
+
+/// The stub activation applied with a zsh on the search path, so its output's
+/// file and its wordcode are both written; `None` where no zsh is installed.
+fn compiled(home: &GuardedHome) -> Option<(Inputs, PathBuf)> {
+    let zsh = crate::shell::testing::installed("zsh")?;
+    home.write(".zshrc", "user\n");
+    seed(home.path(), STUB);
+    stub_tool(home);
+    let search = format!(
+        "{}:{}",
+        home.child("bin").display(),
+        zsh.parent().expect("zsh's directory").display()
+    );
+    let inputs = load(home.path()).with_host(activation::System::new(search, activation::TIMEOUT));
+    assert_eq!(exit(&apply(&inputs), Mode::Apply), Exit::Converged);
+    assert!(home.child(WORDCODE).exists(), "zsh compiled the output");
+    Some((inputs, zsh))
+}
+
+/// The row of `path`, home-relative, in `report`.
+fn row_of(report: &Report, path: &str) -> usize {
+    report
+        .changes
+        .iter()
+        .position(|change| change.target == format!("~/{path}"))
+        .expect("a row")
+}
+
+/// Whether the wordcode is at least as new as the output's file, which is
+/// what has zsh's `source` read it.
+fn fresh(home: &GuardedHome) -> bool {
+    let modified = |path: &str| {
+        std::fs::metadata(home.child(path))
+            .and_then(|meta| meta.modified())
+            .expect("written")
+    };
+    modified(WORDCODE) >= modified(OUTPUT)
+}
+
+/// Leave the wordcode an hour older than it is, so a file written after it
+/// without it is newer than it.
+fn backdate_wordcode(home: &GuardedHome) {
+    let file = std::fs::File::options()
+        .write(true)
+        .open(home.child(WORDCODE))
+        .expect("the wordcode");
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    file.set_modified(then).expect("backdated");
+}
+
+/// `apply`, approved, answering *take* for each of `taken`.
+fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
+    answered(inputs, Mode::Apply, &mut |_| {
+        Ok(Approval {
+            approved: true,
+            taken: taken.iter().copied().collect(),
+        })
+    })
+    .expect("apply runs")
+}
+
+#[test]
+fn a_kept_edit_of_an_activation_file_keeps_its_wordcode_from_overriding_it() {
+    let home = guarded_home();
+    let Some((inputs, zsh)) = compiled(&home) else {
+        return;
+    };
+    let before = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+    // zsh compares whole seconds: an edit made in the second bx wrote the
+    // wordcode would lose to it whatever bx did next.
+    backdate_wordcode(&home);
+    std::fs::write(home.child(OUTPUT), "edited_hook() { :; }\n").expect("the edit");
+    std::fs::write(
+        home.child("bin/stub"),
+        "#!/bin/sh\nprintf 'stub_hook() { true; }\\n'\n",
+    )
+    .expect("an upgraded stub");
+
+    // The file is a question, and the wordcode compiled from bx's new output
+    // waits on its answer rather than being written on its own.
+    let planned = plan(&inputs);
+    let (output, wordcode) = (row_of(&planned, OUTPUT), row_of(&planned, WORDCODE));
+    assert_eq!(planned.changes[output].action, Action::Conflict);
+    assert_eq!(planned.changes[wordcode].action, Action::Conflict);
+    assert!(
+        planned.changes[wordcode]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains(crate::plan::decide::WAITS)),
+        "{:?}",
+        planned.changes[wordcode].note
+    );
+
+    // Kept: neither is written, and zsh still runs the edit.
+    let kept = answer(&inputs, &[]);
+    assert_eq!(kept.changes[wordcode].action, Action::Conflict);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        before
+    );
+    let out = std::process::Command::new(&zsh)
+        .args([
+            "-f",
+            "-c",
+            "source ~/.local/share/bx/zshrc.zsh; whence -w edited_hook stub_hook",
+        ])
+        .env_clear()
+        .env("HOME", home.path())
+        .output()
+        .expect("zsh runs");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "edited_hook: function\nstub_hook: none\n"
+    );
+
+    // Taken: both are written, the wordcode after, and the plan converges.
+    let taken = answer(&inputs, &[output]);
+    assert_eq!(taken.changes[output].action, Action::Modify);
+    assert_eq!(taken.changes[wordcode].action, Action::Modify);
+    assert_ne!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        before
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+}
+
+#[test]
+fn a_wordcode_missing_beside_a_file_already_right_is_written_on_its_own() {
+    let home = guarded_home();
+    let Some((inputs, _)) = compiled(&home) else {
+        return;
+    };
+    let wordcode = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+
+    // The file is what bx wants, so it is not written; its wordcode is
+    // decided on its own and compiles exactly those bytes.
+    std::fs::remove_file(home.child(WORDCODE)).expect("deleted");
+    let planned = plan(&inputs);
+    let row = row_of(&planned, WORDCODE);
+    assert_eq!(
+        planned.changes[row_of(&planned, OUTPUT)].action,
+        Action::Unchanged
+    );
+    assert_eq!(planned.changes[row].action, Action::Create);
+    assert!(
+        planned.changes[row]
+            .note
+            .as_deref()
+            .is_none_or(|note| !note.contains(crate::plan::decide::WAITS)),
+        "{:?}",
+        planned.changes[row].note
+    );
+    assert_eq!(exit(&apply(&inputs), Mode::Apply), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        wordcode
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+}
+
+#[test]
+fn an_activation_file_written_again_with_the_same_output_rewrites_its_wordcode_after_it() {
+    let home = guarded_home();
+    let Some((inputs, _)) = compiled(&home) else {
+        return;
+    };
+    let wordcode = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+
+    // Re-created after a deletion: the wordcode's bytes are right, and it is
+    // rewritten after the file all the same.
+    std::fs::remove_file(home.child(OUTPUT)).expect("deleted");
+    backdate_wordcode(&home);
+    let planned = plan(&inputs);
+    let row = row_of(&planned, WORDCODE);
+    assert_eq!(
+        planned.changes[row_of(&planned, OUTPUT)].action,
+        Action::Create
+    );
+    assert_eq!(planned.changes[row].action, Action::Modify);
+    assert!(
+        planned.changes[row]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains(crate::plan::decide::REWRITTEN)),
+        "{:?}",
+        planned.changes[row].note
+    );
+    assert_eq!(exit(&apply(&inputs), Mode::Apply), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        wordcode
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+
+    // An edit answered *take bx's*, the output unchanged: the same.
+    std::fs::write(home.child(OUTPUT), "edited_hook() { :; }\n").expect("the edit");
+    backdate_wordcode(&home);
+    let planned = plan(&inputs);
+    let output = row_of(&planned, OUTPUT);
+    assert_eq!(planned.changes[output].action, Action::Conflict);
+    assert_eq!(planned.changes[row].action, Action::Unchanged);
+    let kept = answer(&inputs, &[]);
+    assert_eq!(kept.changes[row].action, Action::Unchanged);
+    assert!(!fresh(&home), "kept: the wordcode is left as it was");
+    let taken = answer(&inputs, &[output]);
+    assert_eq!(taken.changes[row].action, Action::Modify);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        wordcode
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
 }

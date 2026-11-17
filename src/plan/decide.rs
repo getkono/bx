@@ -18,8 +18,9 @@
 //! The submodules hold what a decision consults: [`parent`] whether `apply`
 //! can write inside the directory a destination is in, [`dir`] and [`link`]
 //! the decisions for directory and symlink targets, [`guard`] Invariant 2's
-//! judgement of a generated body, and [`undeclared`] the row for a file bx
-//! wrote that nothing declares any more, with the write that takes it back.
+//! judgement of a generated body, [`undeclared`] the row for a file bx
+//! wrote that nothing declares any more, with the write that takes it back,
+//! and [`wordcode`] the tie between a zsh activation's file and its `.zwc`.
 
 mod dir;
 mod guard;
@@ -27,6 +28,7 @@ mod link;
 mod parent;
 mod track;
 mod undeclared;
+mod wordcode;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +41,9 @@ use self::link::decide_link;
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
 use self::track::{Gone, one_side_deleted};
 pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
+pub(super) use self::wordcode::Tied;
+#[cfg(test)]
+pub(super) use self::wordcode::{REWRITTEN, WAITS};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
 use crate::config::env;
@@ -112,6 +117,10 @@ pub(super) struct Decided {
     /// a conflict, or a deletion that stands, and `apply` makes the write only
     /// for a row the user answered with *take bx's* — never by default.
     pub held: Vec<(usize, Op)>,
+    /// Each zsh activation's wordcode whose file is one of
+    /// [`Decided::held`], with the write `apply` makes right after the
+    /// file's, and only once it does: see [`wordcode`].
+    pub tied: Vec<Tied>,
 }
 
 /// Decide every target of a configuration.
@@ -203,13 +212,17 @@ pub(super) fn decide_all(
         }
         rows[at] = Some(change);
     }
+    // Every target has its row, so a row's index is its target's.
+    let mut changes: Vec<Change> = rows.into_iter().flatten().collect();
+    let tied = wordcode::tie(resolutions, &mut changes, &mut ops, &mut held, ctx.home)?;
     Ok(Decided {
-        changes: rows.into_iter().flatten().collect(),
+        changes,
         ops,
         carries,
         agreed,
         declared,
         held,
+        tied,
     })
 }
 
@@ -801,7 +814,7 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             if let Some(note) = guard_generated(generator, &content, ctx.roots, &facts) {
                 return Ok(Wanted::Blocked(note));
             }
-            content.into_bytes()
+            content
         }
         // A declared directory mode reaches disk before any file beneath it
         // is written, which [`locked_parent`] reads as a declaration.
@@ -1241,8 +1254,9 @@ fn ownership(
 }
 
 /// Whether `target` is a file bx generates for itself in its own data
-/// directory, [`env::FRAGMENT_DIR`]: the shell fragments and bash's
-/// interactive file, which a region in the user's startup file sources.
+/// directory, [`env::FRAGMENT_DIR`]: the shell fragments, bash's
+/// interactive file, and each zsh activation's file and its wordcode, which a
+/// region in the user's startup file sources.
 ///
 /// The deletion rule ([`deleted`]) does not apply to one. Nothing the user
 /// wrote or declared is there, the guarded source line hides its loss, and

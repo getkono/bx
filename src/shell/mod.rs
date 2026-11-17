@@ -82,8 +82,11 @@
 //! occurrence in an assigning position through [`crate::env_guard::check`]
 //! when its value is a readable literal, and refuses it when it is not, and
 //! [`activation::plan`] writes none of an output with a refusal. Every other
-//! line passes untouched. bx's own bytes there are one `eval` of a
-//! single-quoted literal holding the output, which set nothing. What the
+//! line passes untouched. bx's own bytes there set nothing: in zsh's file
+//! the guarded line a plugin is, sourcing the activation's own file
+//! ([`activation::file`]), which holds the output byte for byte beside the
+//! `.zwc` zsh compiled from it; in bash's one `eval` of a single-quoted
+//! literal holding the output. What the
 //! output's code runs later — `eval "$(mise hook-env)"` — is the tool's own
 //! behaviour at runtime, outside what bx emits.
 //!
@@ -106,8 +109,10 @@
 //! `starship init {shell}` — is run by [`activation::plan`] rather than at
 //! every shell start, once per shell it has a command for, trusted once two
 //! runs agree, and cached against the content of the tool's binary, so the
-//! `activations` and `completions` phases hold text, and bx's own lines in
-//! them start no process. There is no form that runs a tool's init at shell
+//! `activations` and `completions` phases hold text — in zsh's file a line
+//! sourcing a file of the output's own, which zsh loads from the wordcode
+//! the plan had it compile — and bx's own lines in them start no process.
+//! There is no form that runs a tool's init at shell
 //! start. The cached output is invariant 6's one exception: it is sourced
 //! exactly as the tool printed it, so what it runs still runs at every start,
 //! as it would under `eval "$(tool init)"` (starship's
@@ -136,17 +141,30 @@ impl Gen {
     /// on this machine, and what the machine's facts are: the one input
     /// besides the target itself, asked while `plan` and `apply` decide,
     /// never by the generated shell.
+    ///
+    /// Bytes, not text, because a zsh activation's `.zwc` is zsh's wordcode;
+    /// every other generator's bytes are the text it renders.
     #[must_use]
-    pub fn render(&self, decide: &dyn crate::config::when::Decide) -> String {
+    pub fn render(&self, decide: &dyn crate::config::when::Decide) -> Vec<u8> {
         match self {
-            Self::Env(fragment) => fragment.render(decide),
-            Self::LaunchAgent(agent) => agent.render(decide),
-            Self::Source(fragment) => crate::config::env::source_line(fragment),
-            Self::Profile(file) => bash::profile_line(file),
-            Self::Interactive(file) => file.render(decide),
-            Self::Bash(file) => file.render(decide),
-            Self::Inputrc(keybindings) => bash::render_inputrc(keybindings),
+            Self::Env(fragment) => fragment.render(decide).into_bytes(),
+            Self::LaunchAgent(agent) => agent.render(decide).into_bytes(),
+            Self::Source(fragment) => crate::config::env::source_line(fragment).into_bytes(),
+            Self::Profile(file) => bash::profile_line(file).into_bytes(),
+            Self::Interactive(file) => file.render(decide).into_bytes(),
+            Self::Bash(file) => file.render(decide).into_bytes(),
+            Self::Inputrc(keybindings) => bash::render_inputrc(keybindings).into_bytes(),
+            Self::Activation(output) => output.clone().into_bytes(),
+            Self::Wordcode(wordcode) => wordcode.clone(),
         }
+    }
+
+    /// [`Gen::render`] read as the text every generator but the wordcode
+    /// renders, for the tests that compare it with text.
+    #[cfg(test)]
+    #[must_use]
+    pub fn text(&self, decide: &dyn crate::config::when::Decide) -> String {
+        String::from_utf8(self.render(decide)).expect("a text generator renders text")
     }
 
     /// What the generator's plan row says beside its bytes: for zsh's and
@@ -163,7 +181,9 @@ impl Gen {
             | Self::LaunchAgent(_)
             | Self::Source(_)
             | Self::Profile(_)
-            | Self::Inputrc(_) => None,
+            | Self::Inputrc(_)
+            | Self::Activation(_)
+            | Self::Wordcode(_) => None,
         }
     }
 }

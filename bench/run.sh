@@ -233,10 +233,24 @@ for home in bx bx-real; do
 	# Converged, so what is measured is exactly what bx leaves in place.
 	bx "$home" plan
 done
+activations() { # activations <home> <shell>: the files that home's tools' output is cached in
+	case "$2" in
+	zsh) echo "${WORK}/${1}/.local/share/bx/activation/"*.zsh ;;
+	esac
+}
 # The real home measures the real output only if bx cached it, every tool's.
 for marker in _mise_hook_precmd prompt_starship_precmd __zoxide_hook fzf-file-widget; do
-	grep -qsF "$marker" "${WORK}/bx-real/.local/share/bx/"*.zsh || {
+	# shellcheck disable=SC2046 # the scratch paths hold no whitespace.
+	grep -qsF "$marker" $(activations bx-real zsh) || {
 		echo "error: bx cached no captured output holding ${marker} to measure." >&2
+		exit 1
+	}
+done
+# And zsh loads each output compiled, as a zsh start does: bx wrote the
+# wordcode beside every activation file, in both homes.
+for f in $(activations bx zsh) $(activations bx-real zsh); do
+	[ -f "${f}.zwc" ] || {
+		echo "error: bx compiled no wordcode for ${f} to measure." >&2
 		exit 1
 	}
 done
@@ -269,12 +283,15 @@ startup() { # startup <shell> <fixture>: the command that starts it, as one line
 # The one exception is a tool's cached activation output: bx sources it as the
 # tool printed it, so a substitution the tool emitted runs at every start, as
 # it would under `eval "$(tool init)"`, and the overhead below counts it (on
-# Linux; macOS reports it apart). bx caches that output verbatim, as
-# one single-quoted `eval` under a `# bx activation: NAME` line, so following
-# that quoting splits bx's own lines from the tools'. bx's own must hold no
-# substitution, and the cached output must hold exactly the ones the tools
-# print themselves: one bx added inside it, or dropped from it, changes that
-# count.
+# Linux; macOS reports it apart). bx caches that output verbatim: for zsh in
+# a file of its own under ~/.local/share/bx/activation, which the interactive
+# file sources with one guarded line under a `# bx activation: NAME` line; for
+# bash as one single-quoted `eval` under that line. So the tools' output is
+# zsh's activation files, and the block each such line opens: the source line,
+# or the lines up to the one that closes the eval's quote. bx's own lines must
+# hold no substitution, and the cached output must hold exactly the ones the
+# tools print themselves: one bx added inside it, or dropped from it, changes
+# that count.
 # shellcheck disable=SC2016 # the patterns are literal on purpose.
 SUBST='\$(' TICK='`'
 count() { # count: lines on stdin, not comments, holding a command substitution
@@ -325,7 +342,7 @@ for sh in $SHELLS; do
 	# shellcheck disable=SC2046 # the scratch paths hold no whitespace.
 	found="$(split own $(generated "$sh") | count)"
 	# shellcheck disable=SC2046
-	cached="$(split cached $(generated "$sh") | count)"
+	cached="$({ split cached $(generated "$sh") && cat /dev/null $(activations bx "$sh"); } | count)"
 	tools="$(emitted "$sh" | count)"
 	legacy="$(spawns "${WORK}/legacy/.${sh}rc")"
 	[ "$legacy" -eq 4 ] || {
@@ -369,6 +386,8 @@ TRACE="${WORK}/trace"
 SHARE="${WORK}/bx/.local/share/bx"
 mkdir -p "${TRACE}/bx" "${TRACE}/cached" "${TRACE}/legacy" "${TRACE}/own"
 for f in "$SHARE"/*; do
+	# The activation directory is the tools' output, which `own` leaves out.
+	[ -f "$f" ] || continue
 	split own "$f" >"${TRACE}/own/${f##*/}"
 done
 for rc in .zshenv .zshrc .bashrc; do
@@ -541,16 +560,26 @@ echo exit >"${WORK}/exit"
 # with the cached starship output's continuation prompt set to the text the
 # stub would print instead of to a substitution that starts it. Only the
 # bench's copy changes; bx's own files are measured as bx wrote them, and the
-# spawn's cost is the difference between the two homes.
+# spawn's cost is the difference between the two homes. A zsh activation file
+# the change rewrote is compiled again as bx compiles it, since zsh reads a
+# file newer than its `.zwc` in place of it.
 if [ "$GATED" = own ]; then
 	cp -R "${WORK}/bx" "${WORK}/own"
-	for f in "${WORK}/own/.local/share/bx/"*; do
+	# shellcheck disable=SC2046 # the scratch paths hold no whitespace.
+	for f in "${WORK}/own/.local/share/bx/"* $(activations own zsh); do
+		[ -f "$f" ] || continue
 		# shellcheck disable=SC2016 # the pattern is literal on purpose.
 		sed 's/\$([^)]*prompt --continuation)/> /' "$f" >"${WORK}/own.tmp"
 		cat "${WORK}/own.tmp" >"$f"
 	done
-	left="$(split cached "${WORK}/own/".zshenv "${WORK}/own/".zshrc "${WORK}/own/".bashrc \
-		"${WORK}/own/.local/share/bx/"* | count)"
+	for f in $(activations own zsh); do
+		# shellcheck disable=SC2016 # expanded by the compiling zsh, not this shell.
+		[ ! -f "${f}.zwc" ] || env -i PATH="$SEARCH" \
+			zsh -f -c 'cd -- "$1" && zcompile -U -- "$2"' zsh "${f%/*}" "${f##*/}"
+	done
+	# shellcheck disable=SC2046
+	left="$({ split cached "${WORK}/own/".zshenv "${WORK}/own/".zshrc "${WORK}/own/".bashrc \
+		"${WORK}/own/.local/share/bx/"*.* && cat /dev/null $(activations own zsh); } | count)"
 	[ "$left" -eq 0 ] || {
 		echo "error: bx's home without the starship spawn still holds ${left} cached line(s)" >&2
 		echo "       that start a process; the spawn's cost would not be set apart." >&2

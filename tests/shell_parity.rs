@@ -207,7 +207,10 @@ fn declarations(text: &str) -> BTreeSet<String> {
             if let Some(name) = line.strip_prefix("# bx activation: ") {
                 return Some(format!("activation {name}"));
             }
+            // zsh sources an activation's output from a file of its own,
+            // which is the activation its comment above already names.
             line.split_once(" ]] && source ")
+                .filter(|(_, path)| !path.starts_with("~/.local/share/bx/activation/"))
                 .map(|(_, path)| format!("source {path}"))
         })
         .collect()
@@ -322,9 +325,13 @@ fn zsh_and_bash_render_the_same_declarations_but_those_kept_to_one_shell() {
         "zsh:\n{zshenv}\nbash:\n{bashrc}"
     );
 
-    // Each shell ran its own activation command.
+    // Each shell ran its own activation command: zsh's output is in a file
+    // of its own, which its interactive file sources.
     let zshrc = String::from_utf8_lossy(&zsh_bytes[2]);
-    assert!(zshrc.contains("stub_zsh() { :; }") && !zshrc.contains("stub_bash"));
+    assert!(zshrc.contains("source ~/.local/share/bx/activation/stub.zsh\n"));
+    let output = std::fs::read_to_string(home.child(".local/share/bx/activation/stub.zsh"))
+        .expect("zsh's activation file");
+    assert!(output.contains("stub_zsh() { :; }") && !output.contains("stub_bash"));
     assert!(bashrc.contains("stub_bash() { :; }") && !bashrc.contains("stub_zsh"));
 
     // Idempotent: the second plan is empty and a second apply rewrites

@@ -376,7 +376,10 @@ says what the budget covers.
   the configuration still wants what bx made there, the deletion stands; once
   it wants something else, it is a modify/delete conflict. Either way, at a
   terminal, `apply` and `sync` ask whether to keep it deleted (the default) or
-  restore bx's, and `--yes` or no terminal keeps it deleted.
+  restore bx's, and `--yes` or no terminal keeps it deleted. A file bx
+  generates for itself under `~/.local/share/bx` — a shell fragment, or a zsh
+  activation's file and its `.zwc` — holds nothing of yours, and a deleted one
+  is re-created.
 - A file you brought to exactly what bx wants is recorded as bx's again, so
   the next change to its body is bx's to make, not a conflict.
 - `doctor` reports a declared tool that is not on `PATH`, a required value with
@@ -411,6 +414,12 @@ says what the budget covers.
   on Linux the budget counts it, and on macOS the benchmark reports its cost
   apart and holds `bx`'s own share to the budget.
   Caching saves running the tool's init; it never changes what the init does.
+- For zsh, each tool's cached output is written byte for byte to a file of
+  its own under `~/.local/share/bx/activation/`, and `bx` has zsh compile it
+  to a `.zwc` beside it, so a shell start loads code zsh already parsed
+  instead of parsing the text again. A zsh of another version, or one with
+  no `.zwc`, reads the file itself. bash keeps one `eval` of the text, as it
+  has no compiled form to gain.
 - Beyond what your tools' output runs, the one process a shell ever starts on
   its own is an external's background
   check, after the first prompt, and only for an external you set to

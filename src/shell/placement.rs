@@ -650,7 +650,7 @@ mod tests {
                     };
                     (
                         target.path.to_string(),
-                        generator.render(&tools(&|_| true)),
+                        generator.text(&tools(&|_| true)),
                         inherited,
                     )
                 }
@@ -938,7 +938,7 @@ mod tests {
         let Body::Generated(generator @ Gen::LaunchAgent(_)) = &target.body else {
             panic!("a LaunchAgent: {target:?}");
         };
-        let body = generator.render(&tools(&|_| true));
+        let body = generator.text(&tools(&|_| true));
         assert!(
             body.contains("<array>\n\t\t<string>/usr/bin/true</string>\n\t</array>"),
             "{body}"

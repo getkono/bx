@@ -118,7 +118,7 @@ fn a_followed_external_places_the_update_prompt_and_a_pinned_one_does_not() {
                 Resolution::Ready(Target {
                     body: Body::Generated(generated @ Gen::Interactive(_)),
                     ..
-                }) => Some(generated.render(&crate::config::when::tools(&|_| true))),
+                }) => Some(generated.text(&crate::config::when::tools(&|_| true))),
                 _ => None,
             })
     };

@@ -40,12 +40,19 @@ use crate::paths::Portable;
 /// bash's own history variables, unexported, which [`crate::shell::bash`]'s
 /// tests hold it to.
 /// `~/.inputrc` is readline's syntax and names no variable.
+///
+/// A zsh activation's own file holds the tool's output, which
+/// [`crate::shell::activation::plan`] judged by the relocation rule before it
+/// became a target, and an output it refused never becomes one; its `.zwc` is
+/// zsh's compilation of exactly those bytes. Neither is judged again here.
 pub(super) fn guard_generated(
     generator: &Gen,
-    content: &str,
+    content: &[u8],
     roots: &RootSet,
     decide: &dyn Decide,
 ) -> Option<String> {
+    // Every generator but the wordcode renders text.
+    let content = &String::from_utf8_lossy(content);
     match generator {
         Gen::Env(fragment) => match fragment.syntax {
             Syntax::Zsh => {
@@ -75,7 +82,11 @@ pub(super) fn guard_generated(
                 guard_history_file("bash", file.history().bash_file.as_ref(), roots),
             ])
         }
-        Gen::Source(_) | Gen::Profile(_) | Gen::Inputrc(_) => None,
+        Gen::Source(_)
+        | Gen::Profile(_)
+        | Gen::Inputrc(_)
+        | Gen::Activation(_)
+        | Gen::Wordcode(_) => None,
     }
 }
 

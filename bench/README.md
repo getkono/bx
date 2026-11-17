@@ -28,8 +28,12 @@ Everything below is measured for zsh and for bash alike.
 **`overhead`** — `baseline` vs the same rc file after `bx apply`: bx's region
 in `~/.zshrc` or `~/.bashrc`, the interactive file that region sources, and
 for zsh the `~/.zshenv` fragment, with the example's four activations cached
-into the interactive file and the hook that asks about a followed external's
-updates defined and registered in it. What bx's generated files cost.
+— into the interactive file for bash, and for zsh into a file each under
+`~/.local/share/bx/activation/` with the `.zwc` zsh compiled beside it — and
+the hook that asks about a followed external's updates defined and registered
+in the interactive file. What bx's generated files cost. The bench refuses to
+measure a zsh activation file with no `.zwc` beside it, so zsh's numbers are
+always those of the compiled form a zsh start loads.
 **Gated** at `BX_BUDGET_MS` (default 5), for each shell; on macOS the gated
 home leaves out the tool's spawn, as `spawn` below says. The bench refuses to
 measure when either interactive file lacks the hook, so the number always
@@ -62,8 +66,12 @@ starship ends its output as the real one does, with
 `PROMPT2="$(starship prompt --continuation)"` (`PS2` for bash), so every start
 spawns the stub once and the overhead above counts it (on Linux; macOS
 reports it apart, as *Stub tools* below says). bx caches each output
-verbatim as one single-quoted `eval` under a `# bx activation: NAME` line, and
-following that quoting splits bx's own lines from the tools'. Read: bx's own
+verbatim: for zsh in a file of its own under `~/.local/share/bx/activation/`,
+which the interactive file sources with one guarded line under a
+`# bx activation: NAME` line, and for bash as one single-quoted `eval` under
+that line. So zsh's activation files, and the block each such line opens — the
+source line, or the lines up to the one that closes the `eval`'s quote — are
+the tools' output, and the rest is bx's own lines. Read: bx's own
 lines, comments aside, must hold no command substitution, which covers
 branches this home never takes, and the cached output must hold exactly as
 many as the stub tools print themselves, so a substitution bx added inside it
@@ -143,7 +151,9 @@ spawn is the tool's, and bx does not control it.
   the stub tools' init text that leaves no room for it in 5 ms, and the spawn
   is the tool's, which bx does not control. The gated fixture is `own`, a
   copy of the bx home whose cached starship output sets the continuation
-  prompt to the stub's text instead of starting the stub. The spawn's cost,
+  prompt to the stub's text instead of starting the stub, zsh's activation
+  file compiled again as bx compiles it, since zsh reads a file newer than
+  its `.zwc` in place of it. The spawn's cost,
   the bx home against `own`, is printed as a blue `spawn` line (plain under
   `NO_COLOR`) and never gated.
 - **The stub output is real shell**, not comments, so the shell genuinely

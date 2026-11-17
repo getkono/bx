@@ -174,11 +174,12 @@ impl Ledger {
     ///   [`LedgerEntry::superseded_absent`]: it had no bytes to keep, but that
     ///   there was no file before bx is still part of the history.
     ///
-    ///   **Whole, only for a file bx owns whole.** When the stored or the
-    ///   incoming [`Mechanism`] is a `Region` or an `Include`, those bytes hold
-    ///   bx's own previous region or include line as well as the user's edit,
-    ///   and adopting them would make `bx rm` write bx's stale lines back into
-    ///   the user's file.
+    ///   **Whole, only for a file bx owns whole or a symlink bx made.** When
+    ///   the stored or the incoming [`Mechanism`] is a `Region` or an
+    ///   `Include`, those bytes hold bx's own previous region or include line
+    ///   as well as the user's edit, and adopting them would make `bx rm`
+    ///   write bx's stale lines back into the user's file. A symlink's text is
+    ///   all the user's once they retargeted it.
     ///
     ///   A `Region` both sides name, whose entry records the region's digest
     ///   ([`LedgerEntry::region`]) and whose region in the displaced bytes
@@ -186,7 +187,14 @@ impl Ledger {
     ///   are adopted with the region cut out, by the grammar the writer uses,
     ///   so `bx rm` keeps the user's edit and takes only bx's lines.
     ///
-    ///   Anything else — an include line, an edit inside the region, or a
+    ///   One whose displaced bytes hold a whole region that no longer hashes
+    ///   to it was edited inside its markers. `plan` reports that as a
+    ///   conflict and writes over it only once the user answered *take bx's*,
+    ///   so those bytes are adopted whole, markers and all: they are the
+    ///   user's edit of bx's lines, and `bx rm` puts the file back exactly as
+    ///   they had it.
+    ///
+    ///   Anything else — an include line, a region removed or damaged, or a
     ///   region entry with no digest of its own — cannot be told apart from
     ///   bx's lines, so `record` refuses with [`Error::PriorConflict`], stores
     ///   nothing, and leaves the entry exactly as it was. `plan` reports the
@@ -194,10 +202,15 @@ impl Ledger {
     ///   reaches this call. The way out is for the user to put the file back as
     ///   bx last wrote it.
     ///
-    /// The comparison is on content only. A file whose bytes still match
-    /// `written` but whose mode the user changed is treated as bx's own output,
-    /// because snapshotting it would record bx's generated content as the
-    /// user's file.
+    /// The comparison is on content, with one exception. A file bx owns whole
+    /// whose bytes still match `written` but whose mode is neither the one bx
+    /// set nor the one this record leaves was chmodded by the user, and `plan`
+    /// writes over that only once they answered *take bx's*: those bytes at
+    /// that mode are adopted, so `bx rm` gives their mode back. A record that
+    /// leaves the mode the user set — a tracked target written at the mode its
+    /// copy already has — displaces nothing of theirs. Any other mechanism's
+    /// mode is bx's to set — a directory's, whose bytes always match, above
+    /// all — and is treated as bx's own output.
     ///
     /// [`Ledger::forget`] followed by `record` remains the way to discard a
     /// stored prior deliberately.
@@ -268,7 +281,8 @@ impl Ledger {
                 merge_created_dirs(&key, &[], entry.created_dirs),
             ),
             Some(existing) => {
-                let (prior, history) = self.carry_prior(existing, &entry.mechanism, entry.prior)?;
+                let (prior, history) =
+                    self.carry_prior(existing, (&entry.mechanism, entry.mode), entry.prior)?;
                 (
                     prior,
                     history,
@@ -300,7 +314,7 @@ impl Ledger {
     fn carry_prior(
         &self,
         existing: &LedgerEntry,
-        mechanism: &Mechanism,
+        (mechanism, leaves): (&Mechanism, Mode),
         incoming: PriorBytes,
     ) -> Result<(Prior, History), Error> {
         // A shared file's changed bytes still hold bx's own region or include
@@ -310,7 +324,15 @@ impl Ledger {
         let PriorBytes::Bytes { bytes, mode } = incoming else {
             return Ok(kept());
         };
-        if ContentHash::of(&bytes) == existing.written {
+        // bx's own bytes, at the mode bx set or in a file bx shares: nothing
+        // of the user's to keep. A file bx owns whole at a mode the user set
+        // since, which this record does not leave, is the user's chmod
+        // displaced, and is kept as any displaced edit is.
+        let rechmodded = existing.mechanism == Mechanism::Own
+            && *mechanism == Mechanism::Own
+            && mode != existing.mode
+            && mode != leaves;
+        if ContentHash::of(&bytes) == existing.written && !rechmodded {
             return Ok(kept());
         }
         // A region whose own bytes are as bx wrote them was edited around:
@@ -395,7 +417,8 @@ impl Ledger {
     /// So it must run only because the user chose it, and since no command
     /// offers that choice, [`Error::PriorConflict`]'s message does not name
     /// it. An edit only around a region needs none of this: `record` adopts
-    /// it without bx's lines by itself.
+    /// it without bx's lines by itself. Nor does one inside a region whose
+    /// entry records its digest, which `record` adopts whole by itself.
     ///
     /// Returns `Ok(None)`, changing nothing, when bx records no entry for
     /// `path`.

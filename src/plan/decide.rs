@@ -26,6 +26,7 @@ mod dir;
 mod guard;
 mod link;
 mod parent;
+mod track;
 mod undeclared;
 mod wordcode;
 
@@ -38,23 +39,26 @@ use self::guard::guard_generated;
 pub(super) use self::guard::{guard_environment_d, guard_fragment};
 use self::link::decide_link;
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
+use self::track::{Gone, one_side_deleted};
 pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
 pub(super) use self::wordcode::Tied;
 #[cfg(test)]
 pub(super) use self::wordcode::{REWRITTEN, WAITS};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
+use crate::config::env;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
 use crate::config::when::Facts;
 use crate::env_guard::RootSet;
 use crate::fs::{self, Desired, Kind, Mode, Observed};
+use crate::hash::ContentHash;
 use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
 use crate::shell::activation::{self, Host as _};
-use crate::state::{LedgerEntry, LedgerView, Mechanism};
+use crate::state::{LedgerEntry, LedgerView, Mechanism, removed_written};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -105,10 +109,13 @@ pub(super) struct Decided {
     pub agreed: Vec<Agreed>,
     /// The directories the session is to declare before its first write.
     pub declared: Declared,
-    /// Each file bx owns whole that was edited since bx wrote it, by index
-    /// into [`Decided::changes`], with the write that takes bx's bytes over
-    /// the edit. Its row is a conflict, and `apply` makes the write only for
-    /// a row the user answered with *take bx's* — never by default.
+    /// Each file bx owns whole whose bytes or mode were changed since bx wrote
+    /// it, each region of bx's edited inside its markers, each symlink bx
+    /// made that was retargeted since, and each file or symlink of those
+    /// deleted since, by index into [`Decided::changes`], with the write that
+    /// takes bx's bytes over the edit or restores what was deleted. Its row is
+    /// a conflict, or a deletion that stands, and `apply` makes the write only
+    /// for a row the user answered with *take bx's* — never by default.
     pub held: Vec<(usize, Op)>,
     /// Each zsh activation's wordcode whose file is one of
     /// [`Decided::held`], with the write `apply` makes right after the
@@ -196,10 +203,11 @@ pub(super) fn decide_all(
             continue;
         }
         let (change, op) = decide(resolution, &files)?;
-        // A conflict that carries a write is an edited file's, held back
-        // until it is answered.
+        // A row that is not pending work yet carries a write is a question:
+        // an edited file's, or a deleted one's, held back until it is
+        // answered.
         match op {
-            Some(op) if change.action == Action::Conflict => held.push((at, op)),
+            Some(op) if !change.action.is_pending() => held.push((at, op)),
             op => ops.extend(op),
         }
         rows[at] = Some(change);
@@ -295,6 +303,9 @@ impl Op {
     /// file bx keeps a base for, no `base` kept, or a side that is not shown
     /// line by line. The row's own diff is all there is then.
     pub(super) fn three_way(&self, base: Option<&[u8]>) -> Option<Diff> {
+        if self.deleted() {
+            return self.restored(base);
+        }
         let wanted = self.base()?;
         let base = base?;
         let disk = self.planned.bytes.as_deref()?;
@@ -314,6 +325,34 @@ impl Op {
         (!texts.is_empty()).then_some(Diff {
             kind: super::diff::DiffKind::Texts(texts),
         })
+    }
+
+    /// Whether this write restores a target deleted since bx made it: it was
+    /// decided over nothing at all, and is held, so the ledger says bx made
+    /// something there.
+    pub(super) fn deleted(&self) -> bool {
+        self.planned.kind == Kind::Absent
+    }
+
+    /// The view a question about a deleted target offers: what bx last wrote
+    /// against what bx wants there now, where the two differ, and otherwise
+    /// what restoring it writes. `None` for a file kept no base for, a secret
+    /// above all.
+    fn restored(&self, base: Option<&[u8]>) -> Option<Diff> {
+        let target = self.target.as_str();
+        match &self.made {
+            Made::Link(text) => Some(Diff::link(None, Some(text))),
+            Made::Bytes(_) => {
+                let wanted = self.base()?;
+                match base {
+                    Some(base) if base != wanted => {
+                        Diff::labelled(target, ("bx wrote", "bx wants"), Some(base), wanted, None)
+                    }
+                    _ => Diff::labelled(target, ("deleted", "bx's"), None, wanted, None),
+                }
+            }
+            _ => None,
+        }
     }
 
     /// The journal request that makes this write: bx owning the whole file,
@@ -483,14 +522,30 @@ pub(super) fn decide(
         _ => ownership(found, &observed, entry, note),
     };
     let claim = found == Action::Unchanged && action == Action::Modify;
-    // A file bx owns whole whose bytes someone else changed since: the one
-    // conflict `apply` asks about, at a terminal, rather than only skipping.
-    let edited = found == Action::Modify
-        && action == Action::Conflict
-        && matches!(target.attach, Attach::Own)
+    // A file bx owns whole that was deleted since bx wrote it, settled as git
+    // settles a deletion: see [`deleted`]. A file bx generates for itself in
+    // its own data directory is not the user's to delete: see [`own_data`].
+    // Nor is one bx itself removed, as it carries a tracked target's deletion
+    // across: nothing there is what bx last left, and writing it is a create.
+    let gone = matches!(target.attach, Attach::Own)
+        && action == Action::Create
+        && observed.kind == Kind::Absent
+        && !own_data(target)
         && entry.is_some_and(|entry| {
-            entry.mechanism == Mechanism::Own && observed.digest() != Some(entry.written)
+            entry.mechanism == Mechanism::Own && entry.written != removed_written()
         });
+    let (action, note) = match entry {
+        Some(entry) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
+        _ => (action, note),
+    };
+    // A file bx owns whole whose bytes or mode someone else changed since, or
+    // a region of bx's edited inside its markers: the conflicts `apply` asks
+    // about, at a terminal, rather than only skipping. A deletion is asked
+    // about the same way.
+    let edited = gone
+        || (found == Action::Modify
+            && action == Action::Conflict
+            && entry.is_some_and(|entry| changed_since(&target.attach, &observed, entry)));
 
     // A write into a directory its owner cannot write or search is refused
     // here, so `apply` never reaches `stage` for it. A row with no write is
@@ -500,18 +555,21 @@ pub(super) fn decide(
     // edited file is asked about only where its write could land.
     let locked = locked_parent(&observed, ctx.home, ctx.declared, Write::File);
     let ask = edited && locked.is_none();
+    let asked = if gone { ASK_DELETED } else { ASK };
     let (action, note) = match (action.is_pending(), locked) {
         (true, Some(_)) if claim => (Action::Unchanged, unclaimed),
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
-        _ if ask => (action, join([note, Some(ASK.to_string())])),
+        _ if ask => (action, join([note, Some(asked.to_string())])),
         _ => (action, note),
     };
 
     // Only a regular file has a side to show: a directory, a link or an
-    // unusable parent is explained by the note alone.
+    // unusable parent is explained by the note alone. A file deleted since bx
+    // wrote it shows what bx wants there now only where that changed, as a
+    // modify/delete conflict; a deletion that stands shows nothing.
     let shown = match action {
         Action::Create | Action::Modify => true,
-        Action::Conflict => observed.kind == Kind::File,
+        Action::Conflict => observed.kind == Kind::File || gone,
         // Only a tracked target is carried into the repo, and it is decided
         // by `decide_track`.
         // A declared target is never undone or released: only an undeclared
@@ -543,8 +601,10 @@ pub(super) fn decide(
         .flatten();
     // A create makes every missing parent on the way to its target, and the
     // row names each, so plan announces every directory apply creates.
+    // So does the restore a deleted target's question offers.
     let note = match action {
         Action::Create => join([created_dirs(&observed, ctx.home, ctx.declared), note]),
+        _ if gone && ask => join([note, created_dirs(&observed, ctx.home, ctx.declared)]),
         _ => note,
     };
     let change = row(action, diff, note);
@@ -566,6 +626,40 @@ pub(super) fn decide(
         base,
     });
     Ok((change, op))
+}
+
+/// Whether `observed` is someone else's change, since bx last left `entry`,
+/// that an answer of *take bx's* can keep whole as the prior `bx rm` restores:
+///
+/// * a file bx owns whole whose bytes are not the ones bx wrote, or whose
+///   mode is not the one bx set;
+/// * a region of bx's edited inside its markers: the entry records the
+///   region's digest, and the one whole region on disk no longer hashes to
+///   it. The file is kept whole, its region text and markers with it, as
+///   [`crate::state::Ledger::record`] adopts it.
+///
+/// A region removed, a region entry with no digest of its own, and an include
+/// line are not: what is the user's there cannot be told from bx's lines, and
+/// the conflict is only reported and skipped.
+fn changed_since(attach: &Attach, observed: &Observed, entry: &LedgerEntry) -> bool {
+    let bytes_changed = observed.digest() != Some(entry.written);
+    match attach {
+        Attach::Own => {
+            entry.mechanism == Mechanism::Own
+                && (bytes_changed || observed.mode != Some(entry.mode))
+        }
+        Attach::Region { comment } => {
+            entry.mechanism == (Mechanism::Region { comment: *comment })
+                && entry.region.is_some()
+                && bytes_changed
+                && observed
+                    .bytes
+                    .as_deref()
+                    .and_then(|bytes| region::digest(bytes, *comment))
+                    .is_some_and(|region| Some(region) != entry.region)
+        }
+        Attach::Include { .. } => false,
+    }
 }
 
 /// The note an edited file's row ends with: what `apply` does about it.
@@ -799,8 +893,10 @@ const TRACK_SHAPE: &str = "track mode carries this machine's whole file into the
 /// | --- | --- | --- |
 /// | the same bytes as the repo | | unchanged, and they now agree |
 /// | nothing | nothing | unchanged: there is nothing to track yet |
-/// | nothing | a copy | create: `apply` writes the repo's copy here |
-/// | a copy | nothing | sync: `sync` carries this machine's copy into the repo |
+/// | nothing, with no agreement recorded | a copy | create: `apply` writes the repo's copy here |
+/// | a copy, with no agreement recorded | nothing | sync: `sync` carries this machine's copy into the repo |
+/// | nothing, deleted since they agreed | as they agreed, or changed since | see [`one_side_deleted`] |
+/// | as they agreed, or changed since | nothing, deleted since they agreed | see [`one_side_deleted`] |
 /// | changed since they agreed | as they agreed | sync |
 /// | as they agreed | changed since they agreed | modify: `apply` writes the repo's copy here |
 /// | changed since they agreed | changed since they agreed | conflict, with both sides' diffs (the one diff between them past [`Base::KEPT_WHOLE`]) |
@@ -826,6 +922,10 @@ const TRACK_SHAPE: &str = "track mode carries this machine's whole file into the
 /// The repo's copy is the other way round: `sync` claims it as a whole file
 /// owned by bx, so the ledger keeps the bytes it held before tracking began,
 /// and `rm` puts them back.
+///
+/// A deletion carried to the other side claims the copy it removes, on
+/// either side, so `rm` puts back what it removed unless bx itself created
+/// that copy, whose prior stays absent: see [`one_side_deleted`].
 fn decide_track(
     target: &Target,
     ctx: &Ctx<'_>,
@@ -876,21 +976,48 @@ fn decide_track(
     let agreed = |bytes: &[u8], when| {
         Some(Agreed {
             target: target.path.clone(),
-            bytes: bytes.to_vec(),
+            bytes: Some(bytes.to_vec()),
             when,
         })
     };
     let (machine_bytes, repo_bytes) = (machine.bytes.as_deref(), repo.bytes.as_deref());
     let (m, r) = match (machine_bytes, repo_bytes) {
+        // Nothing on either side agrees on nothing: an agreement still kept
+        // from before both were deleted is forgotten. See [`Agreed::bytes`].
         (None, None) => {
             let note = "neither this machine nor the repo has it yet".to_string();
-            return Ok((row(Action::Unchanged, None, Some(note)), None, None));
+            let forgotten = ctx.bases.contains_key(&target.path).then(|| Agreed {
+                target: target.path.clone(),
+                bytes: None,
+                when: When::Now,
+            });
+            return Ok((row(Action::Unchanged, None, Some(note)), None, forgotten));
         }
         (Some(m), Some(r)) if m == r => {
             return Ok((
                 row(Action::Unchanged, None, None),
                 None,
                 agreed(m, When::Now),
+            ));
+        }
+        // One side deleted since the two last agreed: carried to the other
+        // side, never undone by copying the other side over it. See
+        // [`one_side_deleted`].
+        (None, Some(present)) | (Some(present), None) if ctx.bases.contains_key(&target.path) => {
+            let base = &ctx.bases[&target.path];
+            let (gone, kept) = if machine_bytes.is_none() {
+                (Gone::Machine, (copy, &repo))
+            } else {
+                (Gone::Repo, (target.path.clone(), &machine))
+            };
+            return Ok(one_side_deleted(
+                &target.path,
+                gone,
+                kept,
+                base,
+                present,
+                ctx,
+                row,
             ));
         }
         (None, Some(r)) => {
@@ -1125,6 +1252,67 @@ fn ownership(
         _ => (action, note),
     }
 }
+
+/// Whether `target` is a file bx generates for itself in its own data
+/// directory, [`env::FRAGMENT_DIR`]: the shell fragments, bash's
+/// interactive file, and each zsh activation's file and its wordcode, which a
+/// region in the user's startup file sources.
+///
+/// The deletion rule ([`deleted`]) does not apply to one. Nothing the user
+/// wrote or declared is there, the guarded source line hides its loss, and
+/// every feature the configuration declares depends on it, so a deleted one is
+/// recreated like any missing file bx owns. That holds for a vacated
+/// fragment too, which the ledger still names.
+fn own_data(target: &Target) -> bool {
+    matches!(target.body, Body::Generated(_))
+        && target
+            .path
+            .as_str()
+            .strip_prefix(env::FRAGMENT_DIR)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Settle a target bx made — a file it owns whole, or a symlink — that was
+/// deleted since bx made it, as git settles a deletion against its base.
+///
+/// `entry` is what bx last left there, and `wanted` and `mode` what the
+/// target wants there now:
+///
+/// | the target since bx made it | row |
+/// | --- | --- |
+/// | wants what bx made | unchanged: the deletion stands, and nothing is pending |
+/// | wants something else | conflict: deleted here, changed in the configuration |
+///
+/// Either way nothing is written unless the question its row ends with is
+/// answered *restore*: the deletion is the user's act, as an edit is, and a
+/// rewrite would undo it.
+fn deleted(
+    entry: &LedgerEntry,
+    wanted: ContentHash,
+    mode: Mode,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    if wanted == entry.written && mode == entry.mode {
+        (Action::Unchanged, join([Some(DELETED.to_string()), note]))
+    } else {
+        (
+            Action::Conflict,
+            join([Some(DELETED_CHANGED.to_string()), note]),
+        )
+    }
+}
+
+/// The note a deletion that stands carries, read as `git status` reads one.
+pub(super) const DELETED: &str =
+    "deleted: you deleted it since bx wrote it, and the deletion stands";
+
+/// The note a modify/delete conflict carries.
+pub(super) const DELETED_CHANGED: &str =
+    "deleted since bx wrote it, and what bx wants there changed since";
+
+/// The note a deleted target's row ends with: what `apply` does about it.
+pub(super) const ASK_DELETED: &str =
+    "at a terminal, bx apply and bx sync ask whether to keep it deleted or restore bx's";
 
 /// The note a claim's row carries: what `apply` does to a file bx does not own
 /// that already holds what the target wants.

@@ -124,9 +124,12 @@ pub struct Report {
     /// interactive file was rendered with, and what an executed `apply`
     /// recorded in the fingerprint store.
     pub activations: activation::Plan,
-    /// Each file bx owns whole that was edited since bx wrote it, in row
-    /// order: the questions a writing run asks at a terminal. Its row is a
-    /// conflict, whose note says so in every mode.
+    /// Each file bx owns whole whose bytes or mode were changed since bx wrote
+    /// it, each region of bx's edited inside its markers, each symlink bx made
+    /// that was retargeted since, and each file or symlink of those deleted
+    /// since, in row order: the questions a
+    /// writing run asks at a terminal. Its row is a conflict, or a deletion
+    /// that stands, whose note says so in every mode.
     pub questions: Vec<Question>,
     /// Whether a writing run has work to write beside what its questions are
     /// answered with. Set before `approve` is asked, so it can tell whether
@@ -144,6 +147,9 @@ pub struct Question {
     /// bx wants there; `None` where it cannot be shown, and the row's own
     /// diff is all there is.
     pub three_way: Option<Diff>,
+    /// Whether the target was deleted since bx made it, rather than edited:
+    /// the question is then whether to keep it deleted or restore bx's.
+    pub deleted: bool,
 }
 
 /// What a writing run's `approve` answers: whether to write, and which edited
@@ -168,6 +174,9 @@ impl From<bool> for Approval {
 
 /// The note an edited file's row carries once its answer took bx's bytes.
 const TAKEN: &str = "edited since bx last wrote it; you took bx's bytes, and bx rm restores yours";
+
+/// The note a deleted target's row carries once its answer restored it.
+const RESTORED: &str = "deleted since bx wrote it; you restored bx's";
 
 impl Report {
     /// Every row's action, in order, then every activation's.
@@ -395,6 +404,7 @@ fn decide_and_write(
                     })
                     .as_deref(),
             ),
+            deleted: op.deleted(),
         })
         .collect();
     let mut held = decided.held;
@@ -459,12 +469,18 @@ fn decide_and_write(
             }
             // Each edit answered *take bx's* becomes the write its row was
             // decided with, and its row the modify that write is.
-            // A zsh activation's wordcode tied to a taken file is written
-            // right after it, so it is never the older of the two.
+            // A deleted target answered *restore* becomes the create it was
+            // decided with. A zsh activation's wordcode tied to a taken file
+            // is written right after it, so it is never the older of the two.
             let mut tied = decided.tied;
             for (row, op) in taken.into_iter().rev() {
-                report.changes[row].action = Action::Modify;
-                report.changes[row].note = Some(TAKEN.to_string());
+                let (action, note) = if op.deleted() {
+                    (Action::Create, RESTORED)
+                } else {
+                    (Action::Modify, TAKEN)
+                };
+                report.changes[row].action = action;
+                report.changes[row].note = Some(note.to_string());
                 if let Some(at) = tied.iter().position(|tied| tied.source == row) {
                     let tied = tied.remove(at);
                     report.changes[tied.row].action = Action::Modify;

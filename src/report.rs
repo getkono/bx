@@ -26,6 +26,13 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     /// Already converged. Hidden unless the user asks for detail.
+    ///
+    /// Also a file bx owns whole, or a symlink bx made, that was deleted
+    /// since while the configuration still wants exactly what bx made there:
+    /// the deletion stands, as a deletion against an unchanged base does in
+    /// git. Not pending work, so `apply` twice still converges, and never
+    /// hidden: its row reads like `git status`'s `deleted:`, and at a
+    /// terminal a writing run asks whether to restore it.
     Unchanged,
     /// bx wrote this file, the ledger still owns it, nothing declares it any
     /// more, and `apply` will not take it back: the configuration declares
@@ -42,6 +49,13 @@ pub enum Action {
     /// The target does not exist and will be created.
     Create,
     /// bx owns the target and its content differs; it will be updated.
+    ///
+    /// Also a tracked target whose repo copy was deleted since the last sync
+    /// while this machine's still holds what the two agreed on: the deletion
+    /// is carried here, and `apply` removes this machine's copy, journalled
+    /// and claimed, so `bx rm` puts it back, unless bx itself created that
+    /// copy: then `bx rm` restores what was there before bx, which is
+    /// nothing.
     Modify,
     /// bx wrote this file, nothing declares it any more — its `[[target]]`
     /// was deleted, switched off or gated off here, or the repo file a `tree`
@@ -64,9 +78,20 @@ pub enum Action {
     /// copy into the config repo and commits it. Not `apply`'s work, so it is
     /// neither pending nor in need of attention, and a bare `apply` over it
     /// still reports a converged machine.
+    ///
+    /// Also a tracked target this machine deleted while the repo's copy still
+    /// holds what the two last agreed on: `bx sync` removes the repo's copy,
+    /// claimed so `bx rm` puts it back unless bx itself created that copy,
+    /// and commits the removal.
     Sync,
     /// The target exists, differs, and bx does not own it — or bx owns it but
     /// the user has since edited it. Reported and skipped, never overwritten.
+    ///
+    /// Also a modify/delete conflict, as git names one: a file bx owns whole,
+    /// or a symlink bx made, deleted since while the configuration now wants
+    /// something else there; or a tracked target deleted on one side since
+    /// the last sync and changed on the other. Nothing is re-created unless a
+    /// writing run's question about it is answered *restore*.
     Conflict,
     /// A prerequisite this target needs is absent: a missing tool, or a declared
     /// value this account has not answered. Reported and skipped until the user

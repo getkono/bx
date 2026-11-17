@@ -64,7 +64,7 @@ use crate::git::checkout::{self, NotSelf};
 use crate::git::{self, Git};
 use crate::paths;
 use crate::plan::{self, Report};
-use crate::state::{ContentHash, LedgerView, Mechanism, StateDir};
+use crate::state::{ContentHash, LedgerView, Mechanism, StateDir, removed_written};
 
 /// Everything that stops `bx sync`.
 #[derive(Debug, thiserror::Error)]
@@ -340,6 +340,11 @@ pub(crate) const CARRIED_SUBJECT: &str = "chore: carry tracked files back from b
 /// never committed here, and neither is any other change in the working tree
 /// or the index — the commit names its paths and takes only theirs.
 ///
+/// A copy bx removed, carrying a deletion made on this machine, is one the
+/// ledger records at [`crate::state::removed_written`] with nothing at its
+/// path: the commit takes exactly its removal, with `git rm --cached`, and a
+/// file put back there since is the user's and is left out.
+///
 /// Run twice by `bx sync`: before the fetch, so copies an interrupted `sync`
 /// wrote and never committed are committed whole before anything moves the
 /// branch, and after the apply, for this run's own. A run that stopped
@@ -361,27 +366,49 @@ pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error>
         .map_err(plan::Error::from)?
         .value;
     let root = paths::normalize(repo);
-    let written: BTreeSet<String> = ledger
+    let mut written = BTreeSet::new();
+    let mut removed = BTreeSet::new();
+    for (path, entry) in ledger
         .iter()
         .filter(|(_, entry)| entry.mechanism == Mechanism::Own)
-        .filter_map(|(path, entry)| {
-            let dest = paths::normalize(&path.render(&env.home));
-            let rel = dest.strip_prefix(&root).ok()?.to_str()?.to_string();
-            let still =
-                std::fs::read(&dest).is_ok_and(|bytes| ContentHash::of(&bytes) == entry.written);
-            (still && !rel.is_empty()).then_some(rel)
-        })
-        .collect();
-    if written.is_empty() {
+    {
+        let dest = paths::normalize(&path.render(&env.home));
+        let Some(rel) = dest.strip_prefix(&root).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        if entry.written == removed_written() {
+            let gone = std::fs::symlink_metadata(&dest)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if gone {
+                removed.insert(rel.to_string());
+            }
+        } else if std::fs::read(&dest).is_ok_and(|bytes| ContentHash::of(&bytes) == entry.written) {
+            written.insert(rel.to_string());
+        }
+    }
+    if written.is_empty() && removed.is_empty() {
         return Ok(0);
     }
+    let removed: Vec<&str> = removed.iter().map(String::as_str).collect();
     let written: Vec<&str> = written.iter().map(String::as_str).collect();
     // Staged first and then asked about, so a copy git has never seen and one
     // it has are the same question: what the index now holds that `HEAD` does
-    // not.
-    let mut add = vec!["add", "--"];
-    add.extend(&written);
-    git.query(repo, &add)?;
+    // not. A copy bx removed is taken out of the index alone, and only where
+    // nothing has been put back at its path since.
+    if !written.is_empty() {
+        let mut add = vec!["add", "--"];
+        add.extend(&written);
+        git.query(repo, &add)?;
+    }
+    if !removed.is_empty() {
+        let mut rm = vec!["rm", "--cached", "--quiet", "--ignore-unmatch", "--"];
+        rm.extend(&removed);
+        git.query(repo, &rm)?;
+    }
+    let written: Vec<&str> = written.into_iter().chain(removed).collect();
     let mut staged = vec![
         "diff",
         "--cached",
@@ -1195,6 +1222,76 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(repo.join("lock")).expect("kept"),
             "mine\n"
+        );
+    }
+
+    /// A repo tracking `~/.lock` as `lock`, committed and agreed on as `a\n`
+    /// on both sides, then deleted on this machine and carried by a sync.
+    fn carried_deletion(home: &crate::testing::GuardedHome) -> PathBuf {
+        let repo = cloned(
+            home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \"lock\"\ndirection = \"track\"\n",
+        );
+        std::fs::write(repo.join("lock"), "a\n").expect("the repo copy");
+        std::fs::write(repo.join("other"), "x\n").expect("another file");
+        commit_all(home.path(), &repo, "track");
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        std::fs::remove_file(home.child(".lock")).expect("the deletion");
+        sync("the carrying run");
+        assert!(!repo.join("lock").exists(), "the repo copy is removed");
+        repo
+    }
+
+    #[test]
+    fn a_deletion_sync_carried_is_committed_as_exactly_that_removal() {
+        let home = guarded_home();
+        let repo = carried_deletion(&home);
+        // Unrelated work in the tree is the user's, and stays out of it.
+        std::fs::write(repo.join("other"), "mine\n").expect("an edit");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+
+        assert_eq!(committed, 1);
+        assert_eq!(
+            run(
+                home.path(),
+                &repo,
+                &["show", "--name-status", "--format=%B", "HEAD"]
+            ),
+            format!("{CARRIED_SUBJECT}\n\nlock\n\n\nD\tlock")
+        );
+        assert_eq!(
+            run(home.path(), &repo, &["status", "--porcelain"]),
+            "M other"
+        );
+        // Committed once: the next look finds nothing more to commit.
+        let head = rev(home.path(), &repo, "HEAD");
+        let again = commit_carried(&env(home.path()), &git(home.path()), &repo).expect("again");
+        assert_eq!(again, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    }
+
+    #[test]
+    fn a_removed_copy_put_back_before_the_commit_is_not_committed() {
+        let home = guarded_home();
+        let repo = carried_deletion(&home);
+        std::fs::write(repo.join("lock"), "back\n").expect("put back");
+        let head = rev(home.path(), &repo, "HEAD");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("nothing");
+
+        assert_eq!(committed, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head, "no commit made");
+        assert_eq!(
+            run(home.path(), &repo, &["status", "--porcelain"]),
+            "M lock"
         );
     }
 

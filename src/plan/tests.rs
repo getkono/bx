@@ -693,8 +693,8 @@ fn decision_22_a_mode_the_user_changed_on_a_file_bx_owns_is_a_conflict() {
     assert!(
         report.changes[0].note.as_deref().is_some_and(|note| note
             .starts_with("its mode changed since bx wrote it")
-            && !note.contains(decide::ASK)),
-        "a mode change alone is skipped, not asked about: {:?}",
+            && note.contains(decide::ASK)),
+        "a mode change is asked about, as an edit is: {:?}",
         report.changes[0].note
     );
     let applied = apply(&inputs);
@@ -1116,6 +1116,11 @@ fn t20_exit_follows_the_mode_and_whether_apply_wrote() {
     assert_eq!(exit(&carried, Mode::Sync), Exit::Converged);
 }
 
+/// A file bx owns whole, or a symlink bx made, deleted since bx made it.
+mod deleted;
+/// A region edited inside its markers, a mode changed on bx's bytes, and a
+/// symlink retargeted since bx made it.
+mod displaced;
 /// A file bx owns whole that was edited since bx wrote it.
 mod edited;
 mod secrets;

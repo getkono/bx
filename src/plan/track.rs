@@ -126,8 +126,17 @@ pub(super) enum When {
 pub(super) struct Agreed {
     /// The tracked target.
     pub target: Portable,
-    /// The bytes both sides hold once [`Agreed::when`] has happened.
-    pub bytes: Vec<u8>,
+    /// The bytes both sides hold once [`Agreed::when`] has happened, or
+    /// `None` where neither side will hold any.
+    ///
+    /// # Decision: two sides that hold nothing agree on nothing
+    ///
+    /// Once a deletion is carried to the other side, or both sides were
+    /// deleted, the agreement is forgotten rather than kept. A copy that
+    /// appears on one side later is then a first copy, filled in on the other
+    /// side as one is; kept, the old agreement would read it as the other
+    /// side's deletion standing beside an agreed copy, and remove it again.
+    pub bytes: Option<Vec<u8>>,
     /// What has to happen first.
     pub when: When,
 }
@@ -219,7 +228,8 @@ fn stale(inputs: &Inputs, cache: &Fingerprints) -> Vec<String> {
 /// Record what each tracked target's two sides now agree on: every agreement
 /// that holds already, and — once this run `executed` — those its writes made,
 /// a carry into the repo only in [`Mode::Sync`]; and forget every agreement
-/// [`stale`] names.
+/// [`stale`] names, and each one whose two sides hold nothing once that has
+/// happened.
 ///
 /// Written under the lock, and only when something changed, so a run with
 /// nothing new to record leaves the state directory as it found it.
@@ -237,8 +247,8 @@ pub(super) fn agree(
             When::Applied => executed,
             When::Synced => executed && mode == Mode::Sync,
         })
-        .map(|agreed| (&agreed.target, Base::of(&agreed.bytes)))
-        .filter(|(target, base)| bases.get(*target) != Some(base))
+        .map(|agreed| (&agreed.target, agreed.bytes.as_deref().map(Base::of)))
+        .filter(|(target, base)| bases.get(*target) != base.as_ref())
         .map(|(target, base)| (base_key(target), base))
         .collect::<Vec<_>>();
     if settled.is_empty() && stale(inputs, &Fingerprints::read(&inputs.state)?.value).is_empty() {
@@ -252,7 +262,14 @@ pub(super) fn agree(
         cache.remove(&key);
     }
     for (key, base) in settled {
-        cache.set(key, base.fingerprint());
+        match base {
+            Some(base) => {
+                cache.set(key, base.fingerprint());
+            }
+            None => {
+                cache.remove(&key);
+            }
+        }
     }
     if cache != before {
         cache.save(&inputs.state, &lock)?;

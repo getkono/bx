@@ -99,6 +99,23 @@ pub fn clone_removing() -> ContentHash {
     ContentHash::of(b"removing")
 }
 
+/// What a [`Mechanism::Own`] entry records as [`LedgerEntry::written`] once
+/// bx removed the file and kept the entry: [`ContentHash::ZERO`], which no
+/// file's bytes hash to.
+///
+/// A tracked target deleted on one side since the last sync, while the other
+/// side still holds what the two agreed on, has its deletion carried to the
+/// other side: that removal is bx's write, so the entry stays, with the bytes
+/// it removed as its prior unless bx itself created that copy, and `bx rm`
+/// puts them back; a copy bx itself created keeps its prior
+/// [`Prior::Absent`], so `bx rm` restores nothing there. What is on disk there
+/// is then what bx left while nothing is, and a file found there since is
+/// someone else's, as any edit of a file bx owns is.
+#[must_use]
+pub const fn removed_written() -> ContentHash {
+    ContentHash::ZERO
+}
+
 /// A pointer to the bytes that were at a target before bx wrote it.
 ///
 /// The blob is stored under its own digest, so two targets that displaced
@@ -151,6 +168,8 @@ pub struct LedgerEntry {
     /// touched the file and a rewrite is a `Modify`; if they do not, someone
     /// else has, and it is a `Conflict` — unless [`LedgerEntry::region`] says
     /// the edit was beside bx's region rather than in it.
+    ///
+    /// [`removed_written`] where bx removed the file and kept the entry.
     pub written: ContentHash,
     /// For a [`Mechanism::Region`], the digest of the region bx last wrote,
     /// delimiters included.
@@ -519,7 +538,11 @@ fn unrelated_created_dir(
 ///
 /// A region whose own bytes are still the ones bx wrote is the exception: the
 /// change is all outside it, and [`outside_region`] gives what the user has
-/// there without bx's lines.
+/// there without bx's lines. So are a symlink bx made, whose displaced text is
+/// the user's whole, and a region edited inside its markers
+/// ([`inside_region`]), whose displaced bytes are the user's edit of it: both
+/// are adopted whole, because `plan` writes over either only once the user
+/// answered *take bx's* about it.
 pub(super) fn prior_conflict(
     existing: &LedgerEntry,
     mechanism: &Mechanism,
@@ -529,9 +552,11 @@ pub(super) fn prior_conflict(
         return Ok(());
     };
     let digest = ContentHash::of(bytes);
+    let whole = |shared: &Mechanism| matches!(shared, Mechanism::Own | Mechanism::Link);
     if digest != existing.written
-        && (existing.mechanism != Mechanism::Own || *mechanism != Mechanism::Own)
+        && !(existing.mechanism == *mechanism && whole(mechanism))
         && outside_region(existing, mechanism, bytes).is_none()
+        && !inside_region(existing, mechanism, bytes)
     {
         return Err(Error::PriorConflict {
             target: existing.path.as_str().to_string(),
@@ -575,6 +600,32 @@ pub(super) fn outside_region(
         return None;
     }
     crate::plan::region::without(displaced, comment)
+}
+
+/// Whether `displaced` holds bx's region edited inside its markers since bx
+/// last wrote `existing`: both the stored and the incoming mechanism are the
+/// same [`Mechanism::Region`], the entry records its region's digest, and
+/// `displaced` holds one whole region that no longer hashes to it.
+///
+/// `plan` reports such a file as a conflict and asks about it, and writes
+/// over it only on an answer of *take bx's*, so the displaced bytes are the
+/// user's edit, kept whole: `bx rm` puts back the file exactly as they had it,
+/// their region text and its markers with it. A region entry with no digest
+/// of its own cannot tell an edit inside from one beside, and a file with no
+/// region or a damaged one holds no edit of bx's lines to keep: neither is
+/// this.
+pub(super) fn inside_region(
+    existing: &LedgerEntry,
+    mechanism: &Mechanism,
+    displaced: &[u8],
+) -> bool {
+    let Mechanism::Region { comment } = existing.mechanism else {
+        return false;
+    };
+    *mechanism == existing.mechanism
+        && existing.region.is_some()
+        && crate::plan::region::digest(displaced, comment)
+            .is_some_and(|region| Some(region) != existing.region)
 }
 
 #[cfg(test)]

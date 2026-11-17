@@ -53,6 +53,11 @@ const CHUNK: usize = 64 * 1024;
 pub struct ContentHash([u8; LEN]);
 
 impl ContentHash {
+    /// Thirty-two zero bytes: the digest of no input anyone knows, so a record
+    /// can use it for a state that holds no bytes at all without any file's
+    /// bytes ever hashing to it. See [`crate::state::removed_written`].
+    pub const ZERO: Self = Self([0; LEN]);
+
     /// The digest of `bytes`.
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {

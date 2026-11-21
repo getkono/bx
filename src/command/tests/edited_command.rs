@@ -245,6 +245,38 @@ fn a_mode_change_is_asked_about_its_mode_and_offers_no_view() {
 }
 
 #[test]
+fn a_question_with_neither_a_view_nor_a_row_diff_offers_no_show() {
+    let change = plan::Change {
+        target: "~/.a".to_owned(),
+        origin: crate::config::Origin {
+            file: std::path::PathBuf::from("bx.toml"),
+            line: 1,
+        },
+        action: crate::report::Action::Conflict,
+        diff: None,
+        note: None,
+    };
+    for asked in [
+        plan::Asked::Edited,
+        plan::Asked::Mode,
+        plan::Asked::Region,
+        plan::Asked::Retargeted,
+        plan::Asked::Deleted,
+    ] {
+        let question = plan::Question {
+            row: 0,
+            three_way: None,
+            asked,
+        };
+
+        let (_, choices) = super::super::asked(&change, &question);
+
+        assert!(shows(&choices).is_empty(), "{asked:?}: {choices:?}");
+        assert!(!choices.is_empty(), "{asked:?} still offers keep and take");
+    }
+}
+
+#[test]
 fn a_retargeted_link_is_asked_about_its_target() {
     let home = guarded_home();
     let link = |text: &str| format!("[[target]]\npath = \"~/.tool\"\nsymlink = \"{text}\"\n");

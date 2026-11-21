@@ -250,6 +250,11 @@ pub(crate) const TAKEN_RETARGETED: &str = "you took bx's target, and bx rm resto
 /// What a deleted target's row says once its answer restored it.
 pub(crate) const RESTORED: &str = "you restored bx's";
 
+/// What a pending link's child asked about says in place of its question:
+/// its commit arrived only after this run's questions were put.
+pub(crate) const ASK_NEXT: &str = "its commit arrived after this run's questions were put, so at a \
+                                   terminal the next bx apply or bx sync asks about it";
+
 /// What replaces [`decide::DELETED`] in a restored row's note: the deletion
 /// no longer stands.
 const STOOD: &str = "deleted since bx wrote it";
@@ -734,7 +739,10 @@ fn declared_path(resolution: &Resolution<Target>) -> &str {
 /// its commit is still not here — its
 /// external was stopped, or reached no commit. Each child is decided against
 /// the ledger as the clones left it, and written in a session of its own,
-/// after the one the targets were written in.
+/// after the one the targets were written in. A child retargeted or deleted
+/// since bx made it is not asked about: the questions were put before its
+/// commit was here, so its row says the next run asks, and nothing is
+/// written there.
 ///
 /// # Errors
 ///
@@ -798,7 +806,21 @@ fn link_pending(
         bases,
         host: &inputs.host,
     };
-    let decided = decide::decide_all(&targets, &ctx)?;
+    let mut decided = decide::decide_all(&targets, &ctx)?;
+    // A child retargeted or deleted since bx made it is a question, but this
+    // run's questions were put before its commit was here: its row says the
+    // next run asks it rather than promising this one does, and its write
+    // is never made unanswered. A child is a symlink, so none is a zsh
+    // activation's file with a wordcode tied to it.
+    debug_assert!(decided.tied.is_empty(), "a link's child is never tied");
+    for (row, op) in &decided.held {
+        let ask = op.asked(ledger.get(op.target())).ask();
+        let change = &mut decided.changes[*row];
+        change.note = change
+            .note
+            .as_deref()
+            .map(|note| note.replace(ask, ASK_NEXT));
+    }
     for change in decided.changes {
         // A child that is a conflict or blocked was never shown as one, so
         // it is said with the rows apply stopped short of.

@@ -351,6 +351,11 @@ impl Op {
         let target = self.target.as_str();
         match &self.made {
             Made::Link(text) => Some(Diff::link(None, Some(text))),
+            // Only a generated body is ever a region, so it is never a
+            // secret: restoring it writes the region alone, shown whole.
+            Made::Region(bytes, _) => {
+                Diff::labelled(target, ("deleted", "bx's"), None, bytes, None)
+            }
             Made::Bytes(bytes) => match self.base() {
                 Some(wanted) => Diff::labelled(target, ("deleted", "bx's"), None, wanted, None),
                 None => Some(Diff {
@@ -547,20 +552,42 @@ pub(super) fn decide(
         _ => ownership(found, &observed, entry, note),
     };
     let claim = found == Action::Unchanged && action == Action::Modify;
-    // A file bx owns whole that was deleted since bx wrote it, settled as git
-    // settles a deletion: see [`deleted`]. A file bx generates for itself in
-    // its own data directory is not the user's to delete: see [`own_data`].
-    // Nor is one bx itself removed, as it carries a tracked target's deletion
-    // across: nothing there is what bx last left, and writing it is a create.
-    let gone = matches!(target.attach, Attach::Own)
-        && action == Action::Create
+    // A file bx owns whole that was deleted since bx wrote it, or a file that
+    // held a region of bx's, settled as git settles a deletion: see
+    // [`deleted`]. A file bx generates for itself in its own data directory
+    // is not the user's to delete: see [`own_data`]. Nor is one bx itself
+    // removed, as it carries a tracked target's deletion across: nothing
+    // there is what bx last left, and writing it is a create.
+    let gone = action == Action::Create
         && observed.kind == Kind::Absent
-        && !own_data(target)
         && entry.is_some_and(|entry| {
-            entry.mechanism == Mechanism::Own && entry.written != removed_written()
+            entry.written != removed_written()
+                && match target.attach {
+                    Attach::Own => entry.mechanism == Mechanism::Own && !own_data(target),
+                    Attach::Region { comment } => entry.mechanism == Mechanism::Region { comment },
+                    Attach::Include { .. } => false,
+                }
         });
-    let (action, note) = match entry {
-        Some(entry) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
+    // A region's file restored is put back at the mode bx last left it at,
+    // unless the target declares one: the mode was the user's file's, and
+    // restoring bx's region never widens it.
+    let mode = match (&target.attach, entry) {
+        (Attach::Region { .. }, Some(entry)) if gone && target.mode.is_none() => entry.mode,
+        _ => mode,
+    };
+    let (action, note) = match (&target.attach, entry) {
+        // The region is measured by its own digest, which the ledger keeps
+        // beside the whole file's: the user's lines around it went with the
+        // file, and are not bx's to want back. An entry recorded before bx
+        // kept a region digest is measured by the whole file.
+        (Attach::Region { comment }, Some(entry)) if gone => {
+            let made = match entry.region {
+                Some(region) => region::digest(&bytes, *comment) == Some(region),
+                None => ContentHash::of(&bytes) == entry.written,
+            };
+            settle_deleted(entry, made, mode, note)
+        }
+        (_, Some(entry)) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
         _ => (action, note),
     };
     // A file bx owns whole whose bytes or mode someone else changed since, or
@@ -1331,8 +1358,9 @@ fn own_data(target: &Target) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Settle a target bx made — a file it owns whole, or a symlink — that was
-/// deleted since bx made it, as git settles a deletion against its base.
+/// Settle a target bx made — a file it owns whole, a file holding a region of
+/// bx's, or a symlink — that was deleted since bx made it, as git settles a
+/// deletion against its base.
 ///
 /// `entry` is what bx last left there, and `wanted` and `mode` what the
 /// target wants there now:
@@ -1355,7 +1383,19 @@ fn deleted(
     mode: Mode,
     note: Option<String>,
 ) -> (Action, Option<String>) {
-    if wanted == entry.written && mode == entry.mode {
+    settle_deleted(entry, wanted == entry.written, mode, note)
+}
+
+/// [`deleted`], told whether the target still wants what bx made there,
+/// `made`, rather than measuring it: a region is measured by its own digest,
+/// not the whole file's.
+fn settle_deleted(
+    entry: &LedgerEntry,
+    made: bool,
+    mode: Mode,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    if made && mode == entry.mode {
         (Action::Unchanged, join([Some(DELETED.to_string()), note]))
     } else {
         let moded = (mode != entry.mode).then(|| format!("mode {} -> {mode}", entry.mode));

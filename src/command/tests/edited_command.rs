@@ -299,6 +299,7 @@ fn a_question_with_neither_a_view_nor_a_row_diff_offers_no_show() {
             row: 0,
             three_way: None,
             asked,
+            save: None,
         };
 
         let (_, choices) = super::super::asked(&change, &question);

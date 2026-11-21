@@ -1663,6 +1663,7 @@ mod tests {
             row: 0,
             three_way: None,
             asked: plan::Asked::Edited,
+            save: None,
         };
         assert_eq!(undone(&Report::default()), None);
         // A kept row is unchanged, and a push does not wait on it.

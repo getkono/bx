@@ -13,6 +13,7 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            saved: Default::default(),
             kept: std::collections::BTreeSet::new(),
         })
     })
@@ -254,6 +255,7 @@ fn keep(inputs: &Inputs) -> Report {
         Ok(Approval {
             approved: true,
             taken: std::collections::BTreeSet::new(),
+            saved: Default::default(),
             kept: report
                 .questions
                 .iter()

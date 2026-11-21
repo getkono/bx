@@ -1297,7 +1297,7 @@ pub fn add_asking(
     let mut saved = Vec::new();
     for save in &saves {
         for write in &save.repo {
-            write.write(&ctx.home)?;
+            write.write()?;
             saved.push(write.written());
         }
     }

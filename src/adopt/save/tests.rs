@@ -199,7 +199,7 @@ fn a_layer_saved_by_an_editor_while_bx_asked_is_refused_and_keeps_the_save() {
         panic!("{rows:?}");
     };
     std::fs::write(home.child(".config/bx/bx.toml"), MINE_AGAIN).expect("saved again");
-    let error = save.repo[0].write(home.path()).expect_err("refused");
+    let error = save.repo[0].write().expect_err("refused");
     assert!(
         matches!(&error, Error::Layer { why, .. } if why.contains("changed after bx read it")),
         "{error}"

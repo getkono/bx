@@ -163,6 +163,11 @@ impl Save {
         matches!(self.how, How::Merged | How::Conflicted)
     }
 
+    /// What was on the machine when the save was decided.
+    pub(crate) const fn observed(&self) -> &Observed {
+        &self.observed
+    }
+
     /// Each repo file it rewrites, as a person reads it.
     #[must_use]
     pub fn repo_files(&self, home: &Path) -> Vec<String> {
@@ -261,6 +266,15 @@ pub(crate) fn write_machines(
         }
         ledger.save()?;
     }
+    keep_bases(state, saves);
+    Ok(())
+}
+
+/// Keep what each save in `saves` leaves on the machine as the base a later
+/// edit of it is merged from, as `apply` keeps what it writes. Best effort:
+/// losing one costs only a later merge. A conflicted merge keeps none: what
+/// bx last wrote stays the base.
+pub(crate) fn keep_bases(state: &StateDir, saves: &[&Save]) {
     for save in saves.iter().filter(|save| save.how != How::Conflicted) {
         if save.bytes.len() as u64 <= BASE_LIMIT
             && let Err(error) = state::restore::keep(state, &save.bytes)
@@ -268,7 +282,6 @@ pub(crate) fn write_machines(
             tracing::warn!(%error, "the bytes bx saved were not kept as a base");
         }
     }
-    Ok(())
 }
 
 /// What `decide` found.
@@ -706,23 +719,8 @@ impl RepoWrite {
     ///
     /// [`super::Error::Layer`] naming the file when it changed since, with
     /// nothing written, and otherwise what the write returns.
-    pub(crate) fn write(&self, home: &Path) -> Result<(), super::Error> {
-        let (bytes, mode) = match &self.edit {
-            Edit::File(bytes, mode) => (bytes.as_slice(), *mode),
-            Edit::Layer { text } => {
-                crate::config::parse_str(text, &self.path, home).map_err(|e| {
-                    super::Error::Layer {
-                        path: self.path.clone(),
-                        why: format!("bx's edit would not load, so it was not made: {e}"),
-                    }
-                })?;
-                (
-                    text.as_bytes(),
-                    self.read.mode.unwrap_or(Mode::DEFAULT_FILE),
-                )
-            }
-        };
-        fs::write_over(&self.read, bytes, mode).map_err(|error| match error {
+    pub(crate) fn write(&self) -> Result<(), super::Error> {
+        self.put().map_err(|error| match error {
             fs::Error::Changed { .. } => super::Error::Layer {
                 path: self.path.clone(),
                 why: "changed after bx read it, so bx's edit was not made and the file is as it \
@@ -731,6 +729,25 @@ impl RepoWrite {
             },
             error => super::Error::from(error),
         })
+    }
+
+    /// [`RepoWrite::write`], failing with what the write returns: for a file
+    /// changed since, [`fs::Error::Changed`], with nothing written. A layer's
+    /// text was parsed back as the loader parses it when the save was
+    /// decided, so what is written is a layer that loads.
+    ///
+    /// # Errors
+    ///
+    /// What [`fs::write_over`] returns.
+    pub(crate) fn put(&self) -> Result<(), fs::Error> {
+        let (bytes, mode) = match &self.edit {
+            Edit::File(bytes, mode) => (bytes.as_slice(), *mode),
+            Edit::Layer { text } => (
+                text.as_bytes(),
+                self.read.mode.unwrap_or(Mode::DEFAULT_FILE),
+            ),
+        };
+        fs::write_over(&self.read, bytes, mode)
     }
 }
 

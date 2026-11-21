@@ -152,6 +152,9 @@ pub(crate) enum Answer {
     Keep,
     /// Write bx's bytes over the edit, which `bx rm` then restores.
     Take,
+    /// Save the edit into the repo, or merge it with the repo's change, as
+    /// `bx add` would: the question's [`plan::Question::save`].
+    Save,
     /// Show the question's view, or the row's diff again, then ask again.
     Show,
 }
@@ -170,6 +173,14 @@ const DELETED_CHOICES: [(&str, Answer); 2] = [
     ("keep it deleted", Answer::Keep),
     ("restore bx's", Answer::Take),
 ];
+
+/// The choice that saves an edit into the repo, where only this machine
+/// changed the file.
+const SAVE: (&str, Answer) = ("save mine to the repo", Answer::Save);
+
+/// The choice that merges an edit with the repo's change, where both sides
+/// changed and merge cleanly.
+const MERGE: (&str, Answer) = ("merge both, here and in the repo", Answer::Save);
 
 /// The choice that draws an edited target's three-way view.
 const SHOW_THREE_WAY: (&str, Answer) = ("show the three-way diff", Answer::Show);
@@ -214,6 +225,11 @@ fn asked(
     } else {
         CHOICES.to_vec()
     };
+    choices.extend(question.save.as_ref().map(
+        |save| {
+            if save.writes_machine() { MERGE } else { SAVE }
+        },
+    ));
     let show = match (&question.three_way, &change.diff) {
         (Some(_), _) if question.asked == Asked::Deleted => Some(SHOW_RESTORED),
         (Some(_), _) => Some(SHOW_THREE_WAY),
@@ -420,22 +436,24 @@ pub(crate) fn converge_answering(
         shown = true;
         let mut taken = std::collections::BTreeSet::new();
         let mut kept = std::collections::BTreeSet::new();
+        let mut saved = std::collections::BTreeSet::new();
         if let Some(settle) = settle.as_deref_mut().filter(|_| asking) {
             for question in &report.questions {
-                if settled(out, env, report, question, &mut *settle)? == Answer::Take {
-                    taken.insert(question.row);
-                } else {
-                    kept.insert(question.row);
-                }
+                match settled(out, env, report, question, &mut *settle)? {
+                    Answer::Take => taken.insert(question.row),
+                    Answer::Save => saved.insert(question.row),
+                    Answer::Keep | Answer::Show => kept.insert(question.row),
+                };
             }
         }
         // Every answer kept the edit: nothing is written, so nothing is
         // confirmed, and the answers are remembered.
-        if !report.work && taken.is_empty() {
+        if !report.work && taken.is_empty() && saved.is_empty() {
             return Ok(plan::Approval {
                 approved: false,
                 taken,
                 kept,
+                saved,
             });
         }
         let approved = if yes {
@@ -449,6 +467,7 @@ pub(crate) fn converge_answering(
             approved: decided(report, approved),
             taken,
             kept,
+            saved,
         })
     })?;
 
@@ -466,6 +485,14 @@ pub(crate) fn converge_answering(
             .filter(|action| action.is_pending() || (mode == Mode::Sync && *action == Action::Sync))
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
+        if !report.saved.is_empty() {
+            writeln!(
+                out,
+                "Saved {} edit(s) into the repo; bx sync commits and pushes them.",
+                report.saved.len()
+            )
+            .map_err(Error::Output)?;
+        }
         // A row apply stopped short of was announced as work and shown so; its
         // reason is known only now, so it is said now.
         for &at in &report.stopped {
@@ -503,6 +530,15 @@ fn settled(
                     plan::render_row(change, question.three_way.as_ref(), palette, &env.home);
                 page(out, &view, env)?;
                 out.flush().map_err(Error::Output)?;
+            }
+            // What saving writes, shown before the one confirmation that
+            // makes it.
+            Answer::Save => {
+                if let Some(save) = &question.save {
+                    out.write_all(save_preview(save, &env.home).as_bytes())
+                        .map_err(Error::Output)?;
+                }
+                return Ok(Answer::Save);
             }
             answer => return Ok(answer),
         }

@@ -169,7 +169,14 @@ fn rm_after_add_then_an_edit_names_the_way_out_by_path_and_no_digest() {
     seed(home.path(), "");
     std::fs::write(home.child(".rc"), "original\n").expect("the file");
     let mut out = Vec::new();
-    add(&env(home.path()), home.path(), Some("~/.rc"), &mut out).expect("add");
+    add(
+        &env(home.path()),
+        home.path(),
+        Some("~/.rc"),
+        false,
+        &mut out,
+    )
+    .expect("add");
     std::fs::write(home.child(".rc"), "edited\n").expect("the edit");
 
     let mut out = Vec::new();

@@ -30,8 +30,14 @@ enum Command {
         #[arg(long)]
         yes: bool,
     },
-    /// Begin managing a config file, or a directory of them
-    Add { target: Option<String> },
+    /// Begin managing a config file, or a directory of them, or save an
+    /// edit of one bx manages into the repo
+    Add {
+        target: Option<String>,
+        /// Save an edit into the repo without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Stop managing it, and restore the original
     Rm {
         target: Option<String>,
@@ -191,9 +197,13 @@ fn main() -> Result<()> {
         Some(Command::Secret {
             action: SecretAction::List,
         }) => bx::command::secret_list(&env, &mut out)?,
-        Some(Command::Add { target }) => {
-            bx::command::add(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
-        }
+        Some(Command::Add { target, yes }) => bx::command::add(
+            &env,
+            &std::env::current_dir()?,
+            target.as_deref(),
+            yes,
+            &mut out,
+        )?,
         Some(Command::Rm { target, yes }) => bx::command::rm(
             &env,
             &std::env::current_dir()?,

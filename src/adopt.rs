@@ -60,6 +60,15 @@
 //! tree managed; on a file inside it, it releases nothing and names `exclude`.
 //! `add` likewise refuses to copy a file into a tree's root, where the tree
 //! would declare it beside the `[[target]]` `add` writes.
+//!
+//! # `add` saves an edit of a managed file
+//!
+//! A declared file bx wrote and the user edited since is not refused: `add`
+//! saves the edit into the repo, or merges it with the repo's own change,
+//! once confirmed. [`save`] decides how, and `apply`'s question about an
+//! edited file offers the same save.
+
+pub mod save;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -364,6 +373,18 @@ impl Context {
         &self.home
     }
 
+    /// What saving an edited file into the repo is decided against.
+    fn sides(&self) -> save::Sides<'_> {
+        save::Sides {
+            home: &self.home,
+            repo: &self.repo,
+            state: &self.state,
+            git: &self.git,
+            values: &self.resolved.values,
+            targets: &self.resolved.targets,
+        }
+    }
+
     /// Why bx will not adopt anything at `dest`, when it is bx's own.
     fn bx_own(&self, dest: &Path) -> Option<&'static str> {
         let dest = paths::normalize(dest);
@@ -605,6 +626,15 @@ pub enum Adoption {
         /// Why.
         note: String,
     },
+    /// Declared, owned, and edited on this machine since bx wrote it: the
+    /// edit is saved into the repo, or merged with the repo's change, as
+    /// [`save`] decides. Carried out only once confirmed.
+    Save {
+        /// The target.
+        target: Portable,
+        /// What saving it does.
+        save: Box<save::Save>,
+    },
     /// Refused, with the reason. Nothing is written for it.
     Refused {
         /// The target.
@@ -623,15 +653,21 @@ impl Adoption {
             Self::Adopt { target, .. }
             | Self::Own { target, .. }
             | Self::Unchanged { target }
+            | Self::Save { target, .. }
             | Self::Refused { target, .. } => target.as_str(),
             Self::Skipped { subject, .. } => subject,
         }
     }
 
-    /// Whether a human has to look: `add` did not do what was asked.
+    /// Whether a human has to look: `add` did not do what was asked, or left
+    /// a conflicted merge to resolve.
     #[must_use]
-    pub const fn needs_attention(&self) -> bool {
-        matches!(self, Self::Refused { .. })
+    pub fn needs_attention(&self) -> bool {
+        match self {
+            Self::Refused { .. } => true,
+            Self::Save { save, .. } => save.how == save::How::Conflicted,
+            _ => false,
+        }
     }
 }
 
@@ -918,7 +954,7 @@ fn decide_file(
     pass: &dyn Fn(String) -> Adoption,
 ) -> Result<Adoption, Error> {
     let observed = fs::observe(dest)?;
-    let (Some(bytes), Some(mode)) = (observed.bytes, observed.mode) else {
+    let (Some(bytes), Some(mode)) = (observed.bytes.clone(), observed.mode) else {
         return Ok(pass("changed while bx was reading it".to_string()));
     };
     let refused = |note: String| Adoption::Refused {
@@ -957,10 +993,24 @@ fn decide_file(
                 }
             };
             if (&wanted, Mode::resolve(declared.mode, Kind::File)) != (&bytes, mode) {
-                return Ok(refused(format!(
-                    "is already declared at {origin}, and differs from what it declares; \
-                     `bx plan` shows how"
-                )));
+                // A file bx wrote and the user edited since is saved into
+                // the repo, as `git add` stages an edit; one bx never wrote
+                // has no record of whose side moved.
+                let Some(entry) = ledger.get(target) else {
+                    return Ok(refused(format!(
+                        "is already declared at {origin}, and differs from what it declares; \
+                         `bx plan` shows how"
+                    )));
+                };
+                return Ok(
+                    match save::decide(&ctx.sides(), declared, entry, &observed, &wanted) {
+                        save::Decision::Save(save) => Adoption::Save {
+                            target: target.clone(),
+                            save,
+                        },
+                        save::Decision::Refused(note) => refused(note),
+                    },
+                );
             }
             let digest = ContentHash::of(&bytes);
             let owned = ledger.get(target).is_some_and(|entry| {
@@ -1148,14 +1198,69 @@ fn lock(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// ([`recover::lock_for_writing`]) — refusing when that session cannot be
 /// accounted for.
 ///
+/// This is [`add_asking`] with every save approved, as `bx add --yes` is.
+///
 /// # Errors
 ///
-/// As [`plan_add`], plus whatever the lock, the recovery, the writes, and the
-/// ledger return.
+/// As [`add_asking`].
 pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
+    add_asking(ctx, target, &mut |_| Ok(true))
+}
+
+/// What a save's row says when it was not confirmed.
+pub const NOT_CONFIRMED: &str = "was not saved, since nobody confirmed it; run bx add again at a \
+                                 terminal, or with --yes, to save it";
+
+/// What a save's row says when its file changed after it was shown.
+pub const MOVED: &str = "changed after bx showed what saving it does, so nothing was saved; run \
+                         bx add again";
+
+/// [`add`], asking `approve` about every [`Adoption::Save`] first.
+///
+/// What `approve` is shown is decided as `add` decides it, by the same
+/// function, before the state directory is locked: it is asked only when a
+/// save is among the rows. Under the lock `add` decides again and carries out
+/// only a save identical to the one shown, as `rm` carries out only what its
+/// preview announced; a save declined, or one that changed since it was
+/// shown, is refused with nothing written for it, and the other rows are
+/// carried out as `add` always carries them out.
+///
+/// # Errors
+///
+/// As [`plan_add`], plus whatever `approve`, the lock, the recovery, the
+/// writes, the session a merge writes the machine file through, and the
+/// ledger return.
+pub fn add_asking(
+    ctx: &Context,
+    target: &Portable,
+    approve: &mut dyn FnMut(&[&Adoption]) -> Result<bool, Error>,
+) -> Result<Vec<Adoption>, Error> {
+    let preview = plan_add(ctx, &LedgerView::read(&ctx.state, &ctx.home)?.value, target)?;
+    let saves: Vec<&Adoption> = preview
+        .iter()
+        .filter(|row| matches!(row, Adoption::Save { .. }))
+        .collect();
+    let approved = saves.is_empty() || approve(&saves)?;
+
     let lock = lock(&ctx.state)?;
     let mut ledger = Ledger::open(&ctx.state, &lock, &ctx.home)?.value;
-    let rows = plan_add(ctx, &ledger, target)?;
+    let mut rows = plan_add(ctx, &ledger, target)?;
+    for row in &mut rows {
+        let Adoption::Save { target, .. } = &*row else {
+            continue;
+        };
+        let note = if !approved {
+            NOT_CONFIRMED
+        } else if !preview.contains(row) {
+            MOVED
+        } else {
+            continue;
+        };
+        *row = Adoption::Refused {
+            target: target.clone(),
+            note: note.to_string(),
+        };
+    }
 
     for row in &rows {
         if let Adoption::Adopt {
@@ -1180,9 +1285,27 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
             fs::write_atomically(&path, bytes, *mode)?;
         }
     }
+    let saves: Vec<&save::Save> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Adoption::Save { save, .. } => Some(&**save),
+            _ => None,
+        })
+        .collect();
+    // The repo side first: a run that stops before the machine side finds
+    // the repo holding the edit, which the next `add` sees as one side moved.
+    for save in &saves {
+        for write in &save.repo {
+            write.write(&ctx.home)?;
+        }
+    }
     declare(ctx, &rows)?;
 
     let mut recorded = false;
+    for save in saves.iter().filter(|save| !save.writes_machine()) {
+        ledger.record(save.record())?;
+        recorded = true;
+    }
     for row in &rows {
         if let Adoption::Adopt {
             target,
@@ -1218,6 +1341,8 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
     if recorded {
         ledger.save()?;
     }
+    drop(ledger);
+    save::write_machines(&ctx.state, &ctx.home, lock, &saves)?;
     Ok(rows)
 }
 

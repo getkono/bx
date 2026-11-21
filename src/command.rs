@@ -971,7 +971,7 @@ fn init_with(
     if interactive {
         let deferred = init::adopt_offered(env, ask, &mut |row| {
             adopted += 1;
-            say(out, &adoption_row(row))
+            say(out, &adoption_row(row, &env.home))
         });
         match deferred {
             Ok(init::Deferred::No) => {}
@@ -1197,36 +1197,99 @@ pub fn not_built(command: &str, err: &mut dyn Write) -> Result<Exit, Error> {
 /// `bx add PATH`: adopt a file, or every regular file under a directory, byte
 /// for byte.
 ///
+/// A file bx manages that was edited on this machine is saved into the repo,
+/// or merged with the repo's own change ([`adopt::save`]): what that writes
+/// is shown first, as diffs, and carried out only once approved — by `yes`,
+/// or by the answer to a prompt when standard input is a terminal. With
+/// neither, it is refused, and nothing is written for it.
+///
 /// Prints one row per path: `+` adopted, `=` already managed, `~` already
-/// declared and now owned, `-` passed over inside a directory, `!` refused.
-/// Exits 0 when everything named was adopted or already managed, and 2 when
-/// something was refused.
+/// declared and now owned, `<` saved into the repo, `-` passed over inside a
+/// directory, `!` refused or merged with conflicts. Exits 0 when everything
+/// named was adopted, saved or already managed, 2 when something was refused
+/// or a merge conflicted, and 130 when the prompt was abandoned.
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
-/// or adopting returns.
+/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading,
+/// asking or adopting returns.
 pub fn add(
     env: &Env,
     cwd: &Path,
     path: Option<&str>,
+    yes: bool,
     out: &mut dyn Write,
+) -> Result<Exit, adopt::Error> {
+    add_with(env, cwd, path, yes, out, &mut confirm_save)
+}
+
+/// Ask on the terminal whether to make the saves `add` showed. The default
+/// is **no**, and what was typed ahead is discarded, as [`confirm`] does.
+fn confirm_save() -> Result<bool, adopt::Error> {
+    discard_typeahead(std::io::stdin());
+    inquire::Confirm::new("Save these into the repo?")
+        .with_default(false)
+        .prompt()
+        .map_err(|error| {
+            if init::abandoned(&error) {
+                adopt::Error::Canceled
+            } else {
+                adopt::Error::Prompt(error)
+            }
+        })
+}
+
+/// [`add`], with the confirmation asked through `ask`.
+pub(crate) fn add_with(
+    env: &Env,
+    cwd: &Path,
+    path: Option<&str>,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
 ) -> Result<Exit, adopt::Error> {
     let path = path.ok_or(adopt::Error::NoPath("add"))?;
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
-    let rows = adopt::add(&ctx, &target)?;
+    let home = ctx.home().to_path_buf();
+    let asked = adopt::add_asking(&ctx, &target, &mut |saves| {
+        if yes {
+            return Ok(true);
+        }
+        let mut text = format!("bx add {target} will:\n");
+        for row in saves {
+            if let Adoption::Save { save, .. } = row {
+                text.push_str(&save_preview(save, &home));
+            }
+        }
+        out.write_all(text.as_bytes())
+            .map_err(adopt::Error::Output)?;
+        out.flush().map_err(adopt::Error::Output)?;
+        if env.stdin_tty { ask() } else { Ok(false) }
+    });
+    let rows = match asked {
+        Ok(rows) => rows,
+        Err(adopt::Error::Canceled) => {
+            writeln!(out, "Canceled. Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other),
+    };
     let mut text = String::new();
     for row in &rows {
-        text.push_str(&adoption_row(row));
+        text.push_str(&adoption_row(row, &home));
     }
-    let adopted = rows
-        .iter()
-        .filter(|row| matches!(row, Adoption::Adopt { .. }))
-        .count();
+    let count = |pick: fn(&Adoption) -> bool| rows.iter().filter(|row| pick(row)).count();
+    let adopted = count(|row| matches!(row, Adoption::Adopt { .. }));
     text.push_str(&format!(
         "Adopted {adopted} file(s); run `bx plan` to see the machine against the repo.\n"
     ));
+    let saved = count(|row| matches!(row, Adoption::Save { save, .. } if !save.repo.is_empty()));
+    if saved > 0 {
+        text.push_str(&format!(
+            "Saved {saved} edit(s) into the repo; bx sync commits and pushes them.\n"
+        ));
+    }
     out.write_all(text.as_bytes())
         .map_err(adopt::Error::Output)?;
     Ok(if rows.iter().any(Adoption::needs_attention) {
@@ -1236,8 +1299,54 @@ pub fn add(
     })
 }
 
+/// What saving one edited file will write, as `add` shows it before asking:
+/// what it does, then each diff.
+fn save_preview(save: &adopt::save::Save, home: &Path) -> String {
+    use adopt::save::How;
+    let target = report::escape(save.target.as_str());
+    let files = save.repo_files(home).join(", ");
+    let mut text = match save.how {
+        How::Save => format!("  < {target}  save your edit into {files}\n"),
+        How::Merged => format!(
+            "  < {target}  merge your edit with the repo's change, into {files} and this \
+             file, keeping yours for bx rm\n"
+        ),
+        How::Conflicted => format!(
+            "  ! {target}  your edit and the repo's change conflict: write the merge, with \
+             conflict markers, into this file, keeping yours for bx rm; the repo is not \
+             changed\n"
+        ),
+    };
+    for diff in &save.diffs {
+        for line in diff.lines() {
+            text.push_str("    ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// What saving one edited file did, as its row after the run.
+fn save_row(save: &adopt::save::Save, home: &Path) -> String {
+    use adopt::save::How;
+    let target = report::escape(save.target.as_str());
+    let files = save.repo_files(home).join(", ");
+    match save.how {
+        How::Save => format!("  < {target}  saved into {files}\n"),
+        How::Merged => format!(
+            "  < {target}  merged with the repo's change, into {files} and this file; bx rm \
+             restores yours\n"
+        ),
+        How::Conflicted => format!(
+            "  ! {target}  merged with conflict markers, which bx rm takes back to yours; \
+             resolve them, then run bx add {target}\n"
+        ),
+    }
+}
+
 /// One `add` row, with its note and any warning on the lines below it.
-fn adoption_row(row: &Adoption) -> String {
+fn adoption_row(row: &Adoption, home: &Path) -> String {
     let target = row.subject();
     match row {
         Adoption::Adopt {
@@ -1260,6 +1369,7 @@ fn adoption_row(row: &Adoption) -> String {
             line
         }
         Adoption::Own { .. } => format!("  ~ {target}  already declared; bx now owns it\n"),
+        Adoption::Save { save, .. } => save_row(save, home),
         Adoption::Unchanged { .. } => format!("  = {target}  already managed\n"),
         Adoption::Skipped { note, .. } => format!("  - {target}  skipped: {note}\n"),
         Adoption::Refused { note, .. } => format!("  ! {target}  {note}\n"),

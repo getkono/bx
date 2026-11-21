@@ -31,10 +31,14 @@ enum Command {
         yes: bool,
     },
     /// Begin managing a config file, or a directory of them
-    Add { target: Option<String> },
+    Add {
+        /// The file or directory, e.g. ~/.gitconfig
+        path: String,
+    },
     /// Stop managing it, and restore the original
     Rm {
-        target: Option<String>,
+        /// The file or directory bx manages
+        path: String,
         /// Hand back without asking for confirmation
         #[arg(long)]
         yes: bool,
@@ -191,16 +195,12 @@ fn main() -> Result<()> {
         Some(Command::Secret {
             action: SecretAction::List,
         }) => bx::command::secret_list(&env, &mut out)?,
-        Some(Command::Add { target }) => {
-            bx::command::add(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
+        Some(Command::Add { path }) => {
+            bx::command::add(&env, &std::env::current_dir()?, &path, &mut out)?
         }
-        Some(Command::Rm { target, yes }) => bx::command::rm(
-            &env,
-            &std::env::current_dir()?,
-            target.as_deref(),
-            yes,
-            &mut out,
-        )?,
+        Some(Command::Rm { path, yes }) => {
+            bx::command::rm(&env, &std::env::current_dir()?, &path, yes, &mut out)?
+        }
         // Every command is named: one without a body is refused, not panicked
         // on, and a new one without an arm does not compile.
         Some(Command::ShellInit { .. }) => {

@@ -1624,12 +1624,27 @@ pub(crate) fn snooze_waiting(
         check_interval(externals, interval),
     );
     Stamps::of(inputs.state()).set(now(), Some(ask), Some(auto), Some(&[]))?;
-    writeln!(
-        out,
-        "bx will ask about updates again in {interval}; run `bx update` any time before."
-    )
-    .map_err(Error::Output)?;
+    writeln!(out, "{}", snoozed(ask, auto)).map_err(Error::Output)?;
     Ok(crate::report::Exit::Converged)
+}
+
+/// What `bx update --snooze` says it put off: the question a shell asks every
+/// `ask` interval, the check one starts on its own every `auto` interval, or
+/// that nothing does either.
+fn snoozed(ask: Option<Interval>, auto: Option<Interval>) -> String {
+    let when = match (ask, auto) {
+        (Some(ask), None) => format!("bx will ask about updates again in {ask}"),
+        (None, Some(auto)) => format!("bx will check for updates on its own again in {auto}"),
+        (Some(ask), Some(auto)) => format!(
+            "bx will ask about updates again in {ask}, and check on its own again in {auto}"
+        ),
+        (None, None) => {
+            return "No external follows a branch, so nothing asks about updates; run \
+                    `bx update` any time."
+                .to_string();
+        }
+    };
+    format!("{when}; run `bx update` any time before.")
 }
 
 /// After a `bx update` that finished: every stamp starts a new interval,

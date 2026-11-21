@@ -81,7 +81,7 @@ pub(crate) fn scoped(
 ) -> Result<Exit, update::Error> {
     let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     if !repo.is_dir() {
-        return Err(Error::RepoMissing(repo).into());
+        return Err(Error::repo_missing(&repo, &env.home).into());
     }
     // Held to the end, so two shells answering `y` at once, or a background
     // check fetching into a checkout this run moves, never overlap.

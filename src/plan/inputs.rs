@@ -249,11 +249,48 @@ mod tests {
 
         let error = Inputs::load(&env(home.path())).expect_err("no repo");
 
-        assert!(matches!(error, Error::RepoMissing(_)), "{error:?}");
+        assert!(
+            matches!(error, Error::RepoMissing(_, crate::plan::Absence::Nothing)),
+            "{error:?}"
+        );
         assert_eq!(
             error.to_string(),
             "no bx config repo at ~/.config/bx; run `bx init` to create one",
             "spelled under the home, as every other message spells a path"
+        );
+    }
+
+    /// `bx init` refuses a file at the config repo's path and cannot create
+    /// one beneath a file, so neither message tells the user to run it as
+    /// things stand.
+    #[test]
+    fn a_config_repo_path_that_is_not_a_directory_does_not_say_bx_init_creates_it() {
+        let held = guarded_home();
+        std::fs::create_dir_all(held.child(".config")).expect(".config");
+        std::fs::write(held.child(".config/bx"), b"a file\n").expect("the file");
+        let error = Inputs::load(&env(held.path())).expect_err("no repo");
+        assert!(
+            matches!(
+                error,
+                Error::RepoMissing(_, crate::plan::Absence::NotADirectory)
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "no bx config repo at ~/.config/bx: something that is not a directory is there; \
+             move it aside, and `bx init` creates one"
+        );
+
+        let beneath = guarded_home();
+        std::fs::write(beneath.child(".config"), b"a file\n").expect("the file");
+        let error = Inputs::load(&env(beneath.path())).expect_err("no repo");
+        assert!(
+            matches!(
+                error,
+                Error::RepoMissing(_, crate::plan::Absence::BeneathNonDirectory)
+            ),
+            "{error:?}"
         );
     }
 

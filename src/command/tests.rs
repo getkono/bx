@@ -1023,15 +1023,15 @@ fn a_missing_repo_is_an_error_for_every_command() {
 
     assert!(matches!(
         status(&env, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(
         plan(&env, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(
         apply(&env, true, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
 }
 

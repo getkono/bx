@@ -1165,10 +1165,41 @@ fn a_missing_path_and_no_repo_are_errors() {
     plant(&bare, ".x", b"x\n", 0o644);
     let err =
         crate::command::add(&env(bare.path()), bare.path(), ".x", &mut out).expect_err("no repo");
-    assert!(matches!(err, Error::RepoMissing(_)), "{err}");
+    assert!(matches!(err, Error::RepoMissing(..)), "{err}");
     assert_eq!(
         err.to_string(),
         "no bx config repo at ~/.config/bx; run `bx init` to create one"
+    );
+    assert!(out.is_empty());
+}
+
+/// A config repo path held by a file is not one `bx init` creates as it
+/// stands, and one beneath a file cannot be created at all: `add` says
+/// which, rather than "run `bx init` to create one".
+#[test]
+fn a_repo_path_that_is_not_a_directory_says_so() {
+    let mut out = Vec::new();
+
+    let held = guarded_home();
+    plant(&held, ".x", b"x\n", 0o644);
+    plant(&held, ".config/bx", b"a file\n", 0o644);
+    let err =
+        crate::command::add(&env(held.path()), held.path(), ".x", &mut out).expect_err("no repo");
+    assert_eq!(
+        err.to_string(),
+        "no bx config repo at ~/.config/bx: something that is not a directory is there; move \
+         it aside, and `bx init` creates one"
+    );
+
+    let beneath = guarded_home();
+    plant(&beneath, ".x", b"x\n", 0o644);
+    plant(&beneath, ".config", b"a file\n", 0o644);
+    let err = crate::command::add(&env(beneath.path()), beneath.path(), ".x", &mut out)
+        .expect_err("no repo");
+    assert_eq!(
+        err.to_string(),
+        "no bx config repo at ~/.config/bx: it lies beneath a path that is not a directory; \
+         `bx init` creates one once that path is a directory"
     );
     assert!(out.is_empty());
 }

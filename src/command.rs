@@ -77,22 +77,20 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     )
 }
 
-/// What doctor says of the config repo `root` that loading found missing.
-///
-/// Loading finds it missing when nothing is there, when something that is not
-/// a directory is, and when it lies beneath a non-directory; only the first
-/// is one `bx init` mends as it stands, so each is said as it is.
-fn no_repo_note(root: &Path) -> &'static str {
-    match std::fs::metadata(root) {
-        Ok(_) => {
+/// What doctor says of a config repo that loading found missing in the way
+/// `absence` says: only [`plan::Absence::Nothing`] is one `bx init` mends as
+/// it stands, so each is said as it is.
+fn no_repo_note(absence: plan::Absence) -> &'static str {
+    match absence {
+        plan::Absence::NotADirectory => {
             "is not a directory, so there is no configuration to check; move it aside, and \
              `bx init` creates the config repo"
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+        plan::Absence::BeneathNonDirectory => {
             "lies beneath a path that is not a directory, so there is no configuration to \
              check; `bx init` creates the config repo once that path is a directory"
         }
-        Err(_) => {
+        plan::Absence::Nothing => {
             "does not exist, so there is no configuration to check; `bx init` creates the \
              config repo"
         }
@@ -113,13 +111,12 @@ fn doctor_with(
         // No config repo is the first thing a human should look at, not a
         // failure to look: said as a finding, and nothing else is checked,
         // as every other check reads the configuration.
-        Err(Error::RepoMissing(repo)) => {
-            let root = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
+        Err(Error::RepoMissing(repo, absence)) => {
             let report = doctor::Report {
                 findings: vec![doctor::Finding {
                     subject: repo,
                     origin: None,
-                    note: no_repo_note(&root).to_string(),
+                    note: no_repo_note(absence).to_string(),
                 }],
                 notes: Vec::new(),
             };

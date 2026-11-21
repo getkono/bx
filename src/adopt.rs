@@ -76,6 +76,7 @@ use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
 use crate::journal;
 use crate::paths::{self, Portable};
+use crate::plan::Absence;
 use crate::recover;
 use crate::restore::{self, Restored};
 use crate::shell::activation::{self, Host as _};
@@ -105,9 +106,9 @@ pub enum Error {
     #[error("there is nothing at {0} to add")]
     Missing(String),
     /// There is no config repo at the path it holds, spelled `~/…` when it is
-    /// under the home.
-    #[error("no bx config repo at {0}; run `bx init` to create one")]
-    RepoMissing(String),
+    /// under the home, missing in the way the [`Absence`] says.
+    #[error("no bx config repo at {}{}", .0, .1.advice())]
+    RepoMissing(String, Absence),
     /// The configuration could not be loaded, merged or resolved.
     #[error(transparent)]
     Config(config::Error),
@@ -194,7 +195,9 @@ impl From<config::Error> for Error {
         match error {
             // Without the home there is no `~/…` spelling to give it;
             // [`Context::load`] spells it under the home itself.
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo.display().to_string()),
+            config::Error::RepoMissing(repo) => {
+                Self::RepoMissing(repo.display().to_string(), Absence::of(&repo))
+            }
             other => Self::Config(other),
         }
     }
@@ -323,7 +326,7 @@ impl Context {
         let layers = layers::load_gated(&repo, state.root(), &home, &facts)
             .map_err(|error| match error {
                 config::Error::RepoMissing(repo) => {
-                    Error::RepoMissing(paths::to_portable(&repo, &home))
+                    Error::RepoMissing(paths::to_portable(&repo, &home), Absence::of(&repo))
                 }
                 other => other.into(),
             })?

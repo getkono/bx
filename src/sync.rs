@@ -679,7 +679,7 @@ mod tests {
         let home = guarded_home();
         let error = pull(&env(home.path()), &git(home.path())).expect_err("no repo");
         assert!(
-            matches!(error, Error::Plan(plan::Error::RepoMissing(_))),
+            matches!(error, Error::Plan(plan::Error::RepoMissing(..))),
             "{error:?}"
         );
     }

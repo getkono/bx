@@ -264,6 +264,44 @@ fn a_file_already_holding_what_bx_wants_is_recorded_again_not_edited() {
     assert_eq!(plan(&next).actions(), vec![Action::Modify]);
 }
 
+#[test]
+fn a_taken_file_changed_while_its_question_was_open_refuses_the_run_before_any_write() {
+    let home = guarded_home();
+    let written = inputs(&home, &inline("~/.a", "bx\\n"));
+    assert!(apply(&written).executed, "bx writes the file");
+    std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    let inputs = inputs(
+        &home,
+        &format!("{}{}", inline("~/.a", "new\\n"), inline("~/.b", "b\\n")),
+    );
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Conflict, Action::Create]);
+
+    // Written again while the question was open: the take is queued after
+    // `~/.b`'s create, and still refuses the run before `~/.b` is made.
+    let refused = answered(&inputs, Mode::Apply, &mut |_| {
+        std::fs::write(home.child(".a"), "edited again\n").expect("the second edit");
+        Ok(Approval {
+            approved: true,
+            taken: BTreeSet::from([0]),
+        })
+    });
+    assert!(
+        matches!(
+            refused,
+            Err(Error::Fs(crate::fs::Error::Changed { ref path, .. })) if path == &home.child(".a")
+        ),
+        "{refused:?}"
+    );
+    assert!(!home.child(".b").exists(), "nothing was written");
+    assert_eq!(
+        std::fs::read(home.child(".a")).expect("kept"),
+        b"edited again\n"
+    );
+    assert!(apply(&inputs).executed, "the next run starts clean");
+    assert!(home.child(".b").exists());
+}
+
 /// The inputs once the configuration wants `body` at `~/.a`.
 fn inputs_after(home: &GuardedHome, body: &str) -> Inputs {
     inputs(home, &inline("~/.a", body))

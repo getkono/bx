@@ -403,16 +403,104 @@ fn two_links_naming_one_child_converge_in_one_apply() {
 }
 
 #[test]
-fn update_without_yes_or_a_terminal_reaches_nothing() {
+fn update_without_yes_or_a_terminal_shows_what_it_found_and_refuses_it() {
     let home = guarded_home();
     following(&home);
+    let stamps = Stamps::of(&crate::state::StateDir::resolve(home.path()));
+    let lines = vec![format!("~/{AT}: 1 new commit(s) on master")];
+    stamps
+        .set(update::now(), None, None, Some(&lines))
+        .expect("offered");
+    let offered = std::fs::read(stamps.available()).expect("offered");
+
+    let mut out = Vec::new();
+    let error = update(&home, false, &mut out).expect_err("no terminal");
+    assert!(
+        matches!(error, update::Error::Plan(Error::NeedsConfirmation)),
+        "{error:?}"
+    );
+    // The plan the refusal points at was shown, after what was found.
+    let shown = text(&out);
+    assert!(shown.contains(&format!("~/{AT}")), "{shown}");
+    assert!(shown.contains("Plan: "), "{shown}");
+    assert_eq!(locked(&home), None);
+    assert!(!home.child(AT).exists());
+    // Nobody was asked, so the offer is not answered.
+    assert_eq!(
+        std::fs::read(stamps.available()).expect("still offered"),
+        offered
+    );
+    assert!(!stamps.answered().exists());
+}
+
+#[test]
+fn update_without_a_terminal_and_nothing_to_confirm_runs_to_the_end() {
+    let home = guarded_home();
+    let (_, first) = locked_once(&home);
+
+    let mut out = Vec::new();
+    let exit = update(&home, false, &mut out).expect("nothing to confirm");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert_eq!(locked(&home).as_deref(), Some(first.as_str()));
+}
+
+/// A config repo following [`layer`]'s external, locked, whose `bx.lock`
+/// also holds an entry nothing follows: `bx update` would change a lock that
+/// `apply` writes nothing for. Returns the repo and that lock's text.
+fn with_an_orphaned_lock_entry(home: &GuardedHome) -> (std::path::PathBuf, String) {
+    let (repo, _) = locked_once(home);
+    let mut lock = Lock::read(&repo, home.path()).expect("bx.lock");
+    let entry = lock
+        .iter()
+        .next()
+        .map(|(_, l)| l.clone())
+        .expect("an entry");
+    lock.set(
+        crate::paths::Portable::parse_in("~/gone", home.path()).expect("a path"),
+        entry,
+    );
+    std::fs::write(repo.join("bx.lock"), lock.render()).expect("bx.lock");
+    commit_all(home.path(), &repo, "an orphan");
+    run(home.path(), &repo, &["push", "--quiet"]);
+    let orphaned = std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock");
+    (repo, orphaned)
+}
+
+#[test]
+fn a_declined_lock_change_exits_pending_as_a_declined_apply_does() {
+    let home = guarded_home();
+    let (repo, orphaned) = with_an_orphaned_lock_entry(&home);
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+
+    let mut out = Vec::new();
+    let exit = update_with(&tty, &[], false, &mut out, &git(home.path()), &mut || {
+        Ok(false)
+    })
+    .expect("declined");
+    assert_eq!(exit, Exit::Pending, "{}", text(&out));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock"),
+        orphaned
+    );
+}
+
+#[test]
+fn a_lock_change_without_a_terminal_is_refused_and_locks_nothing() {
+    let home = guarded_home();
+    let (repo, orphaned) = with_an_orphaned_lock_entry(&home);
+
     let error = update(&home, false, &mut Vec::new()).expect_err("no terminal");
     assert!(
         matches!(error, update::Error::Plan(Error::NeedsConfirmation)),
         "{error:?}"
     );
-    assert_eq!(locked(&home), None);
-    assert!(!home.child(AT).exists());
+    assert_eq!(
+        std::fs::read_to_string(repo.join("bx.lock")).expect("bx.lock"),
+        orphaned
+    );
 }
 
 #[test]

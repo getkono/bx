@@ -79,9 +79,6 @@ pub(crate) fn scoped(
     git: &Git,
     ask: &mut dyn FnMut() -> Result<bool, Error>,
 ) -> Result<Exit, update::Error> {
-    if !yes && !env.stdin_tty {
-        return Err(Error::NeedsConfirmation.into());
-    }
     let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     if !repo.is_dir() {
         return Err(Error::RepoMissing(repo).into());
@@ -96,6 +93,9 @@ pub(crate) fn scoped(
     // Every other way this ends settles the offer, so no shell asks it again.
     let why = match updating(env, names, scope, yes, out, git, ask) {
         Ok(Updated::Finished(exit)) => return Ok(exit),
+        // Refused for want of a terminal, as `bx apply` is: nobody was asked,
+        // so the offer stands, unanswered, for a shell that can ask it.
+        Err(refused @ update::Error::Plan(Error::NeedsConfirmation)) => return Err(refused),
         Ok(Updated::Stopped(exit, why)) => Ok((exit, why.to_string())),
         Err(error) => Err(error),
     };
@@ -384,6 +384,10 @@ fn updating(
     if changed && !asked {
         let approved = if yes {
             true
+        } else if !env.stdin_tty {
+            // What was found is said above, and the plan with it: there is
+            // something to confirm and nobody to confirm it.
+            return Err(Error::NeedsConfirmation.into());
         } else {
             match ask() {
                 Ok(approved) => approved,
@@ -424,8 +428,14 @@ fn updating(
         exit => exit,
     };
     // Declined, what was found stays on offer, answered: the same commits
-    // are not offered again, and newer ones are.
+    // are not offered again, and newer ones are. It exits as a declined
+    // `bx apply` does, even where the lock was all there was to approve and
+    // the plan alone would say converged: what was offered is still pending.
     if declined {
+        let exit = match exit {
+            Exit::Converged => Exit::Pending,
+            exit => exit,
+        };
         return Ok(Updated::Stopped(exit, scope.declined()));
     }
     if let Some(pulled) = &pulled {

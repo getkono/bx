@@ -442,6 +442,45 @@ fn a_declined_upgrade_rewrites_and_commits_nothing() {
 }
 
 #[test]
+fn an_upgrade_without_a_terminal_shows_what_is_newer_and_refuses_it() {
+    let home = guarded_home();
+    let (repo, first, _) = released(&home);
+    let head = rev(home.path(), &repo, "HEAD");
+
+    let mut out = Vec::new();
+    let error =
+        upgrade(&home, &[], Upgrading::Upgrade { yes: false }, &mut out).expect_err("no terminal");
+    assert!(
+        matches!(error, update::Error::Plan(Error::NeedsConfirmation)),
+        "{error:?}"
+    );
+    // Looked first: the newer release is named, and the plan shown.
+    let shown = text(&out);
+    assert!(shown.contains("v1.1.0"), "{shown}");
+    assert!(shown.contains("Plan: "), "{shown}");
+    assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    assert_eq!(rev(home.path(), &home.child(PINNED), "HEAD"), first);
+}
+
+#[test]
+fn an_upgrade_without_a_terminal_and_nothing_newer_runs_to_the_end() {
+    let home = guarded_home();
+    released(&home);
+    upgrade(
+        &home,
+        &[],
+        Upgrading::Upgrade { yes: true },
+        &mut Vec::new(),
+    )
+    .expect("upgraded");
+
+    let mut out = Vec::new();
+    let exit = upgrade(&home, &[], Upgrading::Upgrade { yes: false }, &mut out)
+        .expect("nothing to confirm");
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+}
+
+#[test]
 fn a_layer_with_uncommitted_changes_is_refused_before_anything_moves() {
     let home = guarded_home();
     let (repo, first, _) = released(&home);

@@ -251,13 +251,18 @@ or a login banner without anyone parsing its output:
 | `0` | converged — nothing to do; for `plan` and `apply`, also when the only rows are `<`, which are `bx sync`'s to carry |
 | `1` | error |
 | `2` | changes pending, or a conflict or blocked target needs a decision |
+| `64` | the command line could not be parsed — an unknown command or flag, a missing argument, or flags that conflict; nothing was run |
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 The other commands use the same codes. `bx add` exits `2` when it refused a
 path, `bx rm` when a conflict left something as it was, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
-when it did not carry the `<` rows it announced — declined, or refused for
-want of a terminal.
+when it was declined and did not carry the `<` rows it announced, and
+`bx update` and `bx upgrade` when declined, even when all they offered was a
+change to `bx.lock`. Without `--yes` and with no terminal to ask on, `apply`,
+`sync`, `update` and `upgrade` show what they would do and, where there is
+something to confirm, refuse it and exit `1`; with nothing to confirm they run
+to the end.
 
 ## Does it replace your dotfiles manager?
 

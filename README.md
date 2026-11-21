@@ -257,8 +257,12 @@ or a login banner without anyone parsing its output:
 The other commands use the same codes. `bx add` exits `2` when it refused a
 path, `bx rm` when a conflict left something as it was, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
-when it did not carry the `<` rows it announced — declined, or refused for
-want of a terminal.
+when it was declined and did not carry the `<` rows it announced, and
+`bx update` and `bx upgrade` when declined, even when all they offered was a
+change to `bx.lock`. Without `--yes` and with no terminal to ask on, `apply`,
+`sync`, `update` and `upgrade` show what they would do and, where there is
+something to confirm, refuse it and exit `1`; with nothing to confirm they run
+to the end.
 
 ## Does it replace your dotfiles manager?
 

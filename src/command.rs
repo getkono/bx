@@ -703,11 +703,15 @@ impl UpdateMode {
 /// Every way it ends settles what the stamps offer, so no shell asks it again:
 /// run to the end, [`update::finished`] clears the offer and `last-check`;
 /// declined, abandoned at the question, refused or failed, [`update::settled`]
-/// answers it and says why in `last-check`. Only [`update::Error::Busy`] records nothing, as
-/// the run holding the stamps settles them.
+/// answers it and says why in `last-check`. Only [`update::Error::Busy`]
+/// records nothing, as the run holding the stamps settles them, and
+/// [`Error::NeedsConfirmation`], as nobody was asked.
 ///
-/// Without `yes` it needs a terminal to ask on, and refuses before reaching
-/// the network.
+/// Without `yes` and a terminal it looks first, as `bx apply` does: it pulls,
+/// says what it found and shows the plan, and refuses only where there is
+/// something to confirm — a lock to change, or a plan to write. With nothing
+/// to confirm it runs to the end. Declined, it exits [`Exit::Pending`], as a
+/// declined `bx apply` does, even where only the lock was offered.
 ///
 /// # Errors
 ///

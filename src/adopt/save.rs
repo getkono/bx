@@ -45,8 +45,12 @@
 //! region or an include line (part of a file), a tracked target (`bx sync`
 //! already carries it), an inline content with a `{{name}}` bx substituted
 //! (saving it would write this account's answer over the placeholder), an
-//! inline content the edit is not UTF-8 for, and a repo file another target
-//! also delivers, since saving into it would change those too.
+//! inline content the edit is not UTF-8 for, a repo file another target
+//! also delivers, since saving into it would change those too, and a repo
+//! file holding changes git has not committed that no save of bx's left
+//! there: saving would overwrite the user's work in a body file, and
+//! `bx sync` commits a saved file whole, so the commit would carry bytes no
+//! diff showed.
 
 use std::path::{Path, PathBuf};
 
@@ -362,6 +366,7 @@ fn decided(
         let new_mode = (mode != declared_mode).then_some(mode);
         let (file, layer) = repo_writes(sides, target, content, new_mode)?;
         for write in file.into_iter().chain(layer) {
+            uncommitted(sides, &write)?;
             diffs.push(write.diff(sides.home));
             repo.push(write);
         }
@@ -515,6 +520,39 @@ fn repo_writes(
         None
     };
     Ok((file, layer))
+}
+
+/// Refuse `write` where its file holds a change git has not committed that
+/// no save of bx's left there: the user's own work in the repo. Saving over
+/// a body file would lose it, and `bx sync` commits a saved file whole, so
+/// either way bytes the user never saw shown would leave under bx's commit.
+///
+/// A file git does not answer for — a repo that is not a git checkout, or a
+/// `git` that cannot run — is not refused: nothing commits it there.
+fn uncommitted(sides: &Sides<'_>, write: &RepoWrite) -> Result<(), String> {
+    let Some(path) = write.path.to_str() else {
+        return Ok(());
+    };
+    let args = [
+        "status",
+        "--porcelain",
+        "-z",
+        "--untracked-files=all",
+        "--",
+        path,
+    ];
+    let Ok(status) = sides.git.query_whole(sides.repo, &args) else {
+        return Ok(());
+    };
+    let now = write.read.bytes.as_deref().unwrap_or_default();
+    if status.is_empty() || crate::sync::saved_holds(sides.state, sides.repo, &write.path, now) {
+        return Ok(());
+    }
+    let file = shown(&write.path, sides.home);
+    Err(format!(
+        "would be saved into {file}, which holds changes git has not committed; commit or \
+         discard them first, so the commit bx sync makes holds only the save"
+    ))
 }
 
 /// The write that replaces the repo file `rel` with `bytes`.

@@ -374,6 +374,19 @@ fn write_saved(state: &StateDir, saved: &Saved) -> std::io::Result<()> {
         .map_err(std::io::Error::other)
 }
 
+/// Whether the repo file `path` holds exactly `bytes` that a save recorded
+/// and no commit has taken yet: a change of bx's own, which
+/// [`commit_carried`] commits, rather than one the user made in the repo.
+pub(crate) fn saved_holds(state: &StateDir, repo: &Path, path: &Path, bytes: &[u8]) -> bool {
+    let root = paths::normalize(repo);
+    let rel = paths::normalize(path);
+    rel.strip_prefix(&root)
+        .ok()
+        .and_then(Path::to_str)
+        .and_then(|rel| saved(state).get(rel).copied())
+        .is_some_and(|digest| digest == ContentHash::of(bytes))
+}
+
 /// Remember that a save wrote each of `written` — a repo file, and the
 /// digest of the bytes it left there — so [`commit_carried`] commits it.
 ///
@@ -1486,6 +1499,65 @@ mod tests {
         let again = commit_carried(&env(home.path()), &git(home.path()), &repo).expect("again");
         assert_eq!(again, 0);
         assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    }
+
+    #[test]
+    fn a_save_into_a_layer_holding_uncommitted_work_is_refused_and_commits_nothing() {
+        let home = guarded_home();
+        let repo = cloned(&home, "[[target]]\npath = \"~/.rc\"\ncontent = \"a\\n\"\n");
+        let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+        crate::plan::run(&inputs, crate::plan::Mode::Apply, &mut |_| Ok(true)).expect("apply");
+        // The user's own work in the layer, not yet committed.
+        let layer = "# my notes\n[[target]]\npath = \"~/.rc\"\ncontent = \"a\\n\"\n";
+        std::fs::write(repo.join("bx.toml"), layer).expect("the user's edit");
+        home.write(".rc", "mine\n");
+        let head = rev(home.path(), &repo, "HEAD");
+
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+        let rows = crate::adopt::add(&ctx, &rc).expect("add");
+
+        let [crate::adopt::Adoption::Refused { note, .. }] = rows.as_slice() else {
+            panic!("not refused: {rows:?}");
+        };
+        assert!(
+            note.contains("holds changes git has not committed"),
+            "{note}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("bx.toml")).expect("the layer"),
+            layer,
+            "the user's layer is as they left it"
+        );
+        let state = StateDir::resolve(home.path());
+        assert!(saved(&state).is_empty(), "nothing is recorded to commit");
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("nothing");
+        assert_eq!(committed, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    }
+
+    #[test]
+    fn a_second_save_over_one_not_yet_committed_is_bx_s_own_and_saved() {
+        let home = guarded_home();
+        let repo = saved_by_add(&home);
+        home.write(".rc", "mine again\n");
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+
+        let rows = crate::adopt::add(&ctx, &rc).expect("add");
+
+        assert!(
+            matches!(rows.as_slice(), [crate::adopt::Adoption::Save { .. }]),
+            "{rows:?}"
+        );
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+        assert_eq!(committed, 1);
+        assert_eq!(
+            run(home.path(), &repo, &["show", "HEAD:files/rc"]),
+            "mine again"
+        );
     }
 
     #[test]

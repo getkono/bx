@@ -1,17 +1,18 @@
 //! Everything that can stop a run, and how the errors of the modules a run
 //! calls are folded into it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{self, Origin};
-use crate::{journal, recover, state};
+use crate::{journal, paths, recover, state};
 
 /// Everything that can stop a run.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// There is no config repo.
-    #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
-    RepoMissing(PathBuf),
+    /// There is no config repo at the path it holds, spelled `~/…` when it is
+    /// under the home, as every other message spells a path.
+    #[error("no bx config repo at {0}; run `bx init` to create one")]
+    RepoMissing(String),
     /// The configuration could not be loaded, merged or resolved.
     #[error(transparent)]
     Config(config::Error),
@@ -72,10 +73,31 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
+impl Error {
+    /// [`Error::RepoMissing`] for `repo`, spelled under `home`.
+    #[must_use]
+    pub fn repo_missing(repo: &Path, home: &Path) -> Self {
+        Self::RepoMissing(paths::to_portable(repo, home))
+    }
+
+    /// `error`, the configuration's, with a missing config repo spelled under
+    /// `home`: what loading the layers returns goes through here, as only
+    /// it can find the repo missing.
+    #[must_use]
+    pub fn from_config(error: config::Error, home: &Path) -> Self {
+        match error {
+            config::Error::RepoMissing(repo) => Self::repo_missing(&repo, home),
+            other => Self::Config(other),
+        }
+    }
+}
+
 impl From<config::Error> for Error {
     fn from(error: config::Error) -> Self {
         match error {
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo),
+            // Without the home there is no `~/…` spelling to give it;
+            // [`Error::from_config`] is what loading the layers uses.
+            config::Error::RepoMissing(repo) => Self::RepoMissing(repo.display().to_string()),
             other => Self::Config(other),
         }
     }

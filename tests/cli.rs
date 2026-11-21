@@ -1444,8 +1444,10 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     let (path, requests) = served(home.path(), "v999.0.0");
     publish(home.path(), "v999.0.0", false);
     let (exe, _) = installed_copy(home.path());
-    // Where the kernel says the copy is, which is the directory bx names.
+    // Where the kernel says the copy is, which is the directory bx names, as
+    // `~/install` wherever no link lies on the way to the home.
     let dir = std::fs::canonicalize(home.path().join("install")).expect("the install directory");
+    let shown = bx::paths::to_portable(&dir, home.path());
 
     let output = self_upgrade_copy(&exe, home.path(), &path);
 
@@ -1453,9 +1455,8 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     assert_eq!(
         stdout(&output),
         format!(
-            "Installing bx v999.0.0 over v{} in {}...\nInstalled bx v999.0.0.\n",
+            "Installing bx v999.0.0 over v{} in {shown}...\nInstalled bx v999.0.0.\n",
             bx::VERSION,
-            dir.display()
         )
     );
     assert_eq!(

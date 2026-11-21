@@ -990,7 +990,7 @@ fn an_approval_that_fails_stops_the_run() {
     let inputs = inputs(&home, &inline("~/.a", "x\\n"));
 
     let error = run(&inputs, Mode::Apply, &mut |_| {
-        Err(Error::RepoMissing(PathBuf::from("/refused")))
+        Err(Error::RepoMissing("/refused".to_string()))
     })
     .expect_err("the approval's error");
 

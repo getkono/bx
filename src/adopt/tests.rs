@@ -1160,7 +1160,10 @@ fn a_missing_path_and_no_repo_are_errors() {
     let err =
         crate::command::add(&env(bare.path()), bare.path(), ".x", &mut out).expect_err("no repo");
     assert!(matches!(err, Error::RepoMissing(_)), "{err}");
-    assert!(err.to_string().contains("bx init"), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "no bx config repo at ~/.config/bx; run `bx init` to create one"
+    );
     assert!(out.is_empty());
 }
 

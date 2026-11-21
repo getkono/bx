@@ -77,26 +77,26 @@ pub enum Error {
     Git(#[from] git::Error),
     /// The config repo is not a git repository of its own.
     #[error(
-        "the config repo {} is not a git repository{}; bx sync pulls and pushes through git. \
-         Run `git init` there and add a remote, or clone your config repo there",
-        .repo.display(),
+        "the config repo {repo} is not a git repository{}; bx sync pulls and pushes through \
+         git. Run `git init` there and add a remote, or clone your config repo there",
         .toplevel.as_ref().map_or_else(String::new, |top| format!(
-            " (it is inside the git repository {})", top.display()
+            " (it is inside the git repository {top})"
         ))
     )]
     NotARepo {
-        /// The config repo.
-        repo: PathBuf,
-        /// The repository git found it inside, when there is one.
-        toplevel: Option<PathBuf>,
+        /// The config repo, spelled `~/…` when it is under the home.
+        repo: String,
+        /// The repository git found it inside, when there is one, spelled as
+        /// `repo` is.
+        toplevel: Option<String>,
     },
-    /// `HEAD` is not a branch.
+    /// `HEAD` is not a branch. Holds the config repo, spelled `~/…` when it
+    /// is under the home.
     #[error(
-        "the config repo {} has no branch checked out; bx sync fast-forwards a branch. Check \
-         one out and run bx sync again",
-        .0.display()
+        "the config repo {0} has no branch checked out; bx sync fast-forwards a branch. Check \
+         one out and run bx sync again"
     )]
-    Detached(PathBuf),
+    Detached(String),
     /// The branch has no upstream to pull from or push to.
     #[error(
         "the branch {branch} of the config repo has no upstream; set one with \
@@ -153,17 +153,15 @@ pub enum Error {
     /// The state directory is inside the config repo, where a commit would
     /// publish it.
     #[error(
-        "bx's state directory {} is inside the config repo {}, where a commit would publish \
-         this account's answers and the bytes bx displaced; bx sync pushes nothing from such \
-         a repo. Point XDG_STATE_HOME outside it",
-        .state.display(),
-        .repo.display()
+        "bx's state directory {state} is inside the config repo {repo}, where a commit would \
+         publish this account's answers and the bytes bx displaced; bx sync pushes nothing \
+         from such a repo. Point XDG_STATE_HOME outside it"
     )]
     StateInRepo {
-        /// The state directory.
-        state: PathBuf,
-        /// The config repo.
-        repo: PathBuf,
+        /// The state directory, spelled `~/…` when it is under the home.
+        state: String,
+        /// The config repo, spelled as `state` is.
+        repo: String,
     },
     /// A commit waiting to be pushed carries a file named as a state file is.
     #[error(
@@ -269,18 +267,18 @@ pub struct Pulled {
 pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
     let repo = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
     if !repo.is_dir() {
-        return Err(plan::Error::RepoMissing(repo).into());
+        return Err(plan::Error::repo_missing(&repo, &env.home).into());
     }
     let state = StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
-    refuse_state_in_repo(&repo, state.root())?;
-    own_repository(git, &repo)?;
+    refuse_state_in_repo(&repo, state.root(), &env.home)?;
+    own_repository(git, &repo, &env.home)?;
 
     let branch = git
         .query(&repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map_err(|error| match error {
             git::Error::Spawn { .. } => error.into(),
             git::Error::Failed { .. } | git::Error::TimedOut { .. } => {
-                Error::Detached(repo.clone())
+                Error::Detached(paths::to_portable(&repo, &env.home))
             }
         })?;
     let upstream = upstream(git, &repo, &branch)?;
@@ -478,11 +476,15 @@ pub fn may_push(report: &Report) -> bool {
             }))
 }
 
-/// Refuse a state directory that lies inside the config repo, lexically.
-fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
+/// Refuse a state directory that lies inside the config repo, lexically,
+/// naming both under `home`.
+fn refuse_state_in_repo(repo: &Path, state: &Path, home: &Path) -> Result<(), Error> {
     let (repo, state) = (paths::normalize(repo), paths::normalize(state));
     if state.starts_with(&repo) {
-        return Err(Error::StateInRepo { state, repo });
+        return Err(Error::StateInRepo {
+            state: paths::to_portable(&state, home),
+            repo: paths::to_portable(&repo, home),
+        });
     }
     Ok(())
 }
@@ -491,18 +493,19 @@ fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
 /// all, or a directory inside some other repository, whose history `sync`
 /// must not pull into or push from. A `git` that cannot be started at all is
 /// [`git::Error::Spawn`], not a missing repository: `git init` would not help.
-fn own_repository(git: &Git, repo: &Path) -> Result<(), Error> {
+/// Both paths a refusal names are spelled under `home`.
+fn own_repository(git: &Git, repo: &Path, home: &Path) -> Result<(), Error> {
     checkout::toplevel_is_self(git, repo).map_err(|refusal| match refusal {
         NotSelf::Unread(error @ git::Error::Spawn { .. }) => error.into(),
         NotSelf::Unread(git::Error::Failed { .. } | git::Error::TimedOut { .. }) => {
             Error::NotARepo {
-                repo: repo.to_path_buf(),
+                repo: paths::to_portable(repo, home),
                 toplevel: None,
             }
         }
         NotSelf::Inside(top) => Error::NotARepo {
-            repo: repo.to_path_buf(),
-            toplevel: Some(top),
+            repo: paths::to_portable(repo, home),
+            toplevel: Some(paths::to_portable(&top, home)),
         },
     })
 }
@@ -682,9 +685,20 @@ mod tests {
             matches!(&error, Error::NotARepo { toplevel: None, .. }),
             "{error:?}"
         );
-        assert!(
-            error.to_string().contains("Run `git init` there"),
-            "{error}"
+        assert_eq!(
+            error.to_string(),
+            "the config repo ~/.config/bx is not a git repository; bx sync pulls and pushes \
+             through git. Run `git init` there and add a remote, or clone your config repo there"
+        );
+    }
+
+    #[test]
+    fn a_missing_repo_is_named_under_the_home() {
+        let home = guarded_home();
+        let error = pull(&env(home.path()), &git(home.path())).expect_err("no repo");
+        assert_eq!(
+            error.to_string(),
+            "no bx config repo at ~/.config/bx; run `bx init` to create one"
         );
     }
 
@@ -705,14 +719,16 @@ mod tests {
         else {
             panic!("{error:?}");
         };
-        assert_eq!(
-            top,
-            &std::fs::canonicalize(home.path()).expect("canonical home")
-        );
+        // Git names the repository by its real path, which is the home's own
+        // spelling wherever no link lies on the way to it.
+        let canonical = std::fs::canonicalize(home.path()).expect("canonical home");
+        assert_eq!(top, &paths::to_portable(&canonical, home.path()));
         assert!(
-            error
-                .to_string()
-                .contains("it is inside the git repository")
+            error.to_string().starts_with(&format!(
+                "the config repo ~/.config/bx is not a git repository (it is inside the git \
+                 repository {top});"
+            )),
+            "{error}"
         );
     }
 
@@ -723,6 +739,11 @@ mod tests {
         run(home.path(), &repo, &["checkout", "--quiet", "--detach"]);
         let error = pull(&env(home.path()), &git(home.path())).expect_err("detached");
         assert!(matches!(error, Error::Detached(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "the config repo ~/.config/bx has no branch checked out; bx sync fast-forwards a \
+             branch. Check one out and run bx sync again"
+        );
     }
 
     #[test]
@@ -830,26 +851,26 @@ mod tests {
         };
         let error = pull(&inside, &git(home.path())).expect_err("state in repo");
         assert!(matches!(error, Error::StateInRepo { .. }), "{error:?}");
+        assert!(
+            error.to_string().starts_with(
+                "bx's state directory ~/.config/bx/state/bx is inside the config repo \
+                 ~/.config/bx, "
+            ),
+            "{error}"
+        );
         assert!(error.to_string().contains("XDG_STATE_HOME"), "{error}");
     }
 
     #[test]
     fn a_state_directory_beside_the_repo_is_not_inside_it() {
-        assert!(
-            refuse_state_in_repo(Path::new("/h/.config/bx"), Path::new("/h/.config/bx-state"))
-                .is_ok()
-        );
-        assert!(
-            refuse_state_in_repo(Path::new("/h/.config/bx"), Path::new("/h/.config/bx/../s"))
-                .is_ok()
-        );
-        assert!(
-            refuse_state_in_repo(Path::new("/h/.config/bx"), Path::new("/h/.config/bx/./s"))
-                .is_err()
-        );
-        assert!(
-            refuse_state_in_repo(Path::new("/h/.config/bx"), Path::new("/h/.config/bx")).is_err()
-        );
+        let home = Path::new("/h");
+        let refused = |state: &str| {
+            refuse_state_in_repo(Path::new("/h/.config/bx"), Path::new(state), home).is_err()
+        };
+        assert!(!refused("/h/.config/bx-state"));
+        assert!(!refused("/h/.config/bx/../s"));
+        assert!(refused("/h/.config/bx/./s"));
+        assert!(refused("/h/.config/bx"));
     }
 
     #[test]

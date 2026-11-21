@@ -48,6 +48,9 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
         upgrade::Request { check, force },
         crate::VERSION,
         &upgrade::install_dir()?,
+        // No usable home is no reason to refuse an upgrade: the directory is
+        // then named as it is.
+        paths::home().ok().as_deref(),
         upgrade::INSTALLER_URL,
         &std::env::var_os("PATH").unwrap_or_default(),
         out,

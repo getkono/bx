@@ -104,9 +104,10 @@ pub enum Error {
     /// There is nothing at the path.
     #[error("there is nothing at {0} to add")]
     Missing(String),
-    /// There is no config repo.
-    #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
-    RepoMissing(PathBuf),
+    /// There is no config repo at the path it holds, spelled `~/…` when it is
+    /// under the home.
+    #[error("no bx config repo at {0}; run `bx init` to create one")]
+    RepoMissing(String),
     /// The configuration could not be loaded, merged or resolved.
     #[error(transparent)]
     Config(config::Error),
@@ -160,7 +161,9 @@ pub enum Error {
 impl From<config::Error> for Error {
     fn from(error: config::Error) -> Self {
         match error {
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo),
+            // Without the home there is no `~/…` spelling to give it;
+            // [`Context::load`] spells it under the home itself.
+            config::Error::RepoMissing(repo) => Self::RepoMissing(repo.display().to_string()),
             other => Self::Config(other),
         }
     }
@@ -286,7 +289,14 @@ impl Context {
             machine: host.machine(),
             present: &present,
         };
-        let layers = layers::load_gated(&repo, state.root(), &home, &facts)?.layers;
+        let layers = layers::load_gated(&repo, state.root(), &home, &facts)
+            .map_err(|error| match error {
+                config::Error::RepoMissing(repo) => {
+                    Error::RepoMissing(paths::to_portable(&repo, &home))
+                }
+                other => other.into(),
+            })?
+            .layers;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)

@@ -92,7 +92,8 @@ impl Inputs {
         // What a `when` keeps off this machine is left out before anything
         // merges, so it neither replaces nor collides with what stays.
         let layers::Gated { layers, elsewhere } =
-            layers::load_gated(&repo, state.root(), &home, &facts)?;
+            layers::load_gated(&repo, state.root(), &home, &facts)
+                .map_err(|error| Error::from_config(error, &home))?;
         // What every machine sharing the config repo declares: the layers
         // `bx.lock` is committed beside, without this account's own. What a
         // `when` keeps to other machines (`elsewhere`) is never merged: two
@@ -249,7 +250,11 @@ mod tests {
         let error = Inputs::load(&env(home.path())).expect_err("no repo");
 
         assert!(matches!(error, Error::RepoMissing(_)), "{error:?}");
-        assert!(error.to_string().contains("run `bx init`"), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "no bx config repo at ~/.config/bx; run `bx init` to create one",
+            "spelled under the home, as every other message spells a path"
+        );
     }
 
     #[test]

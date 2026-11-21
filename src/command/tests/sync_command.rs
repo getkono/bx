@@ -194,8 +194,8 @@ fn a_sync_that_leaves_a_conflict_pushes_nothing() {
     assert!(text(&out).starts_with("  ! ~/.mine"), "{}", text(&out));
     assert!(
         text(&out).ends_with(
-            "Pushed nothing: 1 commit(s) wait for an apply that leaves nothing undone; \
-                     run `bx sync` again.\n"
+            "Pushed nothing: 1 commit(s) wait on ~/.mine (conflict); settle what this apply \
+             left undone, then run `bx sync` again.\n"
         ),
         "{}",
         text(&out)

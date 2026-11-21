@@ -558,21 +558,52 @@ fn init_ends_by_saying_where_the_machine_stands() {
     const NEXT: &str =
         "Manage a file with `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n";
     assert_eq!(
-        init_closing(Exit::Converged, false),
+        init_closing(Exit::Converged, false, None),
         format!("Already set up: nothing to apply. {NEXT}")
     );
     assert_eq!(
-        init_closing(Exit::Converged, true),
+        init_closing(Exit::Converged, true, None),
         format!("Set up. {NEXT}")
     );
     for did in [false, true] {
         assert_eq!(
-            init_closing(Exit::Pending, did),
+            init_closing(Exit::Pending, did, None),
             "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
         );
-        assert_eq!(init_closing(Exit::Error, did), "");
-        assert_eq!(init_closing(Exit::Canceled, did), "");
+        assert_eq!(
+            init_closing(Exit::Pending, did, Some("~/.a (unanswered)")),
+            "Not finished: ~/.a (unanswered) left undone; see the plan above, settle them, \
+             then run `bx apply` again.\n"
+        );
+        assert_eq!(init_closing(Exit::Error, did, None), "");
+        assert_eq!(init_closing(Exit::Canceled, did, None), "");
     }
+}
+
+#[test]
+fn an_init_that_leaves_a_conflict_names_it_in_its_last_line() {
+    use crate::init::tests::Silent;
+
+    let home = guarded_home();
+    home.write(".mine", "mine\n");
+    seed(home.path(), &inline("~/.mine", "bx\\n"));
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let mut out = Vec::new();
+
+    let exit = init_with(&tty, &[], false, &mut out, &mut Silent, &mut never).expect("init");
+
+    assert_eq!(exit, Exit::Pending);
+    assert!(
+        text(&out).ends_with(
+            "Not finished: ~/.mine (conflict) left undone; see the plan above, settle them, \
+             then run `bx apply` again.\n"
+        ),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -787,7 +818,7 @@ fn a_run_that_only_adopted_is_set_up_and_not_already_set_up() {
     assert_eq!(exit, Exit::Converged);
     assert!(text(&out).contains("  + ~/.zshrc  (copied to files/.zshrc)\n"));
     assert!(
-        text(&out).ends_with(init_closing(Exit::Converged, true)),
+        text(&out).ends_with(&init_closing(Exit::Converged, true, None)),
         "{}",
         text(&out)
     );

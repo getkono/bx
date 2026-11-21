@@ -637,6 +637,12 @@ fn sync_answering(
                 "Pushed {ahead} commit(s) to {}.",
                 pulled.upstream.short
             )
+        } else if let Some(undone) = sync::undone(&report) {
+            writeln!(
+                out,
+                "Pushed nothing: {ahead} commit(s) wait on {undone}; settle what this apply \
+                 left undone, then run `bx sync` again."
+            )
         } else {
             writeln!(
                 out,
@@ -1009,7 +1015,10 @@ fn init_with(
     // nothing else; a closing line would be a second, different instruction.
     if report.recovered.is_none() {
         let did = answered.created || answered.saved.is_some() || adopted > 0 || report.executed;
-        say(out, init_closing(exit, did))?;
+        say(
+            out,
+            &init_closing(exit, did, sync::undone(&report).as_deref()),
+        )?;
     }
     Ok(exit)
 }
@@ -1030,24 +1039,30 @@ fn init_canceled(out: &mut dyn Write, then: &str) -> Result<Exit, init::Error> {
 }
 
 /// `init`'s last line: where the machine stands and what to run next. `did`
-/// is whether this run wrote anything at all.
-const fn init_closing(exit: Exit, did: bool) -> &'static str {
-    match (exit, did) {
+/// is whether this run wrote anything at all, and `undone` the rows it left
+/// in conflict or blocked, as [`sync::undone`] names them: what is left is
+/// those, which another `bx init` does not settle, where there are any.
+fn init_closing(exit: Exit, did: bool, undone: Option<&str>) -> String {
+    match (exit, did, undone) {
         // Not "nothing to answer": config left unmanaged is offered again on
         // every interactive run, so this may follow a question.
-        (Exit::Converged, false) => {
-            "Already set up: nothing to apply. Manage a file with `bx add PATH`; change an \
-             answer with `bx init --set NAME=VALUE`.\n"
-        }
-        (Exit::Converged, true) => {
-            "Set up. Manage a file with `bx add PATH`; change an answer with \
-             `bx init --set NAME=VALUE`.\n"
-        }
-        (Exit::Pending, _) => {
+        (Exit::Converged, false, _) => "Already set up: nothing to apply. Manage a file with \
+                                        `bx add PATH`; change an answer with `bx init --set \
+                                        NAME=VALUE`.\n"
+            .to_string(),
+        (Exit::Converged, true, _) => "Set up. Manage a file with `bx add PATH`; change an \
+                                       answer with `bx init --set NAME=VALUE`.\n"
+            .to_string(),
+        (Exit::Pending, _, Some(undone)) => format!(
+            "Not finished: {undone} left undone; see the plan above, settle them, then run `bx \
+             apply` again.\n"
+        ),
+        (Exit::Pending, _, None) => {
             "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
+                .to_string()
         }
         // Neither is an exit a plan produces.
-        (Exit::Error | Exit::Canceled, _) => "",
+        (Exit::Error | Exit::Canceled, ..) => String::new(),
     }
 }
 

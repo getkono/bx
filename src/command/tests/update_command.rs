@@ -209,7 +209,10 @@ fn a_lock_whose_apply_leaves_a_conflict_is_committed_and_not_pushed() {
     let mut out = Vec::new();
     update(&home, true, &mut out).expect("update");
     assert!(
-        text(&out).contains("Pushed nothing: 1 commit(s) wait for an apply"),
+        text(&out).contains(
+            "Pushed nothing: 1 commit(s) wait on ~/.claude/skills/a (conflict); settle what \
+             this apply left undone, then run `bx sync` to push them."
+        ),
         "{}",
         text(&out)
     );

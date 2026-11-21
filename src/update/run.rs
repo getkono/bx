@@ -476,10 +476,16 @@ fn push_lock(
     }
     let upstream = &pulled.upstream.short;
     let said = if !sync::may_push(report) {
-        format!(
-            "Pushed nothing: {ahead} commit(s) wait for an apply that leaves nothing undone; \
-             run `bx sync` to push them."
-        )
+        match sync::undone(report) {
+            Some(undone) => format!(
+                "Pushed nothing: {ahead} commit(s) wait on {undone}; settle what this apply \
+                 left undone, then run `bx sync` to push them."
+            ),
+            None => format!(
+                "Pushed nothing: {ahead} commit(s) wait for an apply that leaves nothing \
+                 undone; run `bx sync` to push them."
+            ),
+        }
     } else {
         match sync::push(git, pulled) {
             Ok(()) => format!("Pushed {ahead} commit(s) to {upstream}."),

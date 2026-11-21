@@ -400,8 +400,10 @@ says what the budget covers.
   you to resolve and `bx add` again. It shows the diffs first and asks
   (`--yes` asks nothing; with no terminal it saves nothing). It refuses a
   secret, a generated file, a region or include line, a tracked file (which
-  `bx sync` carries already), an inline content with a `{{name}}` in it, and
-  a repo file another target also delivers, naming that target. At a
+  `bx sync` carries already), an inline content with a `{{name}}` in it, a
+  repo file another target also delivers, naming that target, and a repo
+  file holding changes you have not committed, so the commit `bx sync`
+  makes holds only the save. At a
   terminal, `apply`'s question about an edited file offers the same save, or
   the merge where it is clean.
 - A file or link bx made that you deleted is never silently re-created. While

@@ -93,7 +93,7 @@ impl Env {
                 stdout_tty,
                 std::env::var_os("BX_PAGER").as_deref(),
                 std::env::var_os("PAGER").as_deref(),
-                std::env::var_os("LESS").is_some(),
+                std::env::var_os("LESS").as_deref(),
             ),
             user: account(std::env::var("USER").ok(), std::env::var("LOGNAME").ok()),
         })
@@ -126,11 +126,17 @@ pub struct Pager {
     /// The command, run by `sh -c`, so it may carry its own arguments as
     /// `$PAGER` conventionally does.
     pub command: String,
-    /// Whether `LESS=FRX` is set for it: `LESS` was unset, so a `less` named
-    /// bare by `$PAGER` shows colour, leaves the plan on the screen when it
-    /// exits, and exits at once where everything fits, as `less -FRX` does.
-    pub set_less: bool,
+    /// What `LESS` is set to for it: [`LESS_OPTIONS`], after whatever `$LESS`
+    /// already held. A `less` then shows colour, exits at once where
+    /// everything fits, and leaves the plan on the screen when it exits, so
+    /// the question put next follows it: see [`Pager::resolve`].
+    pub less: OsString,
 }
+
+/// The options `less` is always given through `LESS`: `F` exits at once where
+/// everything fits, `R` shows colour, and `X` keeps the terminal's alternate
+/// screen out of it, so what was paged stays on the screen once it exits.
+pub const LESS_OPTIONS: &str = "FRX";
 
 /// What bx pages through when neither `$BX_PAGER` nor `$PAGER` names one.
 pub const DEFAULT_PAGER: &str = "less -FRX";
@@ -148,14 +154,20 @@ impl Pager {
     /// the empty string, which is the one switch that turns paging off.
     ///
     /// Otherwise `$BX_PAGER`, else a `$PAGER` that is not empty, else
-    /// [`DEFAULT_PAGER`]. `less_set` is whether `$LESS` is set at all.
+    /// [`DEFAULT_PAGER`].
+    ///
+    /// `less` is `$LESS`. [`LESS_OPTIONS`] are appended to it, rather than set
+    /// only where it is unset: under a `LESS=-R`, as a shell framework
+    /// exports, `less` would otherwise run on the alternate screen and wipe
+    /// the plan before the question about it is put. Every option `$LESS`
+    /// gave that these do not override is kept.
     #[must_use]
     pub fn resolve(
         no_color: bool,
         stdout_tty: bool,
         bx_pager: Option<&OsStr>,
         pager: Option<&OsStr>,
-        less_set: bool,
+        less: Option<&OsStr>,
     ) -> Option<Self> {
         if no_color || !stdout_tty {
             return None;
@@ -170,7 +182,7 @@ impl Pager {
         };
         Some(Self {
             command,
-            set_less: !less_set,
+            less: keep_on_screen(less),
         })
     }
 
@@ -195,9 +207,7 @@ impl Pager {
             .arg("-c")
             .arg(&self.command)
             .stdin(std::process::Stdio::piped());
-        if self.set_less {
-            command.env("LESS", "FRX");
-        }
+        command.env("LESS", &self.less);
         let Ok(mut child) = command.spawn() else {
             return Ok(false);
         };
@@ -211,6 +221,20 @@ impl Pager {
             _ => {}
         }
         waited.map(|status| !matches!(status.code(), Some(NOT_RUN | NOT_FOUND)))
+    }
+}
+
+/// `LESS` for the pager: [`LESS_OPTIONS`] after what `inherited` holds, as an
+/// option of their own, or alone where it holds nothing but blanks.
+fn keep_on_screen(inherited: Option<&OsStr>) -> OsString {
+    match inherited.filter(|less| !less.as_encoded_bytes().iter().all(u8::is_ascii_whitespace)) {
+        None => OsString::from(LESS_OPTIONS),
+        Some(less) => {
+            let mut kept = less.to_owned();
+            kept.push(" -");
+            kept.push(LESS_OPTIONS);
+            kept
+        }
     }
 }
 
@@ -290,10 +314,10 @@ mod tests {
         assert_eq!(account(None, None), None);
     }
 
-    fn pager(command: &str, set_less: bool) -> Option<Pager> {
+    fn pager(command: &str, less: &str) -> Option<Pager> {
         Some(Pager {
             command: command.to_string(),
-            set_less,
+            less: OsString::from(less),
         })
     }
 
@@ -302,32 +326,50 @@ mod tests {
         let os = |value: &'static str| Some(OsStr::new(value));
         // Off a terminal, or under NO_COLOR, nothing is paged whatever is set.
         assert_eq!(
-            Pager::resolve(false, false, os("more"), os("most"), false),
+            Pager::resolve(false, false, os("more"), os("most"), None),
             None
         );
         assert_eq!(
-            Pager::resolve(true, true, os("more"), os("most"), false),
+            Pager::resolve(true, true, os("more"), os("most"), None),
             None
         );
         // `BX_PAGER=` empty is the switch that turns it off.
-        assert_eq!(Pager::resolve(false, true, os(""), os("most"), false), None);
+        assert_eq!(Pager::resolve(false, true, os(""), os("most"), None), None);
         // `BX_PAGER`, else a `PAGER` that is not empty, else `less -FRX`.
         assert_eq!(
-            Pager::resolve(false, true, os("more"), os("most"), true),
-            pager("more", false)
+            Pager::resolve(false, true, os("more"), os("most"), None),
+            pager("more", "FRX")
         );
         assert_eq!(
-            Pager::resolve(false, true, None, os("most"), true),
-            pager("most", false)
+            Pager::resolve(false, true, None, os("most"), None),
+            pager("most", "FRX")
         );
         assert_eq!(
-            Pager::resolve(false, true, None, os(""), true),
-            pager(DEFAULT_PAGER, false)
+            Pager::resolve(false, true, None, os(""), None),
+            pager(DEFAULT_PAGER, "FRX")
         );
         assert_eq!(
-            Pager::resolve(false, true, None, None, false),
-            pager(DEFAULT_PAGER, true)
+            Pager::resolve(false, true, None, None, None),
+            pager(DEFAULT_PAGER, "FRX")
         );
+    }
+
+    #[test]
+    fn an_inherited_less_still_keeps_the_plan_on_the_screen() {
+        let less = |value: &'static str| {
+            Pager::resolve(false, true, None, None, Some(OsStr::new(value)))
+                .expect("a pager")
+                .less
+        };
+        // oh-my-zsh's `LESS=-R` alone runs `less` on the alternate screen,
+        // which wipes the plan before the question about it is put.
+        assert_eq!(less("-R"), "-R -FRX");
+        // Every option it gave is kept, ahead of the ones bx needs.
+        assert_eq!(less("-i -x4"), "-i -x4 -FRX");
+        assert_eq!(less("SR"), "SR -FRX");
+        // Set to nothing but blanks, it gives no option of its own.
+        assert_eq!(less(""), "FRX");
+        assert_eq!(less(" \t"), "FRX");
     }
 
     #[test]
@@ -345,7 +387,7 @@ mod tests {
             pager,
             user: None,
         };
-        let less = pager(DEFAULT_PAGER, true);
+        let less = pager(DEFAULT_PAGER, LESS_OPTIONS);
         let tall = "a\nb\nc\n";
         assert_eq!(env(Some(3), less.clone()).pager_for(tall), less.as_ref());
         assert_eq!(env(Some(2), less.clone()).pager_for(tall), less.as_ref());
@@ -380,47 +422,40 @@ mod tests {
             seen.display(),
             less.display()
         );
-        let shown = Pager {
-            command,
-            set_less: true,
-        }
+        let shown = Pager::resolve(
+            false,
+            true,
+            Some(command.as_ref()),
+            None,
+            Some("-R".as_ref()),
+        )
+        .expect("a pager")
         .page("one\ntwo\n")
         .expect("paged");
         assert!(shown);
         // Waited for: what it wrote is there once `page` returns.
         assert_eq!(std::fs::read_to_string(&seen).expect("seen"), "one\ntwo\n");
-        assert_eq!(std::fs::read_to_string(&less).expect("LESS"), "FRX");
+        assert_eq!(std::fs::read_to_string(&less).expect("LESS"), "-R -FRX");
 
         // A pager that quits without reading is no error.
-        let quit = Pager {
-            command: "exit 0".to_string(),
-            set_less: false,
-        };
+        let quit = pager("exit 0", "FRX").expect("a pager");
         assert!(quit.page(&"x\n".repeat(1 << 20)).expect("quit early"));
     }
 
     #[test]
     fn a_pager_that_does_not_exist_or_cannot_run_has_shown_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let missing = Pager {
-            command: dir.path().join("no-such-pager").display().to_string(),
-            set_less: true,
-        };
+        let missing = dir.path().join("no-such-pager").display().to_string();
+        let missing = pager(&missing, "FRX").expect("a pager");
         assert!(!missing.page("one\ntwo\n").expect("not shown"));
 
         let unrunnable = dir.path().join("unrunnable");
         std::fs::write(&unrunnable, "#!/bin/sh\n").expect("write");
-        let unrunnable = Pager {
-            command: unrunnable.display().to_string(),
-            set_less: false,
-        };
+        let unrunnable = pager(&unrunnable.display().to_string(), "FRX").expect("a pager");
         assert!(!unrunnable.page("one\n").expect("not shown"));
 
         // Any other status is a pager that ran, and its own business.
-        let failed = Pager {
-            command: "exit 1".to_string(),
-            set_less: false,
-        };
+        let failed = pager("exit 1", "FRX").expect("a pager");
         assert!(failed.page("one\n").expect("ran"));
     }
 

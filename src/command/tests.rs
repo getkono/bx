@@ -287,7 +287,7 @@ fn a_plan_whose_pager_does_not_exist_is_written_before_apply_asks() {
         rows: Some(1),
         pager: Some(crate::env::Pager {
             command: home.child("no-such-pager").display().to_string(),
-            set_less: true,
+            less: crate::env::LESS_OPTIONS.into(),
         }),
         ..env(home.path())
     };

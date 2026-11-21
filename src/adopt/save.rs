@@ -28,8 +28,10 @@
 //!   done only on their confirmation, through a journalled session, so the
 //!   ledger keeps them for `bx rm`. A conflicted merge writes nothing to the
 //!   repo; confirmed, it writes the conflict-marked result to the machine
-//!   file, the user's bytes kept the same way, for them to resolve and
-//!   `bx add` again. With no base kept — a secret, a file over the bound
+//!   file, through the same session, for them to resolve and `bx add`
+//!   again. Every line of theirs is in it, between the markers or merged,
+//!   and since it is not bx's last write, `bx rm` leaves it untouched as a
+//!   conflict, as it leaves any edited file. With no base kept — a secret, a file over the bound
 //!   bases are kept under — there is nothing to merge from, and the save is
 //!   refused.
 //!
@@ -65,8 +67,7 @@ use crate::git::{self, Git};
 use crate::journal::{Content, Ownership, Request, Session, SessionKind};
 use crate::paths::{self, Portable};
 use crate::state::{
-    self, ContentHash, ExclusiveLock, Ledger, LedgerEntry, Mechanism, NewEntry, PriorBytes,
-    StateDir,
+    self, ContentHash, ExclusiveLock, LedgerEntry, Mechanism, NewEntry, PriorBytes, StateDir,
 };
 
 #[cfg(test)]
@@ -223,9 +224,10 @@ impl Save {
 /// later edit is merged from.
 ///
 /// The session keeps the bytes each write displaces, the user's own, as the
-/// prior `bx rm` restores. A conflicted merge's entry is then put back to what
-/// bx last wrote, so the marked file is an edit `plan` asks about rather than
-/// bytes of bx's an `apply` would replace.
+/// prior `bx rm` restores. A conflicted merge's entry is recorded at what bx
+/// last wrote in that same session, saved with its write under the one lock,
+/// so the marked file is an edit `plan` asks about rather than bytes of bx's
+/// an `apply` would replace.
 ///
 /// # Errors
 ///
@@ -238,37 +240,29 @@ pub(crate) fn write_machines(
     saves: &[&Save],
 ) -> Result<(), super::Error> {
     let merges: Vec<&&Save> = saves.iter().filter(|save| save.writes_machine()).collect();
-    if !merges.is_empty() {
+    if merges.is_empty() {
+        drop(lock);
+    } else {
         let scope = merges.iter().map(|save| save.target.clone()).collect();
         let mut session = Session::open_locked(state, SessionKind::Apply, home, scope, lock)?;
         for save in &merges {
             session.apply(save.request(home))?;
         }
-        session.finish()?;
-    } else {
-        drop(lock);
-    }
-    let conflicted: Vec<&&Save> = merges
-        .iter()
-        .copied()
-        .filter(|save| save.how == How::Conflicted)
-        .collect();
-    if !conflicted.is_empty() {
-        let lock = super::lock(state)?;
-        let mut ledger = Ledger::open(state, &lock, home)?.value;
-        for save in conflicted {
+        // In the same session, so the ledger is saved once, under the one
+        // lock, never claiming the marked file as bx's.
+        for save in merges.iter().filter(|save| save.how == How::Conflicted) {
             let (written, mode) = save.base;
-            ledger.record(NewEntry::new(
+            session.record(NewEntry::new(
                 save.target.clone(),
                 written,
                 mode,
                 Mechanism::Own,
-                // Kept: the session already took the user's bytes as the
+                // Kept: the write already took the user's bytes as the
                 // prior, and an absent prior never replaces a stored one.
                 PriorBytes::Absent,
             ))?;
         }
-        ledger.save()?;
+        session.finish()?;
     }
     keep_bases(state, saves);
     Ok(())

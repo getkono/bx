@@ -1375,8 +1375,8 @@ fn save_row(save: &adopt::save::Save, home: &Path) -> String {
              restores yours\n"
         ),
         How::Conflicted => format!(
-            "  ! {target}  merged with conflict markers, which bx rm takes back to yours; \
-             resolve them, then run bx add {target}\n"
+            "  ! {target}  merged with conflict markers around both sides; resolve them, \
+             then run bx add {target}\n"
         ),
     }
 }

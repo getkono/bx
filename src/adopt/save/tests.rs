@@ -335,6 +335,41 @@ fn a_conflicted_merge_marks_the_machine_file_only_and_stays_an_edit() {
 }
 
 #[test]
+fn rm_after_a_conflicted_merge_leaves_the_marked_file_as_a_conflict() {
+    let home = applied(FILE_BODY, BASE);
+    std::fs::write(rc(&home), b"one\nmine\nthree\n").expect("edit here");
+    std::fs::write(home.child(".config/bx/files/rc"), b"one\ntheirs\nthree\n").expect("there");
+    let mut out = Vec::new();
+    crate::command::add(&env(home.path()), home.path(), Some(".rc"), true, &mut out).expect("add");
+    let state = StateDir::resolve(home.path());
+    assert!(
+        !state.journal().exists(),
+        "the merge's session finished whole"
+    );
+    assert_eq!(
+        written(&home),
+        ContentHash::of(BASE),
+        "saved with the write"
+    );
+
+    let marked = std::fs::read(rc(&home)).expect("the marked file");
+    let text = String::from_utf8(out).expect("UTF-8");
+    assert!(
+        text.contains("merged with conflict markers around both sides"),
+        "{text}"
+    );
+
+    let ctx = Context::load(&env(home.path())).expect("the context");
+    adopt::rm(&ctx, &target(&home)).expect("rm");
+
+    // Not bx's last write, so an edit rm will not hand back over: left
+    // byte for byte, every line of the user's inside it, still managed.
+    assert_eq!(std::fs::read(rc(&home)).expect("read"), marked);
+    assert!(String::from_utf8_lossy(&marked).contains("\nmine\n"));
+    assert_eq!(written(&home), ContentHash::of(BASE), "still declared");
+}
+
+#[test]
 fn both_sides_changed_with_no_base_kept_is_refused() {
     let home = applied(FILE_BODY, BASE);
     let state = StateDir::resolve(home.path());

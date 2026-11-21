@@ -287,7 +287,7 @@ fn a_plan_whose_pager_does_not_exist_is_written_before_apply_asks() {
         rows: Some(1),
         pager: Some(crate::env::Pager {
             command: home.child("no-such-pager").display().to_string(),
-            set_less: true,
+            less: crate::env::LESS_OPTIONS.into(),
         }),
         ..env(home.path())
     };
@@ -297,6 +297,58 @@ fn a_plan_whose_pager_does_not_exist_is_written_before_apply_asks() {
 
     assert_eq!(exit, Exit::Pending);
     assert!(text(&out).starts_with("  + ~/.a"), "{}", text(&out));
+}
+
+#[test]
+fn ctrl_c_in_the_pager_cancels_apply_and_only_ends_a_plan() {
+    let home = guarded_home();
+    seed(home.path(), &inline("~/.a", "a\\n"));
+    // Caught from here on, as from the first paging; the pager then waits
+    // until bx's handler has run, which writes `ack` after it marked the
+    // Ctrl-C seen.
+    crate::env::interrupt().expect("Ctrl-C is caught");
+    let ack = home.child("ack");
+    let acked = std::fs::File::create(&ack).expect("ack");
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGINT, acked).expect("acked");
+    let tty = Env {
+        stdin_tty: true,
+        rows: Some(1),
+        pager: Some(crate::env::Pager {
+            // A terminal's Ctrl-C reaches the pager and bx alike, and
+            // `less -K` exits 2 on it.
+            command: format!(
+                "kill -INT $PPID; until [ -s '{}' ]; do :; done; exit 2",
+                ack.display()
+            ),
+            less: crate::env::LESS_OPTIONS.into(),
+        }),
+        ..env(home.path())
+    };
+
+    let mut out = Vec::new();
+    let exit = apply_with(&tty, false, &mut out, &mut || panic!("nothing is asked"))
+        .expect("a cancel is not an error");
+
+    assert_eq!(exit, Exit::Canceled);
+    assert_eq!(text(&out), "Canceled. Nothing was applied.\n");
+    assert!(!home.child(".a").exists());
+
+    // With no question after it, it ends the view and nothing else. Emptied
+    // first, so this pager too waits for its own Ctrl-C to be caught.
+    std::fs::write(&ack, "").expect("ack emptied");
+    let mut out = Vec::new();
+    assert_eq!(super::plan(&tty, &mut out).expect("a plan"), Exit::Pending);
+    assert_eq!(text(&out), "");
+}
+
+#[test]
+fn a_view_with_nothing_after_it_ends_where_its_pager_was_interrupted() {
+    assert!(matches!(viewed(Err(Error::Canceled)), Ok(())));
+    assert!(matches!(viewed(Ok(())), Ok(())));
+    assert!(matches!(
+        viewed(Err(Error::NeedsConfirmation)),
+        Err(Error::NeedsConfirmation)
+    ));
 }
 
 #[test]

@@ -144,12 +144,74 @@ pub struct Question {
     /// The row, by index into [`Report::changes`].
     pub row: usize,
     /// What bx last wrote there against what is on disk, then against what
-    /// bx wants there; `None` where it cannot be shown, and the row's own
-    /// diff is all there is.
+    /// bx wants there; for a deleted target, what restoring it writes.
+    /// `None` where there is no such view, and the row's own diff is all
+    /// there is: the question then offers no view of its own.
     pub three_way: Option<Diff>,
-    /// Whether the target was deleted since bx made it, rather than edited:
-    /// the question is then whether to keep it deleted or restore bx's.
-    pub deleted: bool,
+    /// What changed since bx left the target, which the question is put
+    /// about and its row's note is worded for.
+    pub asked: Asked,
+}
+
+/// What someone changed since bx left a target, which a [`Question`] asks
+/// whether to keep. Each kind has its own wording: in the question, in the
+/// note its row ends with, and in the note the row carries once answered
+/// *take*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// A file bx owns whole, whose bytes were edited.
+    Edited,
+    /// A file bx owns whole, whose bytes are still bx's and whose mode was
+    /// changed.
+    Mode,
+    /// A region of bx's, edited inside its markers.
+    Region,
+    /// A symlink bx made, retargeted.
+    Retargeted,
+    /// A file or symlink bx made, deleted.
+    Deleted,
+}
+
+impl Asked {
+    /// The note a row asked about ends with: what `apply` does about it.
+    pub(crate) const fn ask(self) -> &'static str {
+        match self {
+            Self::Edited => decide::ASK,
+            Self::Mode => decide::ASK_MODE,
+            Self::Region => decide::ASK_REGION,
+            Self::Retargeted => decide::ASK_RETARGETED,
+            Self::Deleted => decide::ASK_DELETED,
+        }
+    }
+
+    /// What takes [`Asked::ask`]'s place in the row's note once its answer
+    /// took bx's.
+    const fn taken(self) -> &'static str {
+        match self {
+            Self::Edited => TAKEN,
+            Self::Mode => TAKEN_MODE,
+            Self::Region => TAKEN_REGION,
+            Self::Retargeted => TAKEN_RETARGETED,
+            Self::Deleted => RESTORED,
+        }
+    }
+
+    /// `note`, the row's, once its question was answered *take*: the
+    /// question gives way to what the answer did, and every other part of
+    /// the note — why it was asked, a mode change, a directory created —
+    /// still holds and stays.
+    /// A deletion that stood no longer does, so it is said as the deletion
+    /// alone.
+    fn answered(self, note: Option<&str>) -> String {
+        let stood = note
+            .filter(|_| self == Self::Deleted)
+            .map(|note| note.replace(decide::DELETED, STOOD));
+        match stood.as_deref().or(note) {
+            Some(note) if note.contains(self.ask()) => note.replace(self.ask(), self.taken()),
+            Some(note) => format!("{note}; {}", self.taken()),
+            None => self.taken().to_string(),
+        }
+    }
 }
 
 /// What a writing run's `approve` answers: whether to write, and which edited
@@ -172,11 +234,25 @@ impl From<bool> for Approval {
     }
 }
 
-/// The note an edited file's row carries once its answer took bx's bytes.
-const TAKEN: &str = "edited since bx last wrote it; you took bx's bytes, and bx rm restores yours";
+/// What an edited file's row says once its answer took bx's bytes.
+pub(crate) const TAKEN: &str = "you took bx's bytes, and bx rm restores yours";
 
-/// The note a deleted target's row carries once its answer restored it.
-const RESTORED: &str = "deleted since bx wrote it; you restored bx's";
+/// What a file's row says once its answer took bx's mode back.
+pub(crate) const TAKEN_MODE: &str = "you took bx's mode, and bx rm restores yours";
+
+/// What an edited region's row says once its answer took bx's region.
+pub(crate) const TAKEN_REGION: &str =
+    "you took bx's region, and bx rm restores the file as you left it";
+
+/// What a retargeted link's row says once its answer took bx's target.
+pub(crate) const TAKEN_RETARGETED: &str = "you took bx's target, and bx rm restores yours";
+
+/// What a deleted target's row says once its answer restored it.
+pub(crate) const RESTORED: &str = "you restored bx's";
+
+/// What replaces [`decide::DELETED`] in a restored row's note: the deletion
+/// no longer stands.
+const STOOD: &str = "deleted since bx wrote it";
 
 impl Report {
     /// Every row's action, in order, then every activation's.
@@ -394,17 +470,19 @@ fn decide_and_write(
     report.questions = decided
         .held
         .iter()
-        .map(|(row, op)| Question {
-            row: *row,
-            three_way: op.three_way(
-                ledger
-                    .get(op.target())
-                    .and_then(|entry| {
-                        state::restore::kept(&inputs.state, entry.written, track::Base::LIMIT)
-                    })
-                    .as_deref(),
-            ),
-            deleted: op.deleted(),
+        .map(|(row, op)| {
+            let entry = ledger.get(op.target());
+            Question {
+                row: *row,
+                three_way: op.three_way(
+                    entry
+                        .and_then(|entry| {
+                            state::restore::kept(&inputs.state, entry.written, track::Base::LIMIT)
+                        })
+                        .as_deref(),
+                ),
+                asked: op.asked(entry),
+            }
         })
         .collect();
     let mut held = decided.held;
@@ -474,13 +552,14 @@ fn decide_and_write(
             // is written right after it, so it is never the older of the two.
             let mut tied = decided.tied;
             for (row, op) in taken.into_iter().rev() {
-                let (action, note) = if op.deleted() {
-                    (Action::Create, RESTORED)
+                let asked = op.asked(ledger.get(op.target()));
+                let change = &mut report.changes[row];
+                change.action = if op.deleted() {
+                    Action::Create
                 } else {
-                    (Action::Modify, TAKEN)
+                    Action::Modify
                 };
-                report.changes[row].action = action;
-                report.changes[row].note = Some(note.to_string());
+                change.note = Some(asked.answered(change.note.as_deref()));
                 if let Some(at) = tied.iter().position(|tied| tied.source == row) {
                     let tied = tied.remove(at);
                     report.changes[tied.row].action = Action::Modify;

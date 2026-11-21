@@ -158,10 +158,171 @@ fn walking_away_from_the_question_is_a_cancel() {
 }
 
 #[test]
-fn every_answer_is_offered_and_keep_is_the_default() {
+fn an_edit_with_a_three_way_view_offers_it_and_keep_is_the_default() {
+    let home = edited_home();
+    let mut offered = Vec::new();
+
+    apply_answering(
+        &tty(home.path()),
+        false,
+        &mut Vec::new(),
+        &mut never,
+        Some(&mut |_, choices| {
+            offered.push(choices.to_vec());
+            Ok(Answer::Keep)
+        }),
+    )
+    .expect("apply");
+
+    assert_eq!(
+        offered,
+        vec![vec![CHOICES[0], CHOICES[1], SHOW_THREE_WAY]],
+        "keep first, so a bare Enter keeps the edit"
+    );
     assert_eq!(CHOICES[0].1, Answer::Keep);
-    let answers: Vec<Answer> = CHOICES.iter().map(|(_, answer)| *answer).collect();
-    assert_eq!(answers, vec![Answer::Keep, Answer::Take, Answer::Show]);
+}
+
+/// The one question `apply` over `home`'s current configuration puts at a
+/// terminal, and the answers it offers, answered *keep*, with any other work
+/// declined.
+fn the_question_put(home: &Path) -> (String, Vec<(&'static str, Answer)>) {
+    let mut put = Vec::new();
+    apply_answering(
+        &tty(home),
+        false,
+        &mut Vec::new(),
+        &mut || Ok(false),
+        Some(&mut |q, choices| {
+            put.push((q.to_string(), choices.to_vec()));
+            Ok(Answer::Keep)
+        }),
+    )
+    .expect("apply");
+    assert_eq!(put.len(), 1, "{put:?}");
+    put.remove(0)
+}
+
+/// Each answer *show* in `choices`, by its label.
+fn shows(choices: &[(&'static str, Answer)]) -> Vec<&'static str> {
+    choices
+        .iter()
+        .filter(|(_, answer)| *answer == Answer::Show)
+        .map(|(label, _)| *label)
+        .collect()
+}
+
+#[test]
+fn an_edit_with_no_view_of_its_own_offers_the_row_diff_again() {
+    let home = guarded_home();
+    // Written by a session alone, so no base is kept to measure it from.
+    own(home.path(), ".a", b"bx\n", Mechanism::Own);
+    std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    seed(home.path(), &inline("~/.a", "new\\n"));
+
+    let (_, choices) = the_question_put(home.path());
+
+    assert_eq!(shows(&choices), vec![SHOW_AGAIN.0]);
+}
+
+#[test]
+fn a_mode_change_is_asked_about_its_mode_and_offers_no_view() {
+    let home = guarded_home();
+    seed(home.path(), &inline("~/.a", "bx\\n"));
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("bx writes it");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(home.child(".a"), std::fs::Permissions::from_mode(0o600))
+        .expect("the user's chmod");
+
+    let (asked, choices) = the_question_put(home.path());
+
+    assert_eq!(
+        asked,
+        "~/.a had its mode changed since bx set it. Keep your mode, or take bx's?"
+    );
+    // The bytes are bx's, so there is no diff to show: only the mode line,
+    // already drawn above the question.
+    assert_eq!(shows(&choices), vec![SHOW_AGAIN.0]);
+}
+
+#[test]
+fn a_question_with_neither_a_view_nor_a_row_diff_offers_no_show() {
+    let change = plan::Change {
+        target: "~/.a".to_owned(),
+        origin: crate::config::Origin {
+            file: std::path::PathBuf::from("bx.toml"),
+            line: 1,
+        },
+        action: crate::report::Action::Conflict,
+        diff: None,
+        note: None,
+    };
+    for asked in [
+        plan::Asked::Edited,
+        plan::Asked::Mode,
+        plan::Asked::Region,
+        plan::Asked::Retargeted,
+        plan::Asked::Deleted,
+    ] {
+        let question = plan::Question {
+            row: 0,
+            three_way: None,
+            asked,
+        };
+
+        let (_, choices) = super::super::asked(&change, &question);
+
+        assert!(shows(&choices).is_empty(), "{asked:?}: {choices:?}");
+        assert!(!choices.is_empty(), "{asked:?} still offers keep and take");
+    }
+}
+
+#[test]
+fn a_retargeted_link_is_asked_about_its_target() {
+    let home = guarded_home();
+    let link = |text: &str| format!("[[target]]\npath = \"~/.tool\"\nsymlink = \"{text}\"\n");
+    seed(home.path(), &link("/opt/one"));
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("bx makes it");
+    std::fs::remove_file(home.child(".tool")).expect("unlink");
+    std::os::unix::fs::symlink("/opt/theirs", home.child(".tool")).expect("retarget");
+    seed(home.path(), &link("/opt/two"));
+
+    let (asked, choices) = the_question_put(home.path());
+
+    assert_eq!(
+        asked,
+        "~/.tool was retargeted since bx made it. Keep your target, or take bx's?"
+    );
+    assert_eq!(shows(&choices), vec![SHOW_AGAIN.0]);
+}
+
+#[test]
+fn a_region_edited_inside_is_asked_about_bx_s_region() {
+    let home = guarded_home();
+    let old = "mine\n# >>> bx >>>\nsource ~/.old\n# <<< bx <<<\n";
+    own(
+        home.path(),
+        ".zshrc",
+        old.as_bytes(),
+        Mechanism::Region { comment: '#' },
+    );
+    std::fs::write(
+        home.child(".zshrc"),
+        old.replace("source ~/.old\n", "source ~/.old\nedited\n"),
+    )
+    .expect("the edit");
+    seed(
+        home.path(),
+        "[[env]]\nname = \"EDITOR\"\nvalue = \"nvim\"\nkind = \"interactive\"\n",
+    );
+
+    let (asked, choices) = the_question_put(home.path());
+
+    assert_eq!(
+        asked,
+        "bx's region in ~/.zshrc was edited since bx last wrote it. Keep your edit, or take \
+         bx's region?"
+    );
+    assert_eq!(shows(&choices), vec![SHOW_AGAIN.0]);
 }
 
 #[test]
@@ -181,7 +342,7 @@ fn a_deleted_file_is_asked_whether_to_keep_it_deleted_and_restore_writes_it() {
         &mut never,
         Some(&mut |q, choices| {
             asked.push(q.to_string());
-            offered.push(*choices);
+            offered.push(choices.to_vec());
             Ok(Answer::Keep)
         }),
     )
@@ -195,7 +356,10 @@ fn a_deleted_file_is_asked_whether_to_keep_it_deleted_and_restore_writes_it() {
         asked,
         vec!["~/.a was deleted since bx last wrote it. Keep it deleted, or restore bx's?"]
     );
-    assert_eq!(offered, vec![DELETED_CHOICES]);
+    assert_eq!(
+        offered,
+        vec![vec![DELETED_CHOICES[0], DELETED_CHOICES[1], SHOW_RESTORED]]
+    );
     assert!(!home.child(".a").exists());
 
     let exit = apply_answering(
@@ -213,5 +377,30 @@ fn a_deleted_file_is_asked_whether_to_keep_it_deleted_and_restore_writes_it() {
 #[test]
 fn keeping_a_deletion_is_the_default() {
     let answers: Vec<Answer> = DELETED_CHOICES.iter().map(|(_, answer)| *answer).collect();
-    assert_eq!(answers, vec![Answer::Keep, Answer::Take, Answer::Show]);
+    assert_eq!(answers, vec![Answer::Keep, Answer::Take]);
+}
+
+#[test]
+fn show_on_a_deletion_draws_what_restoring_writes() {
+    let home = guarded_home();
+    seed(home.path(), &inline("~/.a", "bx\\n"));
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("bx writes it");
+    std::fs::remove_file(home.child(".a")).expect("the deletion");
+    seed(home.path(), &inline("~/.a", "new\\n"));
+    let mut out = Vec::new();
+    // Popped from the end: show first, then keep.
+    let mut answers = vec![Answer::Keep, Answer::Show];
+
+    apply_answering(
+        &tty(home.path()),
+        false,
+        &mut out,
+        &mut never,
+        Some(&mut |_, _| Ok(answers.pop().expect("asked no more than answered"))),
+    )
+    .expect("apply");
+
+    let shown = text(&out);
+    assert!(shown.contains("(deleted → bx's)"), "{shown}");
+    assert!(!shown.contains("(bx wrote → bx wants)"), "{shown}");
 }

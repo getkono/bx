@@ -151,28 +151,77 @@ pub(crate) enum Answer {
     Keep,
     /// Write bx's bytes over the edit, which `bx rm` then restores.
     Take,
-    /// Show the three-way view, then ask again.
+    /// Show the question's view, or the row's diff again, then ask again.
     Show,
 }
 
 /// The answers a question about one file offers, each with its label, in the
 /// order they are listed: the first is the default.
-type Choices = [(&'static str, Answer); 3];
+type Choices = [(&'static str, Answer)];
 
-/// The choices asked about an edited file: a bare Enter keeps the edit.
-const CHOICES: Choices = [
-    ("keep mine", Answer::Keep),
-    ("take bx's", Answer::Take),
-    ("show the three-way diff", Answer::Show),
-];
+/// The choices asked about a target changed since bx left it: a bare Enter
+/// keeps the change. [`asked`] follows them with a view where there is one.
+const CHOICES: [(&str, Answer); 2] = [("keep mine", Answer::Keep), ("take bx's", Answer::Take)];
 
 /// The choices asked about a target deleted since bx made it: a bare Enter
 /// keeps it deleted, and *restore* is [`Answer::Take`].
-const DELETED_CHOICES: Choices = [
+const DELETED_CHOICES: [(&str, Answer); 2] = [
     ("keep it deleted", Answer::Keep),
     ("restore bx's", Answer::Take),
-    ("show what restoring writes", Answer::Show),
 ];
+
+/// The choice that draws an edited target's three-way view.
+const SHOW_THREE_WAY: (&str, Answer) = ("show the three-way diff", Answer::Show);
+
+/// The choice that draws what restoring a deleted target writes.
+const SHOW_RESTORED: (&str, Answer) = ("show what restoring writes", Answer::Show);
+
+/// The choice that draws a row's own diff again, where its question has no
+/// view of its own: it may have scrolled away above the question.
+const SHOW_AGAIN: (&str, Answer) = ("show the diff again", Answer::Show);
+
+/// The question about `change`, the row `question` names, worded for what
+/// was changed there, and the answers it offers. *Show* is offered only
+/// where it draws something: the question's own view, or else the row's
+/// diff again, and nothing at all for a row with neither.
+fn asked(
+    change: &plan::Change,
+    question: &plan::Question,
+) -> (String, Vec<(&'static str, Answer)>) {
+    use plan::Asked;
+    let target = report::escape(&change.target);
+    let asked = match question.asked {
+        Asked::Edited => format!(
+            "{target} was edited since bx last wrote it. Keep your edit, or take bx's bytes?"
+        ),
+        Asked::Mode => {
+            format!("{target} had its mode changed since bx set it. Keep your mode, or take bx's?")
+        }
+        Asked::Region => format!(
+            "bx's region in {target} was edited since bx last wrote it. Keep your edit, or take \
+             bx's region?"
+        ),
+        Asked::Retargeted => {
+            format!("{target} was retargeted since bx made it. Keep your target, or take bx's?")
+        }
+        Asked::Deleted => format!(
+            "{target} was deleted since bx last wrote it. Keep it deleted, or restore bx's?"
+        ),
+    };
+    let mut choices = if question.asked == Asked::Deleted {
+        DELETED_CHOICES.to_vec()
+    } else {
+        CHOICES.to_vec()
+    };
+    let show = match (&question.three_way, &change.diff) {
+        (Some(_), _) if question.asked == Asked::Deleted => Some(SHOW_RESTORED),
+        (Some(_), _) => Some(SHOW_THREE_WAY),
+        (None, Some(_)) => Some(SHOW_AGAIN),
+        (None, None) => None,
+    };
+    choices.extend(show);
+    (asked, choices)
+}
 
 /// Ask on the terminal what to do about the file `question` names, offering
 /// `choices`.
@@ -432,24 +481,9 @@ fn settled(
     settle: &mut Settle<'_>,
 ) -> Result<Answer, Error> {
     let change = &report.changes[question.row];
-    let target = report::escape(&change.target);
-    let (asked, choices) = if question.deleted {
-        (
-            format!(
-                "{target} was deleted since bx last wrote it. Keep it deleted, or restore bx's?"
-            ),
-            &DELETED_CHOICES,
-        )
-    } else {
-        (
-            format!(
-                "{target} was edited since bx last wrote it. Keep your edit, or take bx's bytes?"
-            ),
-            &CHOICES,
-        )
-    };
+    let (asked, choices) = asked(change, question);
     loop {
-        match settle(&asked, choices)? {
+        match settle(&asked, &choices)? {
             Answer::Show => {
                 let palette = Palette::resolve(env.no_color, env.stdout_tty).within(env.columns);
                 let view =

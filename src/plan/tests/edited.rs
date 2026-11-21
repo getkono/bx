@@ -95,10 +95,34 @@ fn take_writes_bx_bytes_and_rm_restores_the_edit_and_its_mode_exactly() {
     let home = guarded_home();
     let inputs = edited(&home, "new\\n");
 
+    let planned = plan(&inputs);
+    assert_eq!(planned.questions[0].asked, Asked::Edited);
     let taken = answer(&inputs, true, &[0]);
 
     assert!(taken.executed);
     assert_eq!(taken.actions(), vec![Action::Modify]);
+    // What the row said stays — the mode bx puts back with it above all —
+    // and what the answer did takes the question's place.
+    assert_eq!(
+        planned.changes[0].note.as_deref(),
+        Some(
+            format!(
+                "edited since bx last wrote it; mode 0600 -> 0644; {}",
+                decide::ASK
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(
+        taken.changes[0].note.as_deref(),
+        Some(
+            format!(
+                "edited since bx last wrote it; mode 0600 -> 0644; {}",
+                super::super::TAKEN
+            )
+            .as_str()
+        )
+    );
     assert_eq!(exit(&taken, Mode::Apply), Exit::Converged);
     assert_eq!(std::fs::read(home.child(".a")).expect("bx's"), b"new\n");
     assert_eq!(mode_of(&home.child(".a")), 0o644);

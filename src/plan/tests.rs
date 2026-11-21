@@ -693,7 +693,7 @@ fn decision_22_a_mode_the_user_changed_on_a_file_bx_owns_is_a_conflict() {
     assert!(
         report.changes[0].note.as_deref().is_some_and(|note| note
             .starts_with("its mode changed since bx wrote it")
-            && note.contains(decide::ASK)),
+            && note.contains(decide::ASK_MODE)),
         "a mode change is asked about, as an edit is: {:?}",
         report.changes[0].note
     );

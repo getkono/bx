@@ -72,7 +72,7 @@ fn a_region_edited_inside_is_asked_about_and_keep_changes_nothing() {
             .note
             .as_deref()
             .is_some_and(|note| note.starts_with("bx's region was edited since")
-                && note.ends_with(decide::ASK)),
+                && note.ends_with(decide::ASK_REGION)),
         "{:?}",
         planned.changes[at].note
     );
@@ -81,6 +81,7 @@ fn a_region_edited_inside_is_asked_about_and_keep_changes_nothing() {
         "the row's diff shows it"
     );
     assert_eq!(planned.questions[0].three_way, None);
+    assert_eq!(planned.questions[0].asked, Asked::Region);
 
     let kept = answer(&inputs, &[]);
     assert_eq!(kept.changes[at].action, Action::Conflict);
@@ -95,11 +96,20 @@ fn a_region_edited_inside_is_asked_about_and_keep_changes_nothing() {
 fn take_over_a_region_edited_inside_and_rm_restores_the_edit_exactly() {
     let home = guarded_home();
     let (inputs, edited) = region_edited_inside(&home);
-    let at = zshrc(&plan(&inputs));
+    let planned = plan(&inputs);
+    let at = zshrc(&planned);
 
     let taken = answer(&inputs, &[at]);
     assert!(taken.executed);
     assert_eq!(taken.changes[at].action, Action::Modify);
+    assert_eq!(
+        taken.changes[at].note,
+        planned.changes[at]
+            .note
+            .as_deref()
+            .map(|note| note.replace(decide::ASK_REGION, super::super::TAKEN_REGION)),
+        "the row's note stays, with what the answer did in place of the question"
+    );
     let now = std::fs::read_to_string(home.child(".zshrc")).expect("bx's region");
     assert!(now.starts_with("mine\n"), "the bytes around it stay: {now}");
     assert!(!now.contains("edited") && !now.contains("~/.old"), "{now}");
@@ -162,11 +172,34 @@ fn take_over_a_mode_changed_on_bxs_bytes_and_rm_restores_the_users_mode() {
     let planned = plan(&written);
     assert_eq!(planned.actions(), vec![Action::Conflict]);
     assert_eq!(planned.questions.len(), 1);
+    assert_eq!(planned.questions[0].asked, Asked::Mode);
+    assert_eq!(planned.questions[0].three_way, None, "the bytes are bx's");
+    assert_eq!(
+        planned.changes[0].note.as_deref(),
+        Some(
+            format!(
+                "its mode changed since bx wrote it; mode 0600 -> 0644; {}",
+                decide::ASK_MODE
+            )
+            .as_str()
+        )
+    );
     assert!(!answer(&written, &[]).executed, "keep writes nothing");
     assert_eq!(snapshot(home.path(), &[]), before);
 
     let taken = answer(&written, &[0]);
     assert!(taken.executed);
+    assert_eq!(
+        taken.changes[0].note.as_deref(),
+        Some(
+            format!(
+                "its mode changed since bx wrote it; mode 0600 -> 0644; {}",
+                super::super::TAKEN_MODE
+            )
+            .as_str()
+        ),
+        "the mode note stays"
+    );
     assert_eq!(mode_of(&home.child(".a")), 0o644, "bx's mode");
     assert_eq!(std::fs::read(home.child(".a")).expect("bx's"), b"bx\n");
     let again = plan(&written);
@@ -185,6 +218,9 @@ fn take_over_a_retargeted_link_and_rm_restores_the_users_text() {
     std::fs::remove_file(home.child(".tool")).expect("unlink");
     std::os::unix::fs::symlink("/opt/theirs", home.child(".tool")).expect("retarget");
     let inputs = inputs(&home, &symlink("~/.tool", "/opt/two"));
+    let planned = plan(&inputs);
+    assert_eq!(planned.questions[0].asked, Asked::Retargeted);
+    assert_eq!(planned.questions[0].three_way, None);
 
     assert!(!answer(&inputs, &[]).executed, "keep writes nothing");
     assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/theirs"));
@@ -192,6 +228,16 @@ fn take_over_a_retargeted_link_and_rm_restores_the_users_text() {
     let taken = answer(&inputs, &[0]);
     assert!(taken.executed);
     assert_eq!(taken.actions(), vec![Action::Modify]);
+    assert_eq!(
+        taken.changes[0].note.as_deref(),
+        Some(
+            format!(
+                "retargeted since bx made it; {}",
+                super::super::TAKEN_RETARGETED
+            )
+            .as_str()
+        )
+    );
     assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/two"));
     let again = plan(&inputs);
     assert_eq!(again.actions(), vec![Action::Unchanged]);
@@ -205,7 +251,7 @@ fn take_over_a_retargeted_link_and_rm_restores_the_users_text() {
 /// no note saying `apply` asks.
 fn asks_nothing(report: &Report) -> bool {
     let notes = report.changes[0].note.as_deref().unwrap_or_default();
-    report.questions.is_empty() && !notes.contains(decide::ASK)
+    report.questions.is_empty() && !notes.contains("at a terminal, bx apply and bx sync ask")
 }
 
 #[test]

@@ -40,7 +40,7 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
 fn the_question(report: &Report) -> &Question {
     assert_eq!(report.questions.len(), 1, "{:?}", report.questions);
     let question = &report.questions[0];
-    assert!(question.deleted, "{question:?}");
+    assert_eq!(question.asked, Asked::Deleted, "{question:?}");
     question
 }
 
@@ -138,10 +138,8 @@ fn a_file_deleted_while_bx_wants_something_else_is_a_modify_delete_conflict() {
     let view = the_question(&planned).three_way.clone().expect("a view");
     assert_eq!(
         view.kind,
-        DiffKind::Text(
-            "--- ~/.a (bx wrote)\n+++ ~/.a (bx wants)\n@@ -1 +1 @@\n-bx\n+new\n".to_string()
-        ),
-        "measured from what bx last wrote"
+        DiffKind::Text("--- ~/.a (deleted)\n+++ ~/.a (bx's)\n@@ -0,0 +1 @@\n+new\n".to_string()),
+        "what restoring writes, not what changed since bx wrote it"
     );
 
     keeping_writes_nothing_twice(&home, &inputs, ".a", Action::Conflict);
@@ -163,7 +161,81 @@ fn a_mode_change_alone_makes_a_deletion_a_conflict() {
         &home,
         &format!("{}mode = \"0600\"\n", inline("~/.a", "bx\\n")),
     );
-    assert_eq!(plan(&inputs).actions(), vec![Action::Conflict]);
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Conflict]);
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.contains("; mode 0644 -> 0600"), "{note}");
+    let view = the_question(&planned).three_way.clone().expect("a view");
+    assert_eq!(
+        view.kind,
+        DiffKind::Text("--- ~/.a (deleted)\n+++ ~/.a (bx's)\n@@ -0,0 +1 @@\n+bx\n".to_string()),
+        "the bytes restoring writes, under the note naming its mode"
+    );
+
+    // The answer's note follows what the row said, rather than replacing it.
+    let restored = answer(&inputs, &[0]);
+    let note = restored.changes[0].note.as_deref().expect("a note");
+    assert!(
+        note.starts_with(&format!("{}; mode 0644 -> 0600; ", decide::DELETED_CHANGED)),
+        "{note}"
+    );
+    assert!(note.ends_with(super::super::RESTORED), "{note}");
+    assert!(!note.contains(decide::ASK_DELETED), "{note}");
+    assert_eq!(mode_of(&home.child(".a")), 0o600);
+}
+
+#[test]
+fn a_deleted_secret_s_view_is_a_summary_that_shows_no_plaintext() {
+    let home = guarded_home();
+    let recipient = age_identity(&home);
+    seal(&home, &recipient, b"hunter2\n");
+    let inputs = inputs(&home, SECRET_TARGET);
+    assert!(apply(&inputs).executed);
+    std::fs::remove_file(home.child(".token")).expect("the deletion");
+
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Unchanged]);
+    let view = the_question(&planned).three_way.clone().expect("a view");
+    assert_eq!(
+        view.kind,
+        DiffKind::Summary {
+            before: None,
+            after: 8,
+            why: crate::plan::diff::Why::Secret
+        }
+    );
+    let shown = render_row(
+        &planned.changes[0],
+        Some(&view),
+        Palette::PLAIN,
+        home.path(),
+    );
+    assert!(
+        shown.contains("secret, not shown: no file -> 8 bytes"),
+        "{shown}"
+    );
+    assert!(!shown.contains("hunter2"), "{shown}");
+}
+
+#[test]
+fn a_deleted_file_over_the_kept_limit_is_summarised_as_too_large() {
+    let home = guarded_home();
+    let body = "x".repeat(crate::plan::track::Base::KEPT_WHOLE + 1);
+    let declared = inline("~/.a", &body);
+    let written = inputs(&home, &declared);
+    assert!(apply(&written).executed);
+    std::fs::remove_file(home.child(".a")).expect("the deletion");
+
+    let planned = plan(&written);
+    let view = the_question(&planned).three_way.clone().expect("a view");
+    assert_eq!(
+        view.kind,
+        DiffKind::Summary {
+            before: None,
+            after: body.len(),
+            why: crate::plan::diff::Why::TooLarge
+        }
+    );
 }
 
 #[test]
@@ -254,6 +326,19 @@ fn restoring_into_a_deleted_directory_announces_the_directory_it_creates() {
 
     let restored = answer(&written, &[0]);
     assert_eq!(restored.actions(), vec![Action::Create]);
+    let note = restored.changes[0].note.as_deref().expect("a note");
+    assert!(
+        note.contains("creates ~/.config/tool 0755"),
+        "the directories it created are still said: {note}"
+    );
+    assert!(
+        note.starts_with(&format!(
+            "deleted since bx wrote it; {}",
+            super::super::RESTORED
+        )),
+        "the deletion no longer stands: {note}"
+    );
+    assert!(!note.contains(decide::DELETED), "{note}");
     assert_eq!(
         std::fs::read(home.child(".config/tool/a")).expect("restored"),
         b"bx\n"
@@ -330,7 +415,7 @@ fn a_generated_file_outside_bx_s_data_directory_follows_the_deletion_rule() {
         .find(|change| change.target == path)
         .expect("the file's row");
     assert_eq!(row.action, Action::Unchanged, "{:?}", row.note);
-    assert!(the_question(&planned).deleted);
+    the_question(&planned);
 }
 
 #[test]

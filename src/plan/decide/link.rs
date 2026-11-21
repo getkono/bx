@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use super::parent::{Write, created_dirs, locked_parent};
-use super::{ASK, ASK_DELETED, Ctx, Made, Op, attached_as, deleted, join, portable_reason};
+use super::{
+    ASK_DELETED, ASK_RETARGETED, Ctx, Made, Op, attached_as, deleted, join, portable_reason,
+};
 use crate::config::target::Target;
 use crate::fs::{self, Kind, Mode, Observed};
 use crate::plan::{Change, Diff, Error};
@@ -88,7 +90,7 @@ pub(super) fn decide_link(
     // Making a link writes an entry in its parent, as a file's write does.
     let locked = locked_parent(&observed, ctx.home, ctx.declared, Write::File);
     let ask = (gone || retargeted) && locked.is_none();
-    let asked = if gone { ASK_DELETED } else { ASK };
+    let asked = if gone { ASK_DELETED } else { ASK_RETARGETED };
     let (action, note) = match (action.is_pending(), locked) {
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
         _ if ask => (action, join([note, Some(asked.to_string())])),
@@ -363,7 +365,7 @@ mod tests {
         assert_eq!(planned.actions(), vec![Action::Conflict; 2]);
         assert_eq!(
             planned.changes[0].note.as_deref(),
-            Some(format!("retargeted since bx made it; {ASK}").as_str())
+            Some(format!("retargeted since bx made it; {ASK_RETARGETED}").as_str())
         );
         let asked: Vec<_> = planned.questions.iter().map(|q| q.row).collect();
         assert_eq!(asked, vec![0], "only the retargeted link is asked about");

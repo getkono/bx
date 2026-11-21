@@ -300,11 +300,16 @@ impl Op {
     /// now, then against what bx wants there.
     ///
     /// `None` where there is no such view to show: a write that is not a whole
-    /// file bx keeps a base for, no `base` kept, or a side that is not shown
-    /// line by line. The row's own diff is all there is then.
+    /// file bx keeps a base for — a region, a link, a secret, a file over
+    /// [`Base::KEPT_WHOLE`] — no `base` kept, or a side that is not shown
+    /// line by line. The row's own diff is all there is then, and the
+    /// question offers no view beside it.
+    ///
+    /// A deleted target's view is what restoring it writes: see
+    /// [`Op::restored`].
     pub(super) fn three_way(&self, base: Option<&[u8]>) -> Option<Diff> {
         if self.deleted() {
-            return self.restored(base);
+            return self.restored();
         }
         let wanted = self.base()?;
         let base = base?;
@@ -334,24 +339,44 @@ impl Op {
         self.planned.kind == Kind::Absent
     }
 
-    /// The view a question about a deleted target offers: what bx last wrote
-    /// against what bx wants there now, where the two differ, and otherwise
-    /// what restoring it writes. `None` for a file kept no base for, a secret
-    /// above all.
-    fn restored(&self, base: Option<&[u8]>) -> Option<Diff> {
+    /// The view a question about a deleted target offers: what restoring it
+    /// writes, from nothing, whatever bx last wrote there. A mode it is
+    /// restored at that is not the one bx last set is said in the row's note
+    /// (see [`deleted`]), which the view is drawn under.
+    ///
+    /// A file kept no base for is only summarised, by size: a secret, whose
+    /// plaintext is never shown, or one over [`Base::KEPT_WHOLE`], which
+    /// cannot be told from a secret here and is summarised as too large.
+    fn restored(&self) -> Option<Diff> {
         let target = self.target.as_str();
         match &self.made {
             Made::Link(text) => Some(Diff::link(None, Some(text))),
-            Made::Bytes(_) => {
-                let wanted = self.base()?;
-                match base {
-                    Some(base) if base != wanted => {
-                        Diff::labelled(target, ("bx wrote", "bx wants"), Some(base), wanted, None)
-                    }
-                    _ => Diff::labelled(target, ("deleted", "bx's"), None, wanted, None),
-                }
-            }
+            Made::Bytes(bytes) => match self.base() {
+                Some(wanted) => Diff::labelled(target, ("deleted", "bx's"), None, wanted, None),
+                None => Some(Diff {
+                    kind: super::diff::DiffKind::Summary {
+                        before: None,
+                        after: bytes.len(),
+                        why: if bytes.len() > Base::KEPT_WHOLE {
+                            super::diff::Why::TooLarge
+                        } else {
+                            super::diff::Why::Secret
+                        },
+                    },
+                }),
+            },
             _ => None,
+        }
+    }
+
+    /// What changed since bx left this write's target, as its question asks
+    /// it: `entry` is what the ledger says bx last left there.
+    pub(super) fn asked(&self, entry: Option<&LedgerEntry>) -> super::Asked {
+        match &self.made {
+            _ if self.deleted() => super::Asked::Deleted,
+            Made::Link(_) => super::Asked::Retargeted,
+            Made::Region(..) => super::Asked::Region,
+            _ => asked_whole(&self.planned, entry),
         }
     }
 
@@ -555,11 +580,20 @@ pub(super) fn decide(
     // edited file is asked about only where its write could land.
     let locked = locked_parent(&observed, ctx.home, ctx.declared, Write::File);
     let ask = edited && locked.is_none();
-    let asked = if gone { ASK_DELETED } else { ASK };
+    // Worded as the question is, for what was changed: see [`Op::asked`].
+    let asked = || {
+        match target.attach {
+            _ if gone => super::Asked::Deleted,
+            Attach::Region { .. } => super::Asked::Region,
+            _ => asked_whole(&observed, entry),
+        }
+        .ask()
+        .to_string()
+    };
     let (action, note) = match (action.is_pending(), locked) {
         (true, Some(_)) if claim => (Action::Unchanged, unclaimed),
         (true, Some(why)) => (Action::Conflict, join([Some(why), note])),
-        _ if ask => (action, join([note, Some(asked.to_string())])),
+        _ if ask => (action, join([note, Some(asked())])),
         _ => (action, note),
     };
 
@@ -662,9 +696,34 @@ fn changed_since(attach: &Attach, observed: &Observed, entry: &LedgerEntry) -> b
     }
 }
 
+/// What was changed since bx left a file it owns whole, `observed` now and
+/// `entry` what bx last left: its mode alone where the bytes are still bx's,
+/// and otherwise its bytes.
+fn asked_whole(observed: &Observed, entry: Option<&LedgerEntry>) -> super::Asked {
+    match entry {
+        Some(entry) if observed.digest() == Some(entry.written) => super::Asked::Mode,
+        _ => super::Asked::Edited,
+    }
+}
+
 /// The note an edited file's row ends with: what `apply` does about it.
 pub(super) const ASK: &str = "at a terminal, bx apply and bx sync ask whether to keep your edit or \
                               take bx's bytes, keeping yours for bx rm";
+
+/// The note a row ends with whose file's mode alone was changed since bx set
+/// it: what `apply` does about it.
+pub(super) const ASK_MODE: &str = "at a terminal, bx apply and bx sync ask whether to keep your \
+                                   mode or take bx's, keeping yours for bx rm";
+
+/// The note a row ends with whose region of bx's was edited inside its
+/// markers: what `apply` does about it.
+pub(super) const ASK_REGION: &str = "at a terminal, bx apply and bx sync ask whether to keep your \
+                                     edit or take bx's region, keeping the file as you left it \
+                                     for bx rm";
+
+/// The note a retargeted link's row ends with: what `apply` does about it.
+pub(super) const ASK_RETARGETED: &str = "at a terminal, bx apply and bx sync ask whether to keep \
+                                         your target or take bx's, keeping yours for bx rm";
 
 /// The whole file a region target leaves, and the mode it leaves it at.
 ///
@@ -1286,6 +1345,10 @@ fn own_data(target: &Target) -> bool {
 /// Either way nothing is written unless the question its row ends with is
 /// answered *restore*: the deletion is the user's act, as an edit is, and a
 /// rewrite would undo it.
+///
+/// A mode the target wants that is not the one bx last set is named in the
+/// note, as a mode drift is, since the view of what restoring writes shows
+/// the bytes alone.
 fn deleted(
     entry: &LedgerEntry,
     wanted: ContentHash,
@@ -1295,9 +1358,10 @@ fn deleted(
     if wanted == entry.written && mode == entry.mode {
         (Action::Unchanged, join([Some(DELETED.to_string()), note]))
     } else {
+        let moded = (mode != entry.mode).then(|| format!("mode {} -> {mode}", entry.mode));
         (
             Action::Conflict,
-            join([Some(DELETED_CHANGED.to_string()), note]),
+            join([Some(DELETED_CHANGED.to_string()), moded, note]),
         )
     }
 }

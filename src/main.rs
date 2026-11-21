@@ -33,7 +33,12 @@ enum Command {
     /// Begin managing a config file, or a directory of them
     Add { target: Option<String> },
     /// Stop managing it, and restore the original
-    Rm { target: Option<String> },
+    Rm {
+        target: Option<String>,
+        /// Hand back without asking for confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// The diff `apply` would make
     Plan,
     /// Converge this machine to the repo
@@ -189,9 +194,13 @@ fn main() -> Result<()> {
         Some(Command::Add { target }) => {
             bx::command::add(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
         }
-        Some(Command::Rm { target }) => {
-            bx::command::rm(&env, &std::env::current_dir()?, target.as_deref(), &mut out)?
-        }
+        Some(Command::Rm { target, yes }) => bx::command::rm(
+            &env,
+            &std::env::current_dir()?,
+            target.as_deref(),
+            yes,
+            &mut out,
+        )?,
         // Every command is named: one without a body is refused, not panicked
         // on, and a new one without an arm does not compile.
         Some(Command::ShellInit { .. }) => {

@@ -228,7 +228,7 @@ impl Machine {
     /// back everything under it.
     fn rm_everything(&self) {
         for path in MANAGED {
-            self.bx(&["rm", path]).converged();
+            self.bx(&["rm", "--yes", path]).converged();
         }
     }
 
@@ -944,7 +944,9 @@ fn adopting_a_file_takes_it_verbatim_and_rm_hands_it_back() {
     assert_same(&before, &machine.the_accounts(), "add wrote to the home");
     machine.bx(&["plan"]).converged();
 
-    machine.bx(&["rm", ".config/tmux/tmux.conf"]).converged();
+    machine
+        .bx(&["rm", "--yes", ".config/tmux/tmux.conf"])
+        .converged();
     assert_eq!(
         std::fs::read(&tmux).expect("tmux.conf"),
         b"set -g mouse on\n"

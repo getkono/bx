@@ -200,7 +200,9 @@ pub trait Ask {
     fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error>;
 }
 
-/// [`Ask`] on the terminal, through `inquire`.
+/// [`Ask`] on the terminal, through `inquire`. Each question first discards
+/// what was typed ahead on the terminal, so a key pressed
+/// before it was shown never answers it.
 #[derive(Debug, Default)]
 pub struct Terminal;
 
@@ -218,20 +220,22 @@ impl Ask for Terminal {
             },
             |problem| format!("{problem}; try again"),
         );
-        inquire::Text::new(&label)
-            .with_help_message(&help)
-            .prompt()
-            .map_err(Error::from_prompt)
+        crate::command::asked_afresh(|| {
+            inquire::Text::new(&label).with_help_message(&help).prompt()
+        })
+        .map_err(Error::from_prompt)
     }
 
     fn adopt(&mut self, offered: &[Portable]) -> Result<Vec<Portable>, Error> {
         let shown: Vec<&str> = offered.iter().map(Portable::as_str).collect();
-        let picked = inquire::MultiSelect::new("Manage which of these with bx?", shown)
-            .with_help_message(
-                "space selects, enter confirms; nothing is selected until you pick it",
-            )
-            .raw_prompt()
-            .map_err(Error::from_prompt)?;
+        let picked = crate::command::asked_afresh(|| {
+            inquire::MultiSelect::new("Manage which of these with bx?", shown)
+                .with_help_message(
+                    "space selects, enter confirms; nothing is selected until you pick it",
+                )
+                .raw_prompt()
+        })
+        .map_err(Error::from_prompt)?;
         Ok(picked
             .into_iter()
             .map(|option| offered[option.index].clone())

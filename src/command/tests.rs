@@ -1607,6 +1607,28 @@ fn a_confirmation_discards_what_was_typed_before_it_was_asked() {
     assert_eq!(rustix::io::ioctl_fionread(&read).expect("a pipe"), 2);
 }
 
+#[test]
+fn every_question_is_put_once_what_was_typed_ahead_is_gone() {
+    // `asked_afresh` is what the confirmation, the question about an edited
+    // file, `init`'s value and adoption questions and the passphrase prompt
+    // are put through: a `y` and Enter typed ahead must be gone by the time
+    // each is asked.
+    let (keyboard, terminal) = pseudo_terminal();
+    rustix::io::write(&keyboard, b"y\r").expect("a y and Enter typed ahead");
+    assert_eq!(
+        waiting(&terminal, std::time::Duration::from_secs(5)),
+        2,
+        "what was typed waits on the terminal"
+    );
+    let left = asked_afresh_on(&terminal, || {
+        waiting(&terminal, std::time::Duration::from_millis(200))
+    });
+    assert_eq!(left, 0, "the question finds nothing typed ahead to read");
+
+    // What the question returns is what the call returns.
+    assert_eq!(asked_afresh(|| "answered"), "answered");
+}
+
 mod doctor_command;
 mod edited_command;
 mod rm_command;

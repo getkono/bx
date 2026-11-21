@@ -77,6 +77,28 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     )
 }
 
+/// What doctor says of the config repo `root` that loading found missing.
+///
+/// Loading finds it missing when nothing is there, when something that is not
+/// a directory is, and when it lies beneath a non-directory; only the first
+/// is one `bx init` mends as it stands, so each is said as it is.
+fn no_repo_note(root: &Path) -> &'static str {
+    match std::fs::metadata(root) {
+        Ok(_) => {
+            "is not a directory, so there is no configuration to check; move it aside, and \
+             `bx init` creates the config repo"
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+            "lies beneath a path that is not a directory, so there is no configuration to \
+             check; `bx init` creates the config repo once that path is a directory"
+        }
+        Err(_) => {
+            "does not exist, so there is no configuration to check; `bx init` creates the \
+             config repo"
+        }
+    }
+}
+
 /// [`doctor`], looking for declared tools along `path`, asking systemd
 /// through `systemd`, and asking `git` about the config repo.
 fn doctor_with(
@@ -92,13 +114,12 @@ fn doctor_with(
         // failure to look: said as a finding, and nothing else is checked,
         // as every other check reads the configuration.
         Err(Error::RepoMissing(repo)) => {
+            let root = paths::config_root_in(&env.home, env.xdg_config_home.as_deref());
             let report = doctor::Report {
                 findings: vec![doctor::Finding {
                     subject: repo,
                     origin: None,
-                    note: "does not exist, so there is no configuration to check; `bx init` \
-                           creates the config repo"
-                        .to_string(),
+                    note: no_repo_note(&root).to_string(),
                 }],
                 notes: Vec::new(),
             };

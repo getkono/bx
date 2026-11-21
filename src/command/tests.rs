@@ -1360,6 +1360,44 @@ fn doctor_without_a_repo_is_a_finding_and_writes_nothing() {
 }
 
 #[test]
+fn doctor_with_a_non_directory_for_a_repo_says_so_and_writes_nothing() {
+    let home = guarded_home();
+    std::fs::create_dir_all(home.path().join(".config")).expect("the config home");
+    std::fs::write(home.path().join(".config/bx"), "x").expect("a file where the repo goes");
+    let before = crate::plan::tests::snapshot(home.path(), &[]);
+
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx is not a directory, so there is no configuration to check; move it \
+         aside, and `bx init` creates the config repo\n\
+         Doctor: 1 finding(s).\n"
+    );
+    assert_eq!(crate::plan::tests::snapshot(home.path(), &[]), before);
+}
+
+#[test]
+fn doctor_with_a_repo_beneath_a_non_directory_says_so() {
+    let home = guarded_home();
+    std::fs::write(home.path().join(".config"), "x").expect("a file where the config home goes");
+
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx lies beneath a path that is not a directory, so there is no \
+         configuration to check; `bx init` creates the config repo once that path is a \
+         directory\n\
+         Doctor: 1 finding(s).\n"
+    );
+}
+
+#[test]
 fn doctor_without_an_output_is_an_error() {
     let home = guarded_home();
     seed(home.path(), "");

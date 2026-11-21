@@ -1,7 +1,7 @@
 use super::super::{Inputs, Mode, Report, run};
 use super::*;
-use crate::plan::DiffKind;
 use crate::plan::tests::inputs;
+use crate::plan::{Asked, DiffKind};
 use crate::restore::{self, Restored};
 use crate::testing::git::{commit_all, run as git_run};
 use crate::testing::{GuardedHome, guarded_home};
@@ -1905,6 +1905,82 @@ fn a_pending_child_something_of_the_users_stands_at_is_reported_as_stopped() {
         "the user's own\n"
     );
     assert!(home.child(".claude/skills/a/SKILL.md").is_file());
+}
+
+/// A child bx made, retargeted or deleted since, whose link is pending again:
+/// the questions were put before its commit was here, so its row promises
+/// the next run's question rather than this one's, nothing is written over
+/// the user's act, and the next run asks.
+#[test]
+fn a_pending_child_changed_since_bx_made_it_is_asked_by_the_next_run() {
+    let home = guarded_home();
+    upstream(&home);
+    let rev = commit_upstream(&home, &["skills/a/SKILL.md", "skills/b/SKILL.md"]);
+    lock(&home, URL, "master", &rev);
+    let layer = linking("master");
+    assert!(apply(&home, &layer).stopped.is_empty());
+    let (a, b) = (
+        home.child(".claude/skills/a"),
+        home.child(".claude/skills/b"),
+    );
+    std::fs::remove_file(&a).expect("the deletion");
+    std::fs::remove_file(&b).expect("the old link");
+    std::os::unix::fs::symlink("elsewhere", &b).expect("the user's link");
+    // A commit fetched but not checked out yet, so the link is pending.
+    let next = commit_upstream(&home, &["skills/d/SKILL.md"]);
+    git_run(
+        home.path(),
+        &home.child(AT),
+        &["fetch", "--quiet", "origin"],
+    );
+    lock(&home, URL, "master", &next);
+    assert_eq!(
+        row(&plan(&home, &layer), "~/.claude/skills/*").action,
+        Action::Create
+    );
+
+    let applied = apply(&home, &layer);
+
+    assert!(applied.questions.is_empty(), "{:?}", applied.questions);
+    assert_eq!(stopped(&applied), ["~/.claude/skills/b"]);
+    for (child, action, ask) in [
+        ("~/.claude/skills/a", Action::Unchanged, Asked::Deleted),
+        ("~/.claude/skills/b", Action::Conflict, Asked::Retargeted),
+    ] {
+        let row = row(&applied, child);
+        assert_eq!(row.action, action, "{child}");
+        let note = row.note.as_deref().expect("a note");
+        assert!(!note.contains(ask.ask()), "{child}: promised now: {note}");
+        assert!(note.ends_with(super::super::ASK_NEXT), "{child}: {note}");
+    }
+    assert!(
+        std::fs::symlink_metadata(&a).is_err(),
+        "the deletion stands"
+    );
+    assert_eq!(
+        std::fs::read_link(&b).expect("kept"),
+        Path::new("elsewhere")
+    );
+    assert!(home.child(".claude/skills/d/SKILL.md").is_file());
+
+    let next_run = plan(&home, &layer);
+    let asked: Vec<_> = next_run
+        .questions
+        .iter()
+        .map(|question| {
+            (
+                next_run.changes[question.row].target.as_str(),
+                question.asked,
+            )
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            ("~/.claude/skills/a", Asked::Deleted),
+            ("~/.claude/skills/b", Asked::Retargeted)
+        ]
+    );
 }
 
 #[test]

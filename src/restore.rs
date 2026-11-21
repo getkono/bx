@@ -47,7 +47,9 @@
 //! # `plan` and `rm` share one function
 //!
 //! [`plan_restore_with`] and [`plan_restore_undeclared`] decide what will
-//! happen to one target and write nothing; [`restore_undeclared_with`] decides
+//! happen to one target and write nothing, and [`preview_undeclared_with`]
+//! says what that comes to for each target `rm` is about to ask about;
+//! [`restore_undeclared_with`] decides
 //! each target the same way and then does exactly what that said. That is
 //! Invariant 7 applied to the removal path: `rm` cannot do work its own
 //! preview did not announce.
@@ -250,6 +252,13 @@ impl Restored {
         matches!(self, Self::Conflict { .. })
     }
 
+    /// Whether carrying it out writes a file or forgets a ledger entry: every
+    /// row but a conflict and a target bx never wrote.
+    #[must_use]
+    pub const fn changes(&self) -> bool {
+        !matches!(self, Self::Conflict { .. } | Self::Unmanaged { .. })
+    }
+
     /// The target this is about.
     #[must_use]
     pub const fn target(&self) -> &Portable {
@@ -306,6 +315,109 @@ pub fn plan_restore_undeclared(
     git: &Git,
 ) -> Result<Restoration, Error> {
     plan(entry, home, git, Declared::No)
+}
+
+/// What starts the way out [`way_out`] appends to a conflict's note.
+const WAY_OUT: &str = "; to hand it back, ";
+
+/// The way out of an edit `rm` refuses to restore over, for the declared
+/// file at `target`, to follow a conflict's note: save the edit, or take
+/// bx's bytes back, and `rm` again. The path is the portable one the user
+/// typed, never a digest.
+///
+/// # Decision: the way out names both directions
+///
+/// The edit is the user's and the bytes bx left are the repo's, and only the
+/// user knows which should win, so the note offers both rather than guessing:
+/// `bx add` carries the edit into the repo, and `bx apply` asks whether to
+/// take bx's bytes back. Either leaves the file as bx last wrote it, which is
+/// what lets the next `rm` put back what it replaced.
+fn way_out(target: &Portable) -> String {
+    format!(
+        "{WAY_OUT}save your edit into the repo with `bx add {target}` or take bx's bytes back \
+         with `bx apply`, then run `bx rm {target}` again"
+    )
+}
+
+/// `note` without the way out [`way_out`] appended to it: what is said about
+/// a file `rm` hands back through another, such as a tracked target's repo
+/// copy, whose own way out would name the wrong path.
+#[must_use]
+pub(crate) fn without_way_out(note: &str) -> &str {
+    note.split_once(WAY_OUT).map_or(note, |(cause, _)| cause)
+}
+
+/// What `rm` will report for `target` once `restoration` is carried out: the
+/// row [`restore_undeclared_with`] returns when nothing fails part way.
+fn announced(target: &Portable, restoration: &Restoration) -> Restored {
+    let target = target.clone();
+    match restoration {
+        Restoration::AlreadyGone { dest } => Restored::AlreadyGone {
+            target,
+            dest: dest.clone(),
+        },
+        Restoration::Keep { dest } => Restored::Kept {
+            target,
+            dest: dest.clone(),
+        },
+        Restoration::Conflict { dest, note } => Restored::Conflict {
+            target,
+            dest: dest.clone(),
+            note: note.clone(),
+        },
+        Restoration::Release { dest }
+        | Restoration::RevertMode { dest, .. }
+        | Restoration::Relink { dest, .. }
+        | Restoration::Revert { dest, .. } => Restored::Reverted {
+            target,
+            dest: dest.clone(),
+        },
+        Restoration::RemoveDir { dest, .. }
+        | Restoration::RemoveLink { dest, .. }
+        | Restoration::RemoveClone { dest, .. }
+        | Restoration::Remove { dest, .. } => Restored::Removed {
+            target,
+            dest: dest.clone(),
+        },
+    }
+}
+
+/// What [`restore_undeclared_with`] would do to each of `targets`, decided
+/// from `ledger` as it decides each one, and writing nothing: the preview
+/// `rm` shows before it asks.
+///
+/// A target `ledger` holds no entry for is [`Restored::Unmanaged`], and every
+/// other one is what [`plan_restore_with`], or [`plan_restore_undeclared`]
+/// where `undeclared` names it, decides. A prior snapshot that turns out
+/// missing or corrupt is found only when `rm` reads it, and is then a
+/// conflict, so the preview can promise less than it shows, never more.
+///
+/// # Errors
+///
+/// As [`plan_restore_with`].
+pub fn preview_undeclared_with(
+    ledger: &state::LedgerView,
+    home: &Path,
+    targets: &[Portable],
+    undeclared: &BTreeSet<Portable>,
+    git: &Git,
+) -> Result<Vec<Restored>, Error> {
+    targets
+        .iter()
+        .map(|target| {
+            let Some(entry) = ledger.get(target) else {
+                return Ok(Restored::Unmanaged {
+                    target: target.clone(),
+                });
+            };
+            let declared = if undeclared.contains(target) {
+                Declared::No
+            } else {
+                Declared::Yes
+            };
+            Ok(announced(target, &plan(entry, home, git, declared)?))
+        })
+        .collect()
 }
 
 /// Whether the configuration still declares the target being restored.
@@ -411,10 +523,9 @@ fn plan(
         }),
         (Kind::File, _) => Ok(Restoration::Conflict {
             note: format!(
-                "has been edited since bx wrote it (bx left {}); \
-                 restoring the file bx replaced would destroy those edits, \
-                 so bx is leaving it and forgetting nothing",
-                entry.written,
+                "has been edited since bx wrote it, and restoring the file bx replaced would \
+                 destroy those edits, so bx is leaving it and forgetting nothing{}",
+                way_out(&entry.path),
             ),
             dest,
         }),
@@ -525,11 +636,8 @@ fn plan_restore_link(
             })
         }
         Kind::Symlink => Restoration::Conflict {
-            note: format!(
-                "has been retargeted since bx made it (bx left {}); bx is leaving it and \
-                 forgetting nothing",
-                entry.written,
-            ),
+            note: "has been retargeted since bx made it; bx is leaving it and forgetting nothing"
+                .to_string(),
             dest,
         },
         kind => Restoration::Conflict {

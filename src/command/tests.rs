@@ -35,6 +35,13 @@ fn prompts_child() {
     // write bx's bytes over the edit.
     let settled = ask_edited("~/.a was edited", &CHOICES);
     assert!(matches!(settled, Err(Error::Prompt(NotTTY))), "{settled:?}");
+    // Nor is there one to `rm`'s question: inventing one would hand back
+    // what nobody confirmed.
+    let removing = confirm_rm();
+    assert!(
+        matches!(removing, Err(adopt::Error::Prompt(NotTTY))),
+        "{removing:?}"
+    );
     assert!(
         matches!(ask_passphrase("~/.ssh/id_ed25519"), Asked::Nothing),
         "a prompt with no terminal is no passphrase, and not one left with Esc"
@@ -1488,6 +1495,7 @@ fn a_confirmation_discards_what_was_typed_before_it_was_asked() {
 
 mod doctor_command;
 mod edited_command;
+mod rm_command;
 mod sync_command;
 mod update_check_command;
 mod update_command;

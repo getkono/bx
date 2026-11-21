@@ -1314,22 +1314,112 @@ fn adoption_row(row: &Adoption) -> String {
 /// `bx rm PATH`: stop managing a target, or every target beneath a directory,
 /// restoring what bx displaced.
 ///
-/// Exits 0 when everything was handed back, or nothing was managed there, and
-/// 2 when a conflict left something as it was.
+/// What it is about to do is shown first, one row per target, and carried
+/// out only once approved: by `yes`, or by the answer to a prompt when
+/// standard input is a terminal. With neither, the rows are shown and
+/// nothing is changed. A preview with nothing to change is not asked about.
+///
+/// Exits 0 when everything was handed back, or nothing was managed there, 2
+/// when a conflict left something as it was or the prompt was declined, and
+/// 130 when the prompt was abandoned.
 ///
 /// # Errors
 ///
-/// Whatever locating, loading or restoring returns.
-pub fn rm(env: &Env, cwd: &Path, path: &str, out: &mut dyn Write) -> Result<Exit, adopt::Error> {
+/// [`adopt::Error::NeedsConfirmation`] with something to change, no `yes`
+/// and no terminal, and whatever locating, loading, asking or restoring
+/// returns. [`adopt::Error::Undeclare`] comes
+/// after the rows it holds are written.
+pub fn rm(
+    env: &Env,
+    cwd: &Path,
+    path: &str,
+    yes: bool,
+    out: &mut dyn Write,
+) -> Result<Exit, adopt::Error> {
+    rm_with(env, cwd, path, yes, out, &mut confirm_rm)
+}
+
+/// Ask on the terminal whether to carry out the rows `rm` showed. The
+/// default is **no**, and what was typed ahead is discarded, as [`confirm`]
+/// does.
+fn confirm_rm() -> Result<bool, adopt::Error> {
+    discard_typeahead(std::io::stdin());
+    inquire::Confirm::new("Stop managing these and hand them back?")
+        .with_default(false)
+        .prompt()
+        .map_err(|error| {
+            if init::abandoned(&error) {
+                adopt::Error::Canceled
+            } else {
+                adopt::Error::Prompt(error)
+            }
+        })
+}
+
+/// [`rm`], with the confirmation asked through `ask`.
+fn rm_with(
+    env: &Env,
+    cwd: &Path,
+    path: &str,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
+) -> Result<Exit, adopt::Error> {
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
-    let removals = adopt::rm(&ctx, &target)?;
+    let home = ctx.home().to_path_buf();
+    let decided = adopt::rm_asking(&ctx, &target, &mut |rows| {
+        if yes {
+            return Ok(true);
+        }
+        let mut text = format!("bx rm {target} will:\n");
+        for row in rows {
+            text.push_str(&removal_row(row, &home, Tense::Will));
+        }
+        out.write_all(text.as_bytes())
+            .map_err(adopt::Error::Output)?;
+        out.flush().map_err(adopt::Error::Output)?;
+        if env.stdin_tty {
+            ask()
+        } else {
+            Err(adopt::Error::NeedsConfirmation)
+        }
+    });
+    let removals = match decided {
+        Ok(Some(removals)) => removals,
+        Ok(None) => {
+            writeln!(out, "Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Pending);
+        }
+        Err(adopt::Error::Canceled) => {
+            writeln!(out, "Canceled. Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(adopt::Error::Undeclare {
+            rows,
+            layer,
+            source,
+        }) => {
+            let mut text = String::new();
+            for row in &rows {
+                text.push_str(&removal_row(row, &home, Tense::Did));
+            }
+            out.write_all(text.as_bytes())
+                .map_err(adopt::Error::Output)?;
+            return Err(adopt::Error::Undeclare {
+                rows,
+                layer,
+                source,
+            });
+        }
+        Err(other) => return Err(other),
+    };
     let mut text = String::new();
     if removals.is_empty() {
         text.push_str(&format!("{target} is not managed by bx; nothing to do.\n"));
     }
     for removal in &removals {
-        text.push_str(&removal_row(removal, ctx.home()));
+        text.push_str(&removal_row(removal, &home, Tense::Did));
     }
     out.write_all(text.as_bytes())
         .map_err(adopt::Error::Output)?;
@@ -1345,25 +1435,52 @@ pub fn rm(env: &Env, cwd: &Path, path: &str, out: &mut dyn Write) -> Result<Exit
     )
 }
 
-/// One `rm` row.
-fn removal_row(removal: &Removal, home: &Path) -> String {
+/// Whether an `rm` row says what is about to be done or what was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tense {
+    /// The preview, before the question.
+    Will,
+    /// The result.
+    Did,
+}
+
+/// One `rm` row, in `tense`.
+fn removal_row(removal: &Removal, home: &Path, tense: Tense) -> String {
     let target = removal.restored.target();
-    let did = match &removal.restored {
-        Restored::Reverted { .. } => "put back the file bx replaced".to_string(),
-        Restored::Removed { .. } => "removed the file bx created".to_string(),
-        Restored::AlreadyGone { .. } => "was already gone".to_string(),
-        Restored::Kept { .. } => {
-            "left as you edited it; nothing declares it, so bx stops managing it".to_string()
+    let will = tense == Tense::Will;
+    let did = match (&removal.restored, will) {
+        (Restored::Reverted { .. }, false) => "put back the file bx replaced",
+        (Restored::Reverted { .. }, true) => "puts back the file bx replaced",
+        (Restored::Removed { .. }, false) => "removed the file bx created",
+        (Restored::Removed { .. }, true) => "removes the file bx created",
+        (Restored::AlreadyGone { .. }, false) => "was already gone",
+        (Restored::AlreadyGone { .. }, true) => "is already gone; bx stops managing it",
+        (Restored::Kept { .. }, false) => {
+            "left as you edited it; nothing declares it, so bx stops managing it"
         }
-        Restored::Unmanaged { .. } => "left as it is; bx never wrote it".to_string(),
-        Restored::Conflict { note, .. } => {
-            return format!("  ! {target}  {note}; still managed\n");
+        (Restored::Kept { .. }, true) => {
+            "is left as you edited it; nothing declares it, so bx stops managing it"
+        }
+        (Restored::Unmanaged { .. }, false) => "left as it is; bx never wrote it",
+        (Restored::Unmanaged { .. }, true) => "is left as it is; bx never wrote it",
+        (Restored::Conflict { note, .. }, _) => {
+            let stays = if will {
+                "stays managed"
+            } else {
+                "still managed"
+            };
+            return format!("  ! {target}  {note}; {stays}\n");
         }
     };
     let mut line = format!("  - {target}  {did}");
+    let declared = if will {
+        "; undeclared from"
+    } else {
+        "; no longer declared in"
+    };
     for layer in &removal.undeclared {
         line.push_str(&format!(
-            "; no longer declared in {}",
+            "{declared} {}",
             crate::paths::to_portable(layer, home)
         ));
     }

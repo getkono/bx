@@ -733,7 +733,7 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
     let planned = bx(home.path(), &["plan"]);
     assert_eq!(planned.status.code(), Some(0), "{}", stdout(&planned));
 
-    let removed = bx(home.path(), &["rm", "~/.tool.rc"]);
+    let removed = bx(home.path(), &["rm", "--yes", "~/.tool.rc"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
     assert_eq!(
         std::fs::read(home.child(".tool.rc")).expect("still there"),
@@ -753,11 +753,12 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
 
         let help = bx(home.path(), &[command, "--help"]);
         assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
-        assert!(
-            stdout(&help).contains(&format!("Usage: bx {command} <PATH>\n")),
-            "{}",
-            stdout(&help)
-        );
+        // `rm` also takes `--yes`, so its usage line reads `[OPTIONS] <PATH>`.
+        let usage = match command {
+            "rm" => "Usage: bx rm [OPTIONS] <PATH>\n",
+            _ => "Usage: bx add <PATH>\n",
+        };
+        assert!(stdout(&help).contains(usage), "{}", stdout(&help));
         assert!(!stdout(&help).contains("TARGET"), "{}", stdout(&help));
     }
 }

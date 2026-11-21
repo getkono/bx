@@ -204,7 +204,7 @@ fn rm_on_everything_applied_restores_the_home() {
         .map(|entry| PathBuf::from(entry.expect("an entry").file_name()))
         .collect();
     for path in top_level {
-        machine.converged(&["rm", path.to_str().expect("a plain name")]);
+        machine.converged(&["rm", "--yes", path.to_str().expect("a plain name")]);
     }
     assert_eq!(before, machine.the_accounts());
 }

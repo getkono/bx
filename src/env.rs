@@ -344,12 +344,17 @@ impl Pager {
 
 /// `LESS` for the pager: [`LESS_OPTIONS`] after what `inherited` holds, as an
 /// option of their own, or alone where it holds nothing but blanks.
+///
+/// A `$` ends what `inherited` holds first: `less` reads a string-valued
+/// option such as `-Pfoo` or `-kfile` to the end of `LESS` unless a `$` ends
+/// it, so without one [`LESS_OPTIONS`] would become part of that string and
+/// never apply. After any other option the `$` is ignored.
 fn keep_on_screen(inherited: Option<&OsStr>) -> OsString {
     match inherited.filter(|less| !less.as_encoded_bytes().iter().all(u8::is_ascii_whitespace)) {
         None => OsString::from(LESS_OPTIONS),
         Some(less) => {
             let mut kept = less.to_owned();
-            kept.push(" -");
+            kept.push("$ -");
             kept.push(LESS_OPTIONS);
             kept
         }
@@ -481,10 +486,15 @@ mod tests {
         };
         // oh-my-zsh's `LESS=-R` alone runs `less` on the alternate screen,
         // which wipes the plan before the question about it is put.
-        assert_eq!(less("-R"), "-R -FRXK");
+        assert_eq!(less("-R"), "-R$ -FRXK");
         // Every option it gave is kept, ahead of the ones bx needs.
-        assert_eq!(less("-i -x4"), "-i -x4 -FRXK");
-        assert_eq!(less("SR"), "SR -FRXK");
+        assert_eq!(less("-i -x4"), "-i -x4$ -FRXK");
+        assert_eq!(less("SR"), "SR$ -FRXK");
+        // A string-valued option last is ended, so bx's options are not read
+        // as the rest of its string: `-Pfoo -FRXK` prompts "foo -FRXK" and
+        // runs on the alternate screen.
+        assert_eq!(less("-Pfoo"), "-Pfoo$ -FRXK");
+        assert_eq!(less("-kfile"), "-kfile$ -FRXK");
         // Set to nothing but blanks, it gives no option of its own.
         assert_eq!(less(""), "FRXK");
         assert_eq!(less(" \t"), "FRXK");
@@ -554,7 +564,7 @@ mod tests {
         assert_eq!(shown, Paged::Shown);
         // Waited for: what it wrote is there once `page` returns.
         assert_eq!(std::fs::read_to_string(&seen).expect("seen"), "one\ntwo\n");
-        assert_eq!(std::fs::read_to_string(&less).expect("LESS"), "-R -FRXK");
+        assert_eq!(std::fs::read_to_string(&less).expect("LESS"), "-R$ -FRXK");
 
         // A pager that quits without reading is no error.
         let quit = pager("exit 0", LESS_OPTIONS).expect("a pager");

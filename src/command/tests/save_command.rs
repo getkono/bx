@@ -180,3 +180,53 @@ fn plan_alone_decides_no_save_so_it_merges_nothing() {
     assert_eq!(report.questions.len(), 1);
     assert!(report.questions[0].save.is_none(), "plan merges nothing");
 }
+
+#[test]
+fn a_save_whose_machine_or_repo_file_changed_while_its_question_was_open_writes_nothing() {
+    for moved in [".a", ".config/bx/files/a"] {
+        let home = applied("bx\n");
+        std::fs::write(home.child(".a"), "mine\n").expect("the edit");
+        let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+        let state = crate::state::StateDir::resolve(home.path());
+        let ledger = std::fs::read(state.ledger()).expect("the ledger");
+
+        let refused = crate::plan::answered(&inputs, crate::plan::Mode::Apply, &mut |report| {
+            assert!(report.questions[0].save.is_some(), "a save is offered");
+            std::fs::write(home.child(moved), "changed meanwhile\n").expect("the change");
+            Ok(crate::plan::Approval {
+                approved: true,
+                saved: std::collections::BTreeSet::from([0]),
+                ..Default::default()
+            })
+        });
+
+        assert!(
+            matches!(
+                refused,
+                Err(crate::plan::Error::Fs(crate::fs::Error::Changed { ref path, .. }))
+                    if path == &home.child(moved)
+            ),
+            "{moved}: {refused:?}"
+        );
+        let (machine, repo) = if moved == ".a" {
+            ("changed meanwhile\n", "bx\n")
+        } else {
+            ("mine\n", "changed meanwhile\n")
+        };
+        assert_eq!(repo_body(&home), repo, "{moved}: the repo is as it was");
+        assert_eq!(
+            std::fs::read_to_string(home.child(".a")).expect("the file"),
+            machine,
+            "{moved}"
+        );
+        assert!(
+            !state.root().join("saved.mpk").exists(),
+            "{moved}: nothing is recorded for bx sync to commit"
+        );
+        assert_eq!(
+            std::fs::read(state.ledger()).expect("the ledger"),
+            ledger,
+            "{moved}: the ledger is as it was"
+        );
+    }
+}

@@ -1502,6 +1502,43 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_holding_a_carried_copy_and_a_save_says_both() {
+        let home = guarded_home();
+        let repo = cloned(
+            &home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \"lock\"\ndirection = \"track\"\n\
+             [[target]]\npath = \"~/.rc\"\nfile = \"files/rc\"\n",
+        );
+        std::fs::write(repo.join("lock"), "a\n").expect("the repo copy");
+        std::fs::create_dir_all(repo.join("files")).expect("files");
+        std::fs::write(repo.join("files/rc"), "a\n").expect("the body");
+        commit_all(home.path(), &repo, "both");
+        run(home.path(), &repo, &["push", "--quiet"]);
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        home.write(".lock", "b\n");
+        sync("the carrying run");
+        home.write(".rc", "mine\n");
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+        crate::adopt::add(&ctx, &rc).expect("add");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+
+        assert_eq!(committed, 2);
+        assert_eq!(
+            run(home.path(), &repo, &["log", "-1", "--format=%B"]),
+            format!("{MIXED_SUBJECT}\n\nfiles/rc\nlock")
+        );
+        assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
     fn a_save_into_a_layer_holding_uncommitted_work_is_refused_and_commits_nothing() {
         let home = guarded_home();
         let repo = cloned(&home, "[[target]]\npath = \"~/.rc\"\ncontent = \"a\\n\"\n");

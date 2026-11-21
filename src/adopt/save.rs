@@ -690,6 +690,16 @@ impl RepoWrite {
         }
     }
 
+    /// The file, and the digest of the bytes the write leaves: what
+    /// `bx sync` commits ([`crate::sync::remember_saved`]).
+    pub(crate) fn written(&self) -> (PathBuf, ContentHash) {
+        let digest = match &self.edit {
+            Edit::File(bytes, _) => ContentHash::of(bytes),
+            Edit::Layer { text } => ContentHash::of(text.as_bytes()),
+        };
+        (self.path.clone(), digest)
+    }
+
     /// Make this write, unless the file changed since the save was decided.
     ///
     /// # Errors

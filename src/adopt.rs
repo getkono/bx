@@ -1294,11 +1294,14 @@ pub fn add_asking(
         .collect();
     // The repo side first: a run that stops before the machine side finds
     // the repo holding the edit, which the next `add` sees as one side moved.
+    let mut saved = Vec::new();
     for save in &saves {
         for write in &save.repo {
             write.write(&ctx.home)?;
+            saved.push(write.written());
         }
     }
+    crate::sync::remember_saved(&ctx.state, &lock, &ctx.repo, &saved);
     declare(ctx, &rows)?;
 
     let mut recorded = false;

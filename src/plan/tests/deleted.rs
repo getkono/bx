@@ -462,3 +462,135 @@ fn a_file_bx_generates_in_its_own_data_directory_is_recreated_not_asked_about() 
         assert!(again.questions.is_empty());
     }
 }
+
+/// A configuration whose generated `~/.zshrc` region sets `EDITOR` to `value`.
+fn interactive(value: &str) -> String {
+    format!("[[env]]\nname = \"EDITOR\"\nvalue = \"{value}\"\nkind = \"interactive\"\n")
+}
+
+/// `~/.zshrc`, the user's own at `0600`, with bx's region written into it for
+/// `EDITOR=nvim`, then deleted by hand.
+fn region_deleted(home: &GuardedHome) {
+    home.write(".zshrc", "mine\n");
+    std::fs::set_permissions(home.child(".zshrc"), std::fs::Permissions::from_mode(0o600))
+        .expect("the user's mode");
+    assert!(apply(&inputs(home, &interactive("nvim"))).executed);
+    let written = std::fs::read_to_string(home.child(".zshrc")).expect("bx's region");
+    assert!(written.starts_with("mine\n# >>> bx >>>\n"), "{written}");
+    std::fs::remove_file(home.child(".zshrc")).expect("the deletion");
+}
+
+/// The row of `report` for `~/.zshrc`, by index.
+fn zshrc(report: &Report) -> usize {
+    report
+        .changes
+        .iter()
+        .position(|change| change.target == "~/.zshrc")
+        .expect("a row for ~/.zshrc")
+}
+
+/// A file that held bx's region is the user's, and so is its deletion: it
+/// stands while bx wants the region it wrote, is asked about, and is never
+/// re-created as a file holding the region alone without that answer.
+#[test]
+fn a_deleted_file_that_held_bx_s_region_stands_and_is_asked_about() {
+    let home = guarded_home();
+    region_deleted(&home);
+    let inputs = inputs(&home, &interactive("nvim"));
+
+    let planned = plan(&inputs);
+    let at = zshrc(&planned);
+    assert_eq!(planned.changes[at].action, Action::Unchanged);
+    assert_eq!(exit(&planned, Mode::Plan), Exit::Converged);
+    let note = planned.changes[at].note.as_deref().expect("a note");
+    assert!(note.starts_with(decide::DELETED), "{note}");
+    assert!(note.ends_with(decide::ASK_DELETED), "{note}");
+    assert_eq!(planned.changes[at].diff, None);
+    let question = the_question(&planned);
+    assert_eq!(question.row, at);
+    match question.three_way.as_ref().map(|view| &view.kind) {
+        Some(DiffKind::Text(text)) => assert!(
+            text.starts_with("--- ~/.zshrc (deleted)\n+++ ~/.zshrc (bx's)\n")
+                && text.contains("+# >>> bx >>>\n")
+                && !text.contains("mine"),
+            "what restoring writes: bx's region alone\n{text}"
+        ),
+        other => panic!("a view of what restoring writes, found {other:?}"),
+    }
+
+    // Approved with no answer, as `--yes` is, and twice: nothing comes back.
+    keeping_writes_nothing_twice_at(&home, &inputs, ".zshrc", at, Action::Unchanged);
+
+    let restored = answer(&inputs, &[at]);
+    assert!(restored.executed);
+    assert_eq!(restored.changes[at].action, Action::Create);
+    let now = std::fs::read_to_string(home.child(".zshrc")).expect("restored");
+    assert!(
+        now.starts_with("# >>> bx >>>\n"),
+        "bx's region alone: {now}"
+    );
+    assert_eq!(
+        mode_of(&home.child(".zshrc")),
+        0o600,
+        "put back at the mode bx left the file at"
+    );
+    let again = plan(&inputs);
+    assert!(
+        again.actions().iter().all(|a| *a == Action::Unchanged),
+        "{:?}",
+        again.actions()
+    );
+    assert!(again.questions.is_empty(), "the second plan is empty");
+}
+
+#[test]
+fn a_deleted_file_that_held_bx_s_region_is_a_conflict_once_the_region_changes() {
+    let home = guarded_home();
+    // bx's older region, which sourced another file, in the user's file.
+    own(
+        home.path(),
+        ".zshrc",
+        b"mine\n# >>> bx >>>\nsource ~/.old\n# <<< bx <<<\n",
+        Mechanism::Region { comment: '#' },
+    );
+    std::fs::remove_file(home.child(".zshrc")).expect("the deletion");
+    let inputs = inputs(&home, &interactive("nvim"));
+
+    let planned = plan(&inputs);
+    let at = zshrc(&planned);
+    assert_eq!(planned.changes[at].action, Action::Conflict);
+    let note = planned.changes[at].note.as_deref().expect("a note");
+    assert!(note.starts_with(decide::DELETED_CHANGED), "{note}");
+    assert!(
+        !note.contains("mode"),
+        "the mode is the one bx left: {note}"
+    );
+    assert!(note.ends_with(decide::ASK_DELETED), "{note}");
+    assert_eq!(the_question(&planned).row, at);
+
+    keeping_writes_nothing_twice_at(&home, &inputs, ".zshrc", at, Action::Conflict);
+
+    let restored = answer(&inputs, &[at]);
+    assert_eq!(restored.changes[at].action, Action::Create);
+    let now = std::fs::read_to_string(home.child(".zshrc")).expect("restored");
+    assert!(now.starts_with("# >>> bx >>>\n"), "{now}");
+    assert!(!now.contains("mine") && !now.contains("~/.old"), "{now}");
+    assert_eq!(exit(&restored, Mode::Apply), Exit::Converged);
+}
+
+/// [`keeping_writes_nothing_twice`], for a configuration with other rows
+/// beside the deleted one, at `at`: whatever else is applied, the deleted
+/// file is not written.
+fn keeping_writes_nothing_twice_at(
+    home: &GuardedHome,
+    inputs: &Inputs,
+    path: &str,
+    at: usize,
+    row: Action,
+) {
+    for _ in 0..2 {
+        let kept = answer(inputs, &[]);
+        assert_eq!(kept.changes[at].action, row);
+        assert!(std::fs::symlink_metadata(home.child(path)).is_err());
+    }
+}

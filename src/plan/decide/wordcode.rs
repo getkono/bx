@@ -10,7 +10,13 @@
 //!   bx's bytes in place of the edit. A wordcode decided against a file that
 //!   is already what bx wants is written as decided: it compiles those bytes.
 //! - **The file is held for an answer**, and its wordcode's write is tied to
-//!   it: made only for *take bx's*, right after the file's.
+//!   it: made only for *take bx's*, right after the file's. The plan says so
+//!   on the wordcode's row, which is held with its file — even where its
+//!   bytes are already right and it is only rewritten — and once taken the
+//!   row is the create or modify its write is. A wordcode edited since bx
+//!   wrote it is a question of its own, as any such file is, which an answer
+//!   of *take bx's* writes only with its file: bx never writes over it on the
+//!   answer for another file.
 //! - **The file is written**, and so is its wordcode, after it, even where
 //!   its bytes are already right: a file rewritten with the same output — a
 //!   refreshed claim, a re-created file, a taken edit — is newer than the
@@ -23,23 +29,84 @@ use crate::config::target::{Body, Gen, Target};
 use crate::fs::{self, Kind, Mode};
 use crate::report::Action;
 
-/// A wordcode's write tied to its file's, which is held for an answer: made
-/// only once the file's is, right after it.
+/// A wordcode tied to its file, which is held for an answer: written only
+/// once the file's is, right after it.
 #[derive(Debug)]
 pub(in crate::plan) struct Tied {
     /// The row of the file, in [`super::Decided::held`].
     pub source: usize,
     /// The wordcode's own row.
     pub row: usize,
-    /// The wordcode's write.
-    pub op: Op,
-    /// The note the wordcode's row carries once its write is made.
-    pub note: Option<String>,
+    /// How the wordcode's write waits on its file's answer.
+    tie: Tie,
+}
+
+impl Tied {
+    /// Whether the wordcode is a question of its own, whose *take bx's* is
+    /// made only where its file's is too.
+    pub(in crate::plan) const fn asked(&self) -> bool {
+        matches!(self.tie, Tie::Asked)
+    }
+
+    /// The write made right after the file's once that is taken, with the
+    /// action and note the wordcode's row then carries; `None` for a
+    /// wordcode that is a question of its own, whose own answer writes it.
+    pub(in crate::plan) fn into_write(self) -> Option<(Op, Action, Option<String>)> {
+        match self.tie {
+            Tie::Write { op, action, note } => Some((*op, action, note)),
+            Tie::Asked => None,
+        }
+    }
+}
+
+impl Op {
+    /// Refuse a taken write — a file answered *take bx's*, and the wordcode
+    /// written right after it — unless its destination is still what plan
+    /// observed, as the session refuses it at the write itself, so a file
+    /// changed while its question was open is refused before the first write.
+    ///
+    /// # Errors
+    ///
+    /// [`fs::Error::Read`] where the destination cannot be looked at, and
+    /// [`fs::Error::Changed`] where it moved since plan.
+    pub(in crate::plan) fn refuse_moved(&self) -> Result<(), fs::Error> {
+        fs::refuse_moved(&self.planned, &fs::observe(&self.dest)?)
+    }
+}
+
+/// How a [`Tied`] wordcode's write waits on its file's answer.
+#[derive(Debug)]
+enum Tie {
+    /// Made right after the file's, once *take bx's* is answered for it.
+    Write {
+        /// The wordcode's write.
+        op: Box<Op>,
+        /// What the wordcode's row is once its write is made: the create or
+        /// modify it was decided as, or a modify where it is only rewritten.
+        action: Action,
+        /// The note the wordcode's row carries once its write is made.
+        note: Option<String>,
+    },
+    /// The wordcode was edited since bx wrote it and is a question of its
+    /// own, held in [`super::Decided::held`]: *take bx's* for it is made only
+    /// with its file's.
+    Asked,
 }
 
 /// The note a wordcode's row carries when its file is not written.
 pub(in crate::plan) const WAITS: &str = "written only with its file, which is not: zsh would \
                                          read it in place of what that file holds";
+
+/// The note a wordcode's row carries when its write waits on its file's
+/// answer.
+pub(in crate::plan) const TIED: &str = "written right after its file only if bx's is taken \
+                                        there: zsh would read it in place of what that file \
+                                        holds";
+
+/// The note an edited wordcode's row carries when its file is asked about
+/// too.
+pub(in crate::plan) const TAKEN_WITH: &str = "taken only with its file: zsh would read it in \
+                                              place of what that file holds";
 
 /// The note a wordcode's row carries when it is rewritten, bytes unchanged,
 /// after its file.
@@ -99,26 +166,38 @@ pub(super) fn tie(
                         join([Some(REWRITTEN.to_string()), changes[row].note.take()]);
                 }
             }
-            None if asked => {
-                let (op, note) = match own(ops, held) {
-                    Some(op) => {
-                        let note = changes[row].note.take();
-                        changes[row].action = Action::Conflict;
-                        changes[row].note = join([Some(WAITS.to_string()), note.clone()]);
-                        (op, note)
-                    }
-                    None if changes[row].action == Action::Unchanged => (
-                        rewrite(target, bytes, home)?,
-                        join([Some(REWRITTEN.to_string()), changes[row].note.clone()]),
-                    ),
-                    None => continue,
-                };
+            // An edited wordcode stays the question it is, answered only
+            // with its file's.
+            None if asked && held.iter().any(|(at, _)| *at == row) => {
+                changes[row].note = join([Some(TAKEN_WITH.to_string()), changes[row].note.take()]);
                 tied.push(Tied {
                     source,
                     row,
-                    op,
-                    note,
+                    tie: Tie::Asked,
                 });
+            }
+            None if asked => {
+                let note = changes[row].note.take();
+                let tie = match own(ops, held) {
+                    Some(op) => Tie::Write {
+                        op: Box::new(op),
+                        action: changes[row].action,
+                        note: note.clone(),
+                    },
+                    None if changes[row].action == Action::Unchanged => Tie::Write {
+                        op: Box::new(rewrite(target, bytes, home)?),
+                        action: Action::Modify,
+                        note: join([Some(REWRITTEN.to_string()), note.clone()]),
+                    },
+                    None => {
+                        changes[row].note = note;
+                        continue;
+                    }
+                };
+                // Announced as held with its file, whose answer decides it.
+                changes[row].action = Action::Conflict;
+                changes[row].note = join([Some(TIED.to_string()), note]);
+                tied.push(Tied { source, row, tie });
             }
             None if changes[source].action == Action::Unchanged => {}
             None => {

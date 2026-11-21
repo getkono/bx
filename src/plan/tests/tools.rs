@@ -667,6 +667,28 @@ fn backdate_wordcode(home: &GuardedHome) {
     file.set_modified(then).expect("backdated");
 }
 
+/// The wordcode's row in `report` announces its write as held with its
+/// file's question, shown in the plan right under it.
+fn assert_tied(report: &Report, wordcode: usize) {
+    let change = &report.changes[wordcode];
+    assert_eq!(change.action, Action::Conflict);
+    assert!(
+        change
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("written right after its file only if bx's is taken")),
+        "{:?}",
+        change.note
+    );
+    let shown = render(
+        report,
+        View::Plan,
+        Palette::PLAIN,
+        std::path::Path::new("/h"),
+    );
+    assert!(shown.contains(&change.target), "{shown}");
+}
+
 /// `apply`, approved, answering *take* for each of `taken`.
 fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
     answered(inputs, Mode::Apply, &mut |_| {
@@ -700,15 +722,7 @@ fn a_kept_edit_of_an_activation_file_keeps_its_wordcode_from_overriding_it() {
     let planned = plan(&inputs);
     let (output, wordcode) = (row_of(&planned, OUTPUT), row_of(&planned, WORDCODE));
     assert_eq!(planned.changes[output].action, Action::Conflict);
-    assert_eq!(planned.changes[wordcode].action, Action::Conflict);
-    assert!(
-        planned.changes[wordcode]
-            .note
-            .as_deref()
-            .is_some_and(|note| note.contains(crate::plan::decide::WAITS)),
-        "{:?}",
-        planned.changes[wordcode].note
-    );
+    assert_tied(&planned, wordcode);
 
     // Kept: neither is written, and zsh still runs the edit.
     let kept = answer(&inputs, &[]);
@@ -829,18 +843,130 @@ fn an_activation_file_written_again_with_the_same_output_rewrites_its_wordcode_a
             .all(|a| *a == Action::Unchanged)
     );
 
-    // An edit answered *take bx's*, the output unchanged: the same.
+    // An edit answered *take bx's*, the output unchanged: the same, and the
+    // plan says so under the question, though the wordcode's bytes are
+    // already right.
     std::fs::write(home.child(OUTPUT), "edited_hook() { :; }\n").expect("the edit");
     backdate_wordcode(&home);
     let planned = plan(&inputs);
     let output = row_of(&planned, OUTPUT);
     assert_eq!(planned.changes[output].action, Action::Conflict);
-    assert_eq!(planned.changes[row].action, Action::Unchanged);
+    assert_tied(&planned, row);
     let kept = answer(&inputs, &[]);
-    assert_eq!(kept.changes[row].action, Action::Unchanged);
+    assert_tied(&kept, row);
     assert!(!fresh(&home), "kept: the wordcode is left as it was");
     let taken = answer(&inputs, &[output]);
     assert_eq!(taken.changes[row].action, Action::Modify);
+    assert!(
+        taken.changes[row]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains(crate::plan::decide::REWRITTEN)),
+        "{:?}",
+        taken.changes[row].note
+    );
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        wordcode
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+}
+
+#[test]
+fn a_wordcode_created_after_a_taken_file_is_a_create() {
+    let home = guarded_home();
+    let Some((inputs, _)) = compiled(&home) else {
+        return;
+    };
+    let wordcode = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+    std::fs::remove_file(home.child(WORDCODE)).expect("deleted");
+    std::fs::write(home.child(OUTPUT), "edited_hook() { :; }\n").expect("the edit");
+
+    let planned = plan(&inputs);
+    let (output, row) = (row_of(&planned, OUTPUT), row_of(&planned, WORDCODE));
+    assert_eq!(planned.changes[output].action, Action::Conflict);
+    assert_tied(&planned, row);
+    let taken = answer(&inputs, &[output]);
+    assert_eq!(taken.changes[row].action, Action::Create);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        wordcode
+    );
+    assert!(fresh(&home));
+    assert!(
+        plan(&inputs)
+            .actions()
+            .iter()
+            .all(|a| *a == Action::Unchanged)
+    );
+}
+
+#[test]
+fn an_edited_wordcode_is_written_only_on_its_own_answer_and_only_with_its_file() {
+    let home = guarded_home();
+    let Some((inputs, _)) = compiled(&home) else {
+        return;
+    };
+    let wordcode = std::fs::read(home.child(WORDCODE)).expect("the wordcode");
+    let edit = |home: &GuardedHome| {
+        std::fs::write(home.child(OUTPUT), "edited_hook() { :; }\n").expect("the edit");
+        std::fs::write(home.child(WORDCODE), "the user's\n").expect("the wordcode's edit");
+    };
+    edit(&home);
+
+    // Both are questions, and the wordcode's says it is taken only with its
+    // file.
+    let planned = plan(&inputs);
+    let (output, row) = (row_of(&planned, OUTPUT), row_of(&planned, WORDCODE));
+    assert_eq!(
+        planned.questions.iter().map(|q| q.row).collect::<Vec<_>>(),
+        vec![output, row]
+    );
+    assert_eq!(planned.changes[row].action, Action::Conflict);
+    assert!(
+        planned.changes[row]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("taken only with its file")),
+        "{:?}",
+        planned.changes[row].note
+    );
+
+    // Its file taken alone: the edited wordcode is kept, never written over
+    // on another file's answer.
+    let taken = answer(&inputs, &[output]);
+    assert_eq!(taken.changes[output].action, Action::Modify);
+    assert_eq!(taken.changes[row].action, Action::Conflict);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        b"the user's\n"
+    );
+
+    // Taken alone: kept too, since zsh would read it in place of the file.
+    edit(&home);
+    let alone = answer(&inputs, &[row]);
+    assert!(!alone.executed, "nothing else was work");
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        b"the user's\n"
+    );
+    assert_eq!(
+        std::fs::read(home.child(OUTPUT)).expect("the file"),
+        b"edited_hook() { :; }\n"
+    );
+
+    // Taken with its file: both are written, the wordcode after.
+    let both = answer(&inputs, &[output, row]);
+    assert_eq!(
+        [both.changes[output].action, both.changes[row].action],
+        [Action::Modify, Action::Modify]
+    );
     assert_eq!(
         std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
         wordcode

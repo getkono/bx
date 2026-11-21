@@ -534,9 +534,18 @@ fn decide_and_write(
                 return Ok(report);
             }
             let approval = approve(&report)?;
+            let mut tied = decided.tied;
+            // A zsh activation's wordcode edited since bx wrote it is taken
+            // only with its file, as its row says: taken alone, it is kept,
+            // since zsh would read bx's compiled form in place of the file.
+            let alone = |row: &usize| {
+                tied.iter().any(|tied| {
+                    tied.row == *row && tied.asked() && !approval.taken.contains(&tied.source)
+                })
+            };
             let taken: Vec<_> = held
                 .drain(..)
-                .filter(|(row, _)| approval.taken.contains(row))
+                .filter(|(row, _)| approval.taken.contains(row) && !alone(row))
                 .collect();
             if !report.work && taken.is_empty() {
                 track::agree(inputs, &bases, &agreed, mode, false)?;
@@ -549,8 +558,11 @@ fn decide_and_write(
             // decided with, and its row the modify that write is.
             // A deleted target answered *restore* becomes the create it was
             // decided with. A zsh activation's wordcode tied to a taken file
-            // is written right after it, so it is never the older of the two.
-            let mut tied = decided.tied;
+            // is written right after it, so it is never the older of the two,
+            // as the create or modify it was announced as; one asked about
+            // itself and taken too is written by its own answer, whose row
+            // follows its file's.
+            let before = ops.len();
             for (row, op) in taken.into_iter().rev() {
                 let asked = op.asked(ledger.get(op.target()));
                 let change = &mut report.changes[row];
@@ -561,12 +573,22 @@ fn decide_and_write(
                 };
                 change.note = Some(asked.answered(change.note.as_deref()));
                 if let Some(at) = tied.iter().position(|tied| tied.source == row) {
-                    let tied = tied.remove(at);
-                    report.changes[tied.row].action = Action::Modify;
-                    report.changes[tied.row].note = tied.note;
-                    ops.insert(taken_at, tied.op);
+                    let wordcode = tied[at].row;
+                    if let Some((write, action, note)) = tied.remove(at).into_write() {
+                        report.changes[wordcode].action = action;
+                        report.changes[wordcode].note = note;
+                        ops.insert(taken_at, write);
+                    }
                 }
                 ops.insert(taken_at, op);
+            }
+            // Every taken write checked against what plan saw before the
+            // first write is made: a target changed while its question was
+            // open refuses the run with nothing written, rather than once
+            // every write queued ahead of it has landed. Any other write is
+            // refused at its own turn, and rolled back with the session.
+            for op in &ops[taken_at..taken_at + (ops.len() - before)] {
+                op.refuse_moved()?;
             }
             // What each file bx writes whole will hold, kept once the session
             // has landed it as the base a later edit is measured from. A run

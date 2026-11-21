@@ -153,11 +153,14 @@ pub struct Intent {
     ///
     /// The one fact a terminated journal cannot otherwise tell recovery: whether
     /// the ledger save in [`Session::finish`](super::Session::finish) happened before the process died.
-    /// A save that happened leaves the target recorded at [`Intent::after`]
-    /// (or still at this digest, where [`Intent::keeps_written`] says so); one
-    /// that did not leaves it at this digest. Recovery rebuilds only the second,
-    /// because re-recording the first hands the ledger bx's own earlier output
-    /// as if a third party had written it. See [`crate::recover`].
+    /// A save that happened leaves the target recorded at [`Intent::after`];
+    /// one that did not leaves it at this digest. Recovery rebuilds only the
+    /// second, because re-recording the first hands the ledger bx's own earlier
+    /// output as if a third party had written it. A write
+    /// [`Intent::keeps_written`] marks is recorded at this digest either way,
+    /// so recovery cannot tell the two apart and always records it again,
+    /// which does no harm: the second record adopts the same prior the first
+    /// did. See [`crate::recover`].
     pub ledger_written: Option<ContentHash>,
     /// Whether the destination is a directory rather than a file.
     ///

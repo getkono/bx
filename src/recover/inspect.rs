@@ -99,15 +99,20 @@ pub(super) enum Step {
 /// user's original out of reach of `rm`.
 ///
 /// So a write the ledger already holds is skipped. "Already holds" is the
-/// stored entry being at the intent's `after` digest and mode (or still at
-/// [`Intent::ledger_written`], where [`Intent::keeps_written`] says the
-/// session left it there) while the ledger
+/// stored entry being at the intent's `after` digest and mode while the ledger
 /// the session opened was not at that digest ([`Intent::ledger_written`]). An
 /// entry still at `after` that the session also found there is re-recorded,
 /// which is idempotent: nothing in the stored entry turns on whether it was
 /// saved. Matching `after` alone is not enough — a session that rewrites bx's
 /// last output over a user's edit and dies before the save leaves the ledger
 /// at `after` without the edit, and skipping that would lose it.
+///
+/// A write [`Intent::keeps_written`] marks is never skipped: it is recorded at
+/// [`Intent::ledger_written`], which is the digest the session found, so it is
+/// always recorded again whether or not the save happened. That does no harm.
+/// Its `before` is the same bytes the session's own record adopted as the
+/// prior, and adopting them a second time leaves the prior, the superseded
+/// history, and the claimed directories as they were.
 ///
 /// [`pending`]: super::pending
 /// [`resolve`]: super::rollback::resolve

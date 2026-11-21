@@ -1593,11 +1593,13 @@ fn rm_of_a_tracked_copy_the_tool_rewrote_is_a_conflict_that_changes_nothing() {
 
     let (exit, text) = rm_text(&home, "~/.config/tool/lock");
     assert_eq!(exit, Exit::Pending, "{text}");
-    assert!(
-        text.starts_with("  ! ~/.config/tool/lock  has been edited since bx wrote it"),
-        "{text}"
+    assert_eq!(
+        text,
+        "  ! ~/.config/tool/lock  has been edited since bx wrote it, and restoring the file \
+         bx replaced would destroy those edits, so bx is leaving it and forgetting nothing; \
+         still managed\n",
+        "a tracked copy's note offers no `bx add` or `bx apply` way out"
     );
-    assert_eq!(text.lines().count(), 1, "{text}");
     assert_eq!(
         std::fs::read(home.child(".config/tool/lock")).expect("kept"),
         b"tool\n"
@@ -1632,6 +1634,15 @@ fn rm_of_a_tracked_tree_restores_every_copy_and_holds_on_one_that_conflicts() {
 
     let (exit, text) = rm_text(&home, "~/.config/x");
     assert_eq!(exit, Exit::Pending, "{text}");
+    assert_eq!(
+        text.lines().nth(1),
+        Some(
+            "  ! ~/.config/x/b  its repo copy ~/.config/bx/files/.config/x/b has been edited \
+             since bx wrote it, and restoring the file bx replaced would destroy those edits, \
+             so bx is leaving it and forgetting nothing; still managed"
+        ),
+        "a tree's file's note offers no `bx add` or `bx apply` way out: {text}"
+    );
     assert_eq!(layer(&home), layer_text, "the tree stays whole");
     assert_eq!(
         std::fs::read(body(&home, ".config/x/a")).expect("a"),

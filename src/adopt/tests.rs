@@ -890,8 +890,14 @@ fn rm_of_a_file_bx_replaced_reports_putting_it_back_and_undeclares_it() {
     assert_eq!(plan_exit(&home).0, Exit::Converged);
 
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some(".replaced"), &mut out)
-        .expect("rm");
+    let exit = crate::command::rm(
+        &env(home.path()),
+        home.path(),
+        Some(".replaced"),
+        true,
+        &mut out,
+    )
+    .expect("rm");
     assert_eq!(exit, Exit::Converged);
     let text = String::from_utf8(out).expect("UTF-8");
     assert!(
@@ -909,8 +915,14 @@ fn rm_over_an_edit_is_a_conflict_that_changes_nothing() {
     std::fs::write(home.child(".edited"), b"hand edit\n").expect("edit");
 
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some("~/.edited"), &mut out)
-        .expect("rm");
+    let exit = crate::command::rm(
+        &env(home.path()),
+        home.path(),
+        Some("~/.edited"),
+        false,
+        &mut out,
+    )
+    .expect("rm");
     assert_eq!(exit, Exit::Pending);
     let text = String::from_utf8(out).expect("UTF-8");
     assert!(text.starts_with("  ! ~/.edited  "), "{text}");
@@ -1027,8 +1039,14 @@ fn rm_of_something_bx_does_not_manage_is_a_no_op() {
     let home = repo(MINE);
     plant(&home, ".untouched", b"u\n", 0o644);
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some(".untouched"), &mut out)
-        .expect("rm");
+    let exit = crate::command::rm(
+        &env(home.path()),
+        home.path(),
+        Some(".untouched"),
+        false,
+        &mut out,
+    )
+    .expect("rm");
     assert_eq!(exit, Exit::Converged);
     assert_eq!(
         String::from_utf8(out).expect("UTF-8"),
@@ -1161,7 +1179,7 @@ fn a_missing_path_no_path_and_no_repo_are_errors() {
         Err(Error::NoPath("add"))
     ));
     assert!(matches!(
-        crate::command::rm(&e, home.path(), None, &mut out),
+        crate::command::rm(&e, home.path(), None, false, &mut out),
         Err(Error::NoPath("rm"))
     ));
     assert!(matches!(
@@ -1191,7 +1209,8 @@ fn tree_repo() -> GuardedHome {
 
 fn rm_text(home: &GuardedHome, arg: &str) -> (Exit, String) {
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some(arg), &mut out).expect("rm");
+    let exit =
+        crate::command::rm(&env(home.path()), home.path(), Some(arg), true, &mut out).expect("rm");
     (exit, String::from_utf8(out).expect("UTF-8"))
 }
 

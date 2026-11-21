@@ -733,7 +733,7 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
     let planned = bx(home.path(), &["plan"]);
     assert_eq!(planned.status.code(), Some(0), "{}", stdout(&planned));
 
-    let removed = bx(home.path(), &["rm", "~/.tool.rc"]);
+    let removed = bx(home.path(), &["rm", "--yes", "~/.tool.rc"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
     assert_eq!(
         std::fs::read(home.child(".tool.rc")).expect("still there"),

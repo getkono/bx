@@ -107,7 +107,7 @@ There are fourteen. You should not need a manual.
 | `bx` | status: every managed target, and what is pending, in conflict or blocked |
 | `bx init` | guided setup |
 | `bx add PATH` | begin managing a config file, or a directory of them |
-| `bx rm PATH` | stop managing it, and restore the original |
+| `bx rm PATH` | stop managing it, and restore the original, once you confirm what it shows (`--yes` asks nothing) |
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, carry this machine's copies of tracked files into the repo and commit them, push — no git knowledge required |

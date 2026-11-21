@@ -18,7 +18,13 @@
 //!    `bx update --background`, detached and silent, and asks nothing. What it
 //!    finds is offered at a later prompt.
 //! 3. **A question is due.** `update/ask-due` has passed: the hook asks
-//!    whether to check now. `y` runs `bx update`; any other answer snoozes.
+//!    whether to check now. `y` runs `bx update --check`, which looks and
+//!    changes nothing but the stamps, and the hook then offers at once what
+//!    that check found, as in 1; any other answer snoozes.
+//!
+//! Only a key pressed once the question is shown answers it: what was typed
+//! ahead at a terminal — a `y` meant for the command line — is read and
+//! dropped before the question is printed.
 //!
 //! It asks about an offer, or a question, at most once per shell: a shell that
 //! asked one nobody answered remembers it in `BX_UPDATE_ASKED`, and asks again
@@ -34,7 +40,7 @@
 //! - **One generation per offer.** `available` begins `gen G`, a hash of what
 //!   it offers. The hook offers it only while `answered` holds something else,
 //!   so a shell opened after an answer is not asked, even while the
-//!   `bx update` or `bx update --snooze` the answer started still runs. The
+//!   `bx update`, check or snooze the answer started still runs. The
 //!   question whether to check is named `ask` and its `ask-due` the same way.
 //!   An offer's answer names the `ask-due` it was given under on a second
 //!   line, so the question due with it is settled too. An `available` an
@@ -42,8 +48,8 @@
 //!   line, so it too is asked once per shell and settled by one answer.
 //! - **Answered before anything starts.** The shell answered writes
 //!   `answered` with one redirect, then sends `SIGURG` with the `kill` builtin
-//!   to every other shell waiting under `waiting/`, then starts `bx update`
-//!   or the snooze.
+//!   to every other shell waiting under `waiting/`, then starts what the
+//!   answer runs.
 //! - **Waiting without polling.** A shell asking writes `waiting/$$`, traps
 //!   `SIGURG`, checks once more that nothing settled what it asks, and only
 //!   then reads, so an answer given before it registered is not waited out;
@@ -120,8 +126,9 @@
 //! process. Asking starts none either: registering, waiting, waking and
 //! answering are redirects, `trap`, `read`, a glob and the `kill` builtin.
 //! The only processes it ever starts are the detached background check, at
-//! most once per shell and only once `check-due` has passed, and `bx update`
-//! itself once someone answers.
+//! most once per shell and only once `check-due` has passed, and
+//! `bx update`, `bx update --check` or `bx update --snooze` once someone
+//! answers.
 //!
 //! # Invariant 2
 //!
@@ -232,13 +239,22 @@ __bx_update_settled() {
 # answered settles the question due with it too, until the answer moves on.
 __bx_update_ask() {
   setopt localoptions localtraps nullglob
-  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= due= f p
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= due= ahead= f p
   local -i wait=60 start=${(%):-%D{%s}} now left
   [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[^0-9]* ]] \
     && wait=$BX_UPDATE_PROMPT_TIMEOUT
   typeset -g BX_UPDATE_ASKED=$gen
   print -r -- "$gen" 2>/dev/null >| $dir/waiting/$$
   trap 'woken=1' URG
+  # Nothing typed before the question is shown answers it. Read from the
+  # terminal, which read -k puts in cbreak, so a key typed without Enter is
+  # read and dropped too.
+  if [[ -t 0 ]]; then
+    while read -k 1 -t 0 ahead
+    do
+      :
+    done
+  fi
   print -n -- "$4"
   while [[ -z $outcome ]]
   do
@@ -278,10 +294,15 @@ __bx_update_ask() {
     p=${f:t}
     [[ $p == [1-9]* && $p != *[^0-9]* && $p != $$ && -s $f ]] && kill -URG $p 2>/dev/null
   done
-  if [[ $answer == [yY] ]]; then
+  if [[ $answer != [yY] ]]; then
+    command bx update --snooze </dev/null >/dev/null 2>&1 &!
+  elif [[ $kind == offer ]]; then
     command bx update
   else
-    command bx update --snooze </dev/null >/dev/null 2>&1 &!
+    # Asked whether to check, a yes checks, and what the check finds is
+    # offered at once.
+    command bx update --check
+    __bx_update_due
   fi
   return 0
 }
@@ -380,7 +401,7 @@ __bx_update_settled() {
 # offer answered settles the question due with it too, until the answer moves on.
 __bx_update_ask() {
   local -
-  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= saved= posix= waits= due= f p start now
+  local dir=$1 kind=$2 gen=$3 answer= woken= outcome= spent= saved= posix= waits= due= ahead= f p start now
   local -i wait=60 left
   [[ ${BX_UPDATE_PROMPT_TIMEOUT-} == [1-9]* && $BX_UPDATE_PROMPT_TIMEOUT != *[!0-9]* ]] \
     && wait=$BX_UPDATE_PROMPT_TIMEOUT
@@ -394,6 +415,15 @@ __bx_update_ask() {
       read -r -d '' saved
     } 2>/dev/null < "$dir/waiting/$$"
     trap 'woken=1' URG
+  fi
+  # Nothing typed before the question is shown answers it. read -n puts the
+  # terminal out of canonical mode, so a key typed without Enter is read and
+  # dropped too.
+  if [[ -t 0 ]]; then
+    while read -r -n 1 -t 0.01 ahead
+    do
+      :
+    done
   fi
   printf '%s' "$4"
   while [[ -z $outcome ]]
@@ -439,10 +469,15 @@ __bx_update_ask() {
     p=${f##*/}
     [[ $p == [1-9]* && $p != *[!0-9]* && $p != "$$" && -s $f ]] && kill -URG "$p" 2>/dev/null
   done
-  if [[ $answer == [yY] ]]; then
+  if [[ $answer != [yY] ]]; then
+    (command bx update --snooze </dev/null >/dev/null 2>&1 &)
+  elif [[ $kind == offer ]]; then
     command bx update
   else
-    (command bx update --snooze </dev/null >/dev/null 2>&1 &)
+    # Asked whether to check, a yes checks, and what the check finds is
+    # offered at once.
+    command bx update --check
+    __bx_update_due
   fi
   return 0
 }
@@ -524,6 +559,23 @@ mod tests {
             // As `Stamps::set` leaves it.
             std::fs::create_dir_all(Self::dir_in(home.path()).join("waiting")).expect("update/");
             Self { home, shell }
+        }
+
+        /// The recording `bx` replaced by one whose `bx update --check`
+        /// finds `available` and writes it, as [`crate::update::check`] does.
+        fn checking_finds(&self, available: &str) {
+            let bx = self.home.path().join("bin/bx");
+            std::fs::write(
+                &bx,
+                format!(
+                    "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\n\
+                     [ \"$*\" = 'update --check' ] && printf '%s' '{available}' > {}\n\
+                     exit 0\n",
+                    self.home.path().join("calls").display(),
+                    self.dir().join("available").display()
+                ),
+            )
+            .expect("a checking bx");
         }
 
         fn dir_in(home: &Path) -> PathBuf {
@@ -779,7 +831,36 @@ mod tests {
                 1,
                 "{shell:?}: {printed}"
             );
-            assert_eq!(calls, "update\n", "{shell:?}");
+            assert_eq!(
+                calls, "update --check\n",
+                "{shell:?}: a yes to checking checks, and moves nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn yes_to_checking_checks_and_then_offers_what_the_check_found() {
+        for shell in shells() {
+            let rig = Rig::new(shell);
+            rig.stamp("ask-due", "1\n");
+            rig.checking_finds("gen g1\n~/a: 1 new commit(s) on main\n");
+            let (printed, calls) = rig.run("__bx_update_due", "yy", &[]);
+            let asked = printed.find("check now whether").expect("asked to check");
+            let offered = printed.find("bx: update now? [y/N] ").expect("offered");
+            assert!(asked < offered, "{shell:?}: {printed}");
+            assert!(
+                printed.contains("  ~/a: 1 new commit(s) on main\n"),
+                "{shell:?}: {printed}"
+            );
+            assert_eq!(
+                calls, "update --check\nupdate\n",
+                "{shell:?}: only the second yes, to the offer, updates"
+            );
+            assert_eq!(
+                rig.read("answered").as_deref(),
+                Some("g1\nask 1\n"),
+                "{shell:?}"
+            );
         }
     }
 
@@ -913,12 +994,15 @@ mod tests {
             rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
             rig.stamp("answered", "g1\nask 0\n");
             let (printed, calls) = rig.run("__bx_update_due", "y", &[]);
-            assert!(!printed.contains("new commits:"), "{shell:?}: {printed}");
+            let asked = printed.find("check now whether").expect("asked to check");
             assert!(
-                printed.contains("check now whether"),
-                "{shell:?}: {printed}"
+                !printed[..asked].contains("new commits:"),
+                "{shell:?}: the answered offer is not asked first: {printed}"
             );
-            assert_eq!(calls, "update\n", "{shell:?}");
+            // The check's yes moves the offer's answer on, so what the check
+            // left in `available` is offered next; here, with nothing typed
+            // for it, it goes unanswered.
+            assert_eq!(calls, "update --check\n", "{shell:?}");
             assert_eq!(rig.read("answered").as_deref(), Some("ask 1\n"));
         }
     }
@@ -1209,6 +1293,108 @@ mod tests {
         }
         assert!(output.status.success(), "{output:?}");
         Some(rig.calls_once(|calls| calls == expected))
+    }
+
+    /// The bx calls made once an interactive `shell` at a terminal is
+    /// offered an update, with `ahead` typed before the hook runs and
+    /// `answer` typed once the question is shown, read once they are
+    /// `expected` or ten seconds on; `None` where zsh's `zpty` is not
+    /// available.
+    fn answered_at_a_terminal(
+        shell: Shell,
+        ahead: &str,
+        answer: &str,
+        expected: &str,
+    ) -> Option<String> {
+        let zsh = crate::shell::testing::installed("zsh")?;
+        let rig = Rig::new(shell);
+        rig.stamp("available", "gen g1\n~/a: 1 new commit(s) on main\n");
+        let (program, flags, hook) = match shell {
+            Shell::Zsh => (zsh.clone(), "-f -i", ZSH),
+            Shell::Bash => (
+                crate::shell::testing::installed("bash")?,
+                "--norc --noprofile -i",
+                BASH,
+            ),
+        };
+        // The hook runs only once `go` exists, which the driver makes after
+        // typing ahead, so what it typed waits on the terminal by then.
+        let go = rig.home.path().join("go");
+        let script = rig.home.path().join("script");
+        std::fs::write(
+            &script,
+            format!(
+                "{hook}\nprintf 'ready\\n'\n\
+                 while [[ ! -e {go} ]]; do sleep 0.05; done\n\
+                 __bx_update\nwait\nsleep 0.2\n",
+                go = go.display()
+            ),
+        )
+        .expect("the script");
+        let driver = rig.home.path().join("driver");
+        std::fs::write(
+            &driver,
+            format!(
+                "zmodload zsh/zpty || exit 3\n\
+                 zpty t 'BX_UPDATE_PROMPT_TIMEOUT=10 TERM=xterm exec {} {flags} {}'\n\
+                 zpty -r t line '*ready*' || exit 4\n\
+                 zpty -w -n t $'{}'\n\
+                 : > {}\n\
+                 zpty -r t line '*\\[y/N\\] ' || exit 5\n\
+                 zpty -w -n t $'{}'\n\
+                 for i in {{1..100}}; do zpty -t t || break; sleep 0.1; done\n\
+                 zpty -d t\n",
+                program.display(),
+                script.display(),
+                ahead.escape_default(),
+                go.display(),
+                answer.escape_default()
+            ),
+        )
+        .expect("the driver");
+        let output = Command::new(&zsh)
+            .arg("-f")
+            .arg(&driver)
+            .env_clear()
+            .env("HOME", rig.home.path())
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", rig.home.path().join("bin").display()),
+            )
+            .stdin(Stdio::null())
+            .output()
+            .expect("the driver runs");
+        if output.status.code() == Some(3) {
+            return None;
+        }
+        assert!(output.status.success(), "{shell:?}: {output:?}");
+        Some(rig.calls_once(|calls| calls == expected))
+    }
+
+    #[test]
+    fn a_key_typed_before_the_question_never_answers_it() {
+        for shell in shells() {
+            // The `y` meant for the command line, typed while the last
+            // command ran, and then an Enter: without the flush it answers
+            // `bx: update now?` before the question is on the screen.
+            let Some(calls) = answered_at_a_terminal(shell, "y\r", "n\r", "update --snooze\n")
+            else {
+                crate::testing::skip_unconstructible(&format!(
+                    "{shell:?}: no zsh with its zpty module to supply a terminal"
+                ));
+                continue;
+            };
+            assert_eq!(
+                calls, "update --snooze\n",
+                "{shell:?}: only the key pressed once it was asked answers"
+            );
+            // The positive control: a `y` pressed once it is asked updates.
+            assert_eq!(
+                answered_at_a_terminal(shell, "", "y\r", "update\n").as_deref(),
+                Some("update\n"),
+                "{shell:?}"
+            );
+        }
     }
 
     #[test]

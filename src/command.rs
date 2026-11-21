@@ -147,7 +147,8 @@ pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
 /// What the user answered about one file edited since bx wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Answer {
-    /// Leave the edit as it is and skip the file, as every conflict is.
+    /// Leave the edit as it is and skip the file, and remember the answer
+    /// until either side changes, so the question is not put again.
     Keep,
     /// Write bx's bytes over the edit, which `bx rm` then restores.
     Take,
@@ -392,8 +393,9 @@ type Prompts<'a, 'b> = (
 /// with a `settle`: otherwise every edited file is kept, as every conflict
 /// is, so `--yes` never writes over an edit. Each answer of *show* draws the
 /// three-way view and asks again. Where the questions were the only work and
-/// every answer kept the edit, the confirmation is not put and nothing is
-/// written.
+/// every answer kept the edit, the confirmation is not put and no target is
+/// written; each answer *keep* is remembered, so its row says it was kept
+/// and asks nothing until either side changes.
 pub(crate) fn converge_answering(
     inputs: &Inputs,
     env: &Env,
@@ -417,15 +419,24 @@ pub(crate) fn converge_answering(
         out.flush().map_err(Error::Output)?;
         shown = true;
         let mut taken = std::collections::BTreeSet::new();
+        let mut kept = std::collections::BTreeSet::new();
         if let Some(settle) = settle.as_deref_mut().filter(|_| asking) {
             for question in &report.questions {
                 if settled(out, env, report, question, &mut *settle)? == Answer::Take {
                     taken.insert(question.row);
+                } else {
+                    kept.insert(question.row);
                 }
             }
         }
+        // Every answer kept the edit: nothing is written, so nothing is
+        // confirmed, and the answers are remembered.
         if !report.work && taken.is_empty() {
-            return Ok(plan::Approval::from(false));
+            return Ok(plan::Approval {
+                approved: false,
+                taken,
+                kept,
+            });
         }
         let approved = if yes {
             true
@@ -437,6 +448,7 @@ pub(crate) fn converge_answering(
         Ok(plan::Approval {
             approved: decided(report, approved),
             taken,
+            kept,
         })
     })?;
 

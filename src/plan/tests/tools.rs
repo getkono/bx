@@ -695,6 +695,7 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            kept: std::collections::BTreeSet::new(),
         })
     })
     .expect("apply runs")
@@ -745,6 +746,37 @@ fn a_kept_edit_of_an_activation_file_keeps_its_wordcode_from_overriding_it() {
         String::from_utf8_lossy(&out.stdout),
         "edited_hook: function\nstub_hook: none\n"
     );
+
+    // Kept and remembered: the wordcode waits with its file, and neither is
+    // asked about or left in conflict again.
+    let remembered = answered(&inputs, Mode::Apply, &mut |_| {
+        Ok(Approval {
+            approved: false,
+            taken: std::collections::BTreeSet::new(),
+            kept: std::collections::BTreeSet::from([output]),
+        })
+    })
+    .expect("apply runs");
+    assert!(remembered.kept.contains(&output) && remembered.kept.contains(&wordcode));
+    assert_eq!(remembered.changes[wordcode].action, Action::Unchanged);
+    assert!(
+        remembered.changes[wordcode]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains(crate::plan::decide::WAITS)),
+        "{:?}",
+        remembered.changes[wordcode].note
+    );
+    let again = plan(&inputs);
+    assert!(again.questions.is_empty());
+    assert_eq!(again.changes[wordcode].action, Action::Unchanged);
+    assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        before
+    );
+    // Edited again, so its question is put again for the take below.
+    std::fs::write(home.child(OUTPUT), "edited_hook() { true; }\n").expect("a second edit");
 
     // Taken: both are written, the wordcode after, and the plan converges.
     let taken = answer(&inputs, &[output]);

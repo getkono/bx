@@ -13,6 +13,7 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            kept: std::collections::BTreeSet::new(),
         })
     })
     .expect("apply runs")

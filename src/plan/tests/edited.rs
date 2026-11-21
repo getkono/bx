@@ -26,6 +26,24 @@ fn answer(inputs: &Inputs, approved: bool, taken: &[usize]) -> Report {
         Ok(Approval {
             approved,
             taken: taken.iter().copied().collect(),
+            kept: BTreeSet::new(),
+        })
+    })
+    .expect("apply runs")
+}
+
+/// An `apply` answering *keep* for every question it puts, as a terminal's
+/// bare Enter does, with nothing else to confirm.
+fn keep(inputs: &Inputs) -> Report {
+    answered(inputs, Mode::Apply, &mut |report| {
+        Ok(Approval {
+            approved: false,
+            taken: BTreeSet::new(),
+            kept: report
+                .questions
+                .iter()
+                .map(|question| question.row)
+                .collect(),
         })
     })
     .expect("apply runs")
@@ -284,6 +302,7 @@ fn a_taken_file_changed_while_its_question_was_open_refuses_the_run_before_any_w
         Ok(Approval {
             approved: true,
             taken: BTreeSet::from([0]),
+            kept: BTreeSet::new(),
         })
     });
     assert!(
@@ -321,6 +340,7 @@ fn take_crash_child() {
         Ok(Approval {
             approved: true,
             taken: BTreeSet::from([0]),
+            kept: BTreeSet::new(),
         })
     })
     .expect("the apply");
@@ -366,4 +386,149 @@ fn a_take_killed_at_any_journal_phase_recovers_like_any_session() {
             );
         }
     }
+}
+
+#[test]
+fn keep_is_remembered_and_not_asked_again_until_either_side_changes() {
+    let home = guarded_home();
+    let inputs = edited(&home, "new\\n");
+
+    // The defect: every run asked again, and the row stayed a conflict.
+    let kept = keep(&inputs);
+    assert!(!kept.executed, "keeping writes no target");
+    assert_eq!(kept.actions(), vec![Action::Unchanged]);
+    assert_eq!(kept.kept, vec![0]);
+    assert_eq!(exit(&kept, Mode::Apply), Exit::Converged);
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+    assert!(entry(&home).expect("the entry").kept.is_some());
+
+    // The next plan says it was kept, shows it, and asks nothing.
+    let planned = plan(&inputs);
+    assert_eq!(planned.actions(), vec![Action::Unchanged]);
+    assert!(planned.questions.is_empty());
+    assert_eq!(planned.kept, vec![0]);
+    assert_eq!(planned.changes[0].diff, None);
+    assert_eq!(
+        planned.changes[0].note.as_deref(),
+        Some(
+            format!(
+                "edited since bx last wrote it; mode 0600 -> 0644; {}",
+                super::super::KEPT
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(exit(&planned, Mode::Plan), Exit::Converged);
+    let shown = render(&planned, View::Plan, Palette::PLAIN, home.path());
+    assert!(shown.contains("~/.a"), "{shown}");
+    assert!(shown.contains(super::super::KEPT), "{shown}");
+
+    // Applying again asks nothing and changes nothing, the ledger included.
+    let before = snapshot(home.path(), &[".local/state/bx/lock"]);
+    let again = run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve")).expect("apply");
+    assert!(!again.executed);
+    assert_eq!(snapshot(home.path(), &[".local/state/bx/lock"]), before);
+
+    // What bx wants changed: the question is put again.
+    let changed = inputs_after(&home, "newer\\n");
+    assert_eq!(plan(&changed).questions.len(), 1);
+    assert_eq!(plan(&changed).actions(), vec![Action::Conflict]);
+
+    // What is on disk changed: so is it.
+    std::fs::write(home.child(".a"), "edited twice\n").expect("a second edit");
+    assert_eq!(plan(&inputs).questions.len(), 1);
+}
+
+#[test]
+fn take_after_a_kept_answer_clears_it_and_rm_restores_the_edit() {
+    let home = guarded_home();
+    let inputs = edited(&home, "new\\n");
+    keep(&inputs);
+
+    // Edited again, so asked again, and *take* clears the answer with the
+    // write it makes.
+    std::fs::write(home.child(".a"), "edited twice\n").expect("a second edit");
+    let taken = answer(&inputs, true, &[0]);
+    assert!(taken.executed);
+    assert_eq!(entry(&home).expect("the entry").kept, None);
+    assert_eq!(std::fs::read(home.child(".a")).expect("bx's"), b"new\n");
+
+    let state = StateDir::resolve(home.path());
+    let targets = ledger_targets(&state, home.path());
+    crate::restore::restore(&state, home.path(), &targets).expect("rm");
+    assert_eq!(
+        std::fs::read(home.child(".a")).expect("the edit is back"),
+        b"edited twice\n"
+    );
+}
+
+#[test]
+fn rm_over_a_kept_edit_keeps_the_edit() {
+    let home = guarded_home();
+    let inputs = edited(&home, "new\\n");
+    keep(&inputs);
+
+    let state = StateDir::resolve(home.path());
+    let targets = ledger_targets(&state, home.path());
+    crate::restore::restore(&state, home.path(), &targets).expect("rm");
+
+    assert_eq!(
+        std::fs::read(home.child(".a")).expect("the edit stays"),
+        b"edited\n"
+    );
+}
+
+/// `~/.a` written by bx and edited by hand, with the configuration now
+/// wanting `new\n` there and creating `~/.b` beside it: work beside the
+/// question, so the confirmation is put.
+fn edited_beside_work(home: &GuardedHome) -> Inputs {
+    let written = inputs(home, &inline("~/.a", "bx\\n"));
+    assert!(apply(&written).executed);
+    std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    inputs(
+        home,
+        &format!("{}{}", inline("~/.a", "new\\n"), inline("~/.b", "b\\n")),
+    )
+}
+
+/// An `apply` answering *keep* for row 0 and confirming with `approved`.
+fn keep_and_confirm(inputs: &Inputs, approved: bool) -> Report {
+    answered(inputs, Mode::Apply, &mut |_| {
+        Ok(Approval {
+            approved,
+            taken: BTreeSet::new(),
+            kept: BTreeSet::from([0]),
+        })
+    })
+    .expect("apply runs")
+}
+
+#[test]
+fn a_declined_run_remembers_no_answer() {
+    let home = guarded_home();
+    let inputs = edited_beside_work(&home);
+
+    let declined = keep_and_confirm(&inputs, false);
+
+    assert!(!declined.executed);
+    assert!(declined.kept.is_empty());
+    assert_eq!(entry(&home).expect("the entry").kept, None);
+    assert_eq!(plan(&inputs).questions.len(), 1, "asked again");
+}
+
+#[test]
+fn an_approved_run_remembers_its_kept_answers_beside_its_writes() {
+    let home = guarded_home();
+    let inputs = edited_beside_work(&home);
+
+    let applied = keep_and_confirm(&inputs, true);
+
+    assert!(applied.executed);
+    assert_eq!(applied.kept, vec![0]);
+    assert_eq!(exit(&applied, Mode::Apply), Exit::Converged);
+    assert_eq!(std::fs::read(home.child(".b")).expect("written"), b"b\n");
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+    let again = plan(&inputs);
+    assert_eq!(again.actions(), vec![Action::Unchanged, Action::Unchanged]);
+    assert!(again.questions.is_empty());
 }

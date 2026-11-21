@@ -40,7 +40,7 @@ fn keep_mine_at_a_terminal_writes_nothing_and_puts_no_confirmation() {
     )
     .expect("apply");
 
-    assert_eq!(exit, Exit::Pending, "the conflict still needs a human");
+    assert_eq!(exit, Exit::Converged, "the answer settled it");
     assert_eq!(
         asked,
         vec!["~/.a was edited since bx last wrote it. Keep your edit, or take bx's bytes?"]
@@ -52,6 +52,21 @@ fn keep_mine_at_a_terminal_writes_nothing_and_puts_no_confirmation() {
         text(&out)
     );
     assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+
+    // The defect: the next run asked again. The answer is remembered, and
+    // the row says so.
+    let mut out = Vec::new();
+    let exit = apply_answering(
+        &tty(home.path()),
+        false,
+        &mut out,
+        &mut never,
+        Some(&mut |_, _| panic!("a kept edit is not asked about again")),
+    )
+    .expect("apply");
+    assert_eq!(exit, Exit::Converged);
+    assert!(text(&out).starts_with("  = ~/.a"), "{}", text(&out));
+    assert!(text(&out).contains(crate::plan::KEPT), "{}", text(&out));
 }
 
 #[test]
@@ -362,8 +377,31 @@ fn a_deleted_file_is_asked_whether_to_keep_it_deleted_and_restore_writes_it() {
     );
     assert!(!home.child(".a").exists());
 
+    // Kept deleted is remembered: the next run asks nothing.
+    let mut out = Vec::new();
     let exit = apply_answering(
         &tty(home.path()),
+        false,
+        &mut out,
+        &mut never,
+        Some(&mut |_, _| panic!("a kept deletion is not asked about again")),
+    )
+    .expect("apply");
+    assert_eq!(exit, Exit::Converged);
+    assert!(
+        text(&out).contains(crate::plan::KEPT_DELETED),
+        "{}",
+        text(&out)
+    );
+    assert!(!home.child(".a").exists());
+
+    // Restore is answered on a machine that has not kept it.
+    let fresh = guarded_home();
+    seed(fresh.path(), &inline("~/.a", "bx\\n"));
+    apply_with(&env(fresh.path()), true, &mut Vec::new(), &mut never).expect("bx writes it");
+    std::fs::remove_file(fresh.child(".a")).expect("the deletion");
+    let exit = apply_answering(
+        &tty(fresh.path()),
         false,
         &mut Vec::new(),
         &mut || Ok(true),
@@ -371,7 +409,7 @@ fn a_deleted_file_is_asked_whether_to_keep_it_deleted_and_restore_writes_it() {
     )
     .expect("apply");
     assert_eq!(exit, Exit::Converged);
-    assert_eq!(std::fs::read(home.child(".a")).expect("restored"), b"bx\n");
+    assert_eq!(std::fs::read(fresh.child(".a")).expect("restored"), b"bx\n");
 }
 
 #[test]

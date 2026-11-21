@@ -45,6 +45,11 @@
 //! never writes a repo copy, so the config repo is never left modified outside
 //! a sync.
 //!
+//! An edit `bx add` saved into the repo, or `apply`'s question saved, is
+//! committed here too: the save records each repo file it wrote, and what it
+//! left there, in `saved.mpk` in the state directory (`remember_saved`),
+//! and [`commit_carried`] commits each one still holding exactly that.
+//!
 //! # State never leaves the machine
 //!
 //! The state directory holds this account's answers, the bytes bx displaced
@@ -52,8 +57,8 @@
 //! [`pull`] refuses a state directory inside the config repo, where a commit
 //! could pick it up; and before any commit is pushed, it refuses one that
 //! carries a file named as a state file is: `local.toml`, `ledger.mpk`,
-//! `journal.mpk`, or a content-addressed blob in a `restore/` directory. That
-//! is a guard on four literal names, not a secret scanner.
+//! `journal.mpk`, `saved.mpk`, or a content-addressed blob in a `restore/`
+//! directory. That is a guard on five literal names, not a secret scanner.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -333,9 +338,94 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
 /// machine and account ran them and whenever they ran.
 pub(crate) const CARRIED_SUBJECT: &str = "chore: carry tracked files back from bx sync";
 
-/// Commit every tracked target's copy that `sync` wrote into the config repo
-/// and git has not committed yet, in one commit, and return how many files it
-/// holds.
+/// The message of a commit [`commit_carried`] makes that holds an edit
+/// `bx add` saved into the repo, fixed as [`CARRIED_SUBJECT`] is.
+pub(crate) const SAVED_SUBJECT: &str = "chore: save edits made with bx add";
+
+/// The message of a commit [`commit_carried`] makes that holds both.
+pub(crate) const MIXED_SUBJECT: &str = "chore: carry tracked files and save edits made with bx add";
+
+/// The file in the state directory naming each repo file `bx add` saved an
+/// edit into and no commit has taken yet, with the digest of what it wrote.
+const SAVED: &str = "saved.mpk";
+
+/// Each repo file a save wrote, by its path relative to the repo, and the
+/// digest of the bytes it left.
+type Saved = std::collections::BTreeMap<String, ContentHash>;
+
+/// The saves [`remember_saved`] recorded. A record that is missing or cannot
+/// be read is empty: losing it costs only the commit, which the user can
+/// make by hand.
+fn saved(state: &StateDir) -> Saved {
+    std::fs::read(state.root().join(SAVED))
+        .ok()
+        .and_then(|bytes| rmp_serde::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Write the record of saves, or remove it when it holds none.
+fn write_saved(state: &StateDir, saved: &Saved) -> std::io::Result<()> {
+    let path = state.root().join(SAVED);
+    if saved.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        };
+    }
+    let bytes = rmp_serde::to_vec(saved).map_err(std::io::Error::other)?;
+    crate::fs::write_atomically(&path, &bytes, crate::fs::Mode::PRIVATE_FILE)
+        .map_err(std::io::Error::other)
+}
+
+/// Whether the repo file `path` holds exactly `bytes` that a save recorded
+/// and no commit has taken yet: a change of bx's own, which
+/// [`commit_carried`] commits, rather than one the user made in the repo.
+pub(crate) fn saved_holds(state: &StateDir, repo: &Path, path: &Path, bytes: &[u8]) -> bool {
+    let root = paths::normalize(repo);
+    let rel = paths::normalize(path);
+    rel.strip_prefix(&root)
+        .ok()
+        .and_then(Path::to_str)
+        .and_then(|rel| saved(state).get(rel).copied())
+        .is_some_and(|digest| digest == ContentHash::of(bytes))
+}
+
+/// Remember that a save wrote each of `written` — a repo file, and the
+/// digest of the bytes it left there — so [`commit_carried`] commits it.
+///
+/// Called under the state directory's exclusive lock, which `lock` proves.
+/// Bookkeeping only: a record that cannot be written is logged, and costs
+/// only the commit.
+pub(crate) fn remember_saved(
+    state: &StateDir,
+    _lock: &crate::state::ExclusiveLock,
+    repo: &Path,
+    written: &[(PathBuf, ContentHash)],
+) {
+    let root = paths::normalize(repo);
+    let mut record = saved(state);
+    let before = record.clone();
+    for (path, digest) in written {
+        let rel = paths::normalize(path);
+        if let Some(rel) = rel.strip_prefix(&root).ok().and_then(Path::to_str) {
+            record.insert(rel.to_string(), *digest);
+        }
+    }
+    if record != before
+        && let Err(error) = write_saved(state, &record)
+    {
+        tracing::warn!(%error, "the record of what bx add saved was not written");
+    }
+}
+
+/// Commit every tracked target's copy that `sync` wrote into the config repo,
+/// and every repo file `bx add` saved an edit into, that git has not
+/// committed yet, in one commit, and return how many files it holds.
+///
+/// A saved file is one `remember_saved` recorded that still holds exactly
+/// the bytes the save left; one edited since is the user's, and is forgotten
+/// rather than committed. Each recorded file this looks at is forgotten once
+/// the commit is made, or once there is nothing to commit.
 ///
 /// A copy is one bx wrote when the ledger records a whole file bx owns inside
 /// the repo and the file still holds exactly the bytes it recorded: `sync` is
@@ -392,6 +482,44 @@ pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error>
             written.insert(rel.to_string());
         }
     }
+    let record = saved(&state);
+    let mut saves = BTreeSet::new();
+    for (rel, digest) in &record {
+        if std::fs::read(repo.join(rel)).is_ok_and(|bytes| ContentHash::of(&bytes) == *digest) {
+            written.insert(rel.clone());
+            saves.insert(rel.clone());
+        }
+    }
+    let committed = commit_paths(git, repo, &written, &removed, &saves)?;
+    // Every save looked at is forgotten: committed, already in `HEAD`, or
+    // edited since, which makes it the user's. Under the lock `bx add`
+    // records them under; one that cannot be taken leaves the record for
+    // the next sync, which finds the same files.
+    if !record.is_empty() {
+        match crate::state::ExclusiveLock::acquire(&state) {
+            Ok(_lock) => {
+                let mut left = saved(&state);
+                left.retain(|rel, digest| record.get(rel) != Some(digest));
+                if let Err(error) = write_saved(&state, &left) {
+                    tracing::warn!(%error, "the record of what bx add saved was not updated");
+                }
+            }
+            Err(error) => tracing::debug!(%error, "the record of saves is left for the next sync"),
+        }
+    }
+    Ok(committed)
+}
+
+/// Commit `written` and the removals in `removed`, the paths in `saves`
+/// among the first being saves `bx add` made, and return how many files
+/// the commit holds: only those whose staged state differs from `HEAD`.
+fn commit_paths(
+    git: &Git,
+    repo: &Path,
+    written: &BTreeSet<String>,
+    removed: &BTreeSet<String>,
+    saves: &BTreeSet<String>,
+) -> Result<usize, Error> {
     if written.is_empty() && removed.is_empty() {
         return Ok(0);
     }
@@ -432,7 +560,13 @@ pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error>
         return Ok(0);
     }
     let paths: Vec<&str> = changed.iter().map(String::as_str).collect();
-    let message = format!("{CARRIED_SUBJECT}\n\n{}\n", paths.join("\n"));
+    let saved = changed.iter().filter(|path| saves.contains(*path)).count();
+    let subject = match (saved, changed.len() - saved) {
+        (0, _) => CARRIED_SUBJECT,
+        (_, 0) => SAVED_SUBJECT,
+        _ => MIXED_SUBJECT,
+    };
+    let message = format!("{subject}\n\n{}\n", paths.join("\n"));
     let mut commit = vec!["commit", "--quiet", "-m", &message, "--"];
     commit.extend(&paths);
     git.remote(repo, &commit)?;
@@ -669,7 +803,7 @@ fn refuse_outgoing_state(
 /// The names the state directory gives its files, taken from [`StateDir`] so
 /// the guard and the layout cannot drift apart.
 struct StateNames {
-    files: [OsString; 3],
+    files: [OsString; 4],
     restore: OsString,
 }
 
@@ -685,13 +819,15 @@ impl StateNames {
                 name(state.local_toml()),
                 name(state.ledger()),
                 name(state.journal()),
+                name(state.root().join(SAVED)),
             ],
             restore: name(state.restore()),
         }
     }
 
     /// Whether the repo path `path` is named as a state file: `local.toml`,
-    /// the ledger or the journal anywhere, or a restore-store blob — a SHA-256
+    /// the ledger, the journal or the record of saves anywhere, or a
+    /// restore-store blob — a SHA-256
     /// digest in hex — directly inside a directory named as the store is.
     fn matches(&self, path: &str) -> bool {
         let mut parts = path.rsplit('/');
@@ -1364,6 +1500,177 @@ mod tests {
         assert_eq!(rev(home.path(), &repo, "HEAD"), head);
     }
 
+    /// A repo declaring `~/.rc` from `files/rc`, committed and pushed, applied
+    /// here, the file then edited and saved into the repo by `bx add`.
+    fn saved_by_add(home: &crate::testing::GuardedHome) -> PathBuf {
+        let layer = "[[target]]\npath = \"~/.rc\"\nfile = \"files/rc\"\n";
+        let repo = cloned(home, layer);
+        std::fs::create_dir_all(repo.join("files")).expect("files");
+        std::fs::write(repo.join("files/rc"), "a\n").expect("the body");
+        commit_all(home.path(), &repo, "rc");
+        run(home.path(), &repo, &["push", "--quiet"]);
+        let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+        crate::plan::run(&inputs, crate::plan::Mode::Apply, &mut |_| Ok(true)).expect("apply");
+        home.write(".rc", "mine\n");
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+        crate::adopt::add(&ctx, &rc).expect("add");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("files/rc")).expect("saved"),
+            "mine\n"
+        );
+        repo
+    }
+
+    #[test]
+    fn an_edit_bx_add_saved_is_committed_once_and_forgotten() {
+        let home = guarded_home();
+        let repo = saved_by_add(&home);
+        let state = StateDir::resolve(home.path());
+        assert_eq!(saved(&state).len(), 1, "the save is recorded");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+
+        assert_eq!(committed, 1);
+        assert_eq!(
+            run(home.path(), &repo, &["log", "-1", "--format=%B"]),
+            format!("{SAVED_SUBJECT}\n\nfiles/rc")
+        );
+        assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+        assert!(saved(&state).is_empty(), "forgotten once committed");
+        assert!(!state.root().join(SAVED).exists());
+        let head = rev(home.path(), &repo, "HEAD");
+        let again = commit_carried(&env(home.path()), &git(home.path()), &repo).expect("again");
+        assert_eq!(again, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    }
+
+    #[test]
+    fn a_commit_holding_a_carried_copy_and_a_save_says_both() {
+        let home = guarded_home();
+        let repo = cloned(
+            &home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \"lock\"\ndirection = \"track\"\n\
+             [[target]]\npath = \"~/.rc\"\nfile = \"files/rc\"\n",
+        );
+        std::fs::write(repo.join("lock"), "a\n").expect("the repo copy");
+        std::fs::create_dir_all(repo.join("files")).expect("files");
+        std::fs::write(repo.join("files/rc"), "a\n").expect("the body");
+        commit_all(home.path(), &repo, "both");
+        run(home.path(), &repo, &["push", "--quiet"]);
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        home.write(".lock", "b\n");
+        sync("the carrying run");
+        home.write(".rc", "mine\n");
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+        crate::adopt::add(&ctx, &rc).expect("add");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+
+        assert_eq!(committed, 2);
+        assert_eq!(
+            run(home.path(), &repo, &["log", "-1", "--format=%B"]),
+            format!("{MIXED_SUBJECT}\n\nfiles/rc\nlock")
+        );
+        assert_eq!(run(home.path(), &repo, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn a_save_into_a_layer_holding_uncommitted_work_is_refused_and_commits_nothing() {
+        let home = guarded_home();
+        let repo = cloned(&home, "[[target]]\npath = \"~/.rc\"\ncontent = \"a\\n\"\n");
+        let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+        crate::plan::run(&inputs, crate::plan::Mode::Apply, &mut |_| Ok(true)).expect("apply");
+        // The user's own work in the layer, not yet committed.
+        let layer = "# my notes\n[[target]]\npath = \"~/.rc\"\ncontent = \"a\\n\"\n";
+        std::fs::write(repo.join("bx.toml"), layer).expect("the user's edit");
+        home.write(".rc", "mine\n");
+        let head = rev(home.path(), &repo, "HEAD");
+
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+        let rows = crate::adopt::add(&ctx, &rc).expect("add");
+
+        let [crate::adopt::Adoption::Refused { note, .. }] = rows.as_slice() else {
+            panic!("not refused: {rows:?}");
+        };
+        assert!(
+            note.contains("holds changes git has not committed"),
+            "{note}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("bx.toml")).expect("the layer"),
+            layer,
+            "the user's layer is as they left it"
+        );
+        let state = StateDir::resolve(home.path());
+        assert!(saved(&state).is_empty(), "nothing is recorded to commit");
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("nothing");
+        assert_eq!(committed, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    }
+
+    #[test]
+    fn a_second_save_over_one_not_yet_committed_is_bx_s_own_and_saved() {
+        let home = guarded_home();
+        let repo = saved_by_add(&home);
+        home.write(".rc", "mine again\n");
+        let ctx = crate::adopt::Context::load(&env(home.path())).expect("context");
+        let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+
+        let rows = crate::adopt::add(&ctx, &rc).expect("add");
+
+        assert!(
+            matches!(rows.as_slice(), [crate::adopt::Adoption::Save { .. }]),
+            "{rows:?}"
+        );
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+        assert_eq!(committed, 1);
+        assert_eq!(
+            run(home.path(), &repo, &["show", "HEAD:files/rc"]),
+            "mine again"
+        );
+    }
+
+    #[test]
+    fn a_saved_file_edited_again_before_the_commit_is_the_users_and_forgotten() {
+        let home = guarded_home();
+        let repo = saved_by_add(&home);
+        std::fs::write(repo.join("files/rc"), "by hand\n").expect("an edit");
+        let head = rev(home.path(), &repo, "HEAD");
+
+        let committed =
+            commit_carried(&env(home.path()), &git(home.path()), &repo).expect("nothing");
+
+        assert_eq!(committed, 0);
+        assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+        assert_eq!(
+            run(home.path(), &repo, &["status", "--porcelain"]),
+            "M files/rc"
+        );
+        assert!(saved(&StateDir::resolve(home.path())).is_empty());
+    }
+
+    #[test]
+    fn a_record_of_saves_that_cannot_be_read_is_empty() {
+        let home = guarded_home();
+        let state = StateDir::resolve(home.path());
+        state.ensure().expect("the state directory");
+        std::fs::write(state.root().join(SAVED), b"\xc1 not msgpack").expect("damage");
+        assert!(saved(&state).is_empty());
+        assert!(StateNames::of(&state).matches("x/saved.mpk"));
+    }
+
     #[test]
     fn a_removed_copy_put_back_before_the_commit_is_not_committed() {
         let home = guarded_home();
@@ -1510,6 +1817,7 @@ mod tests {
             row: 0,
             three_way: None,
             asked: plan::Asked::Edited,
+            save: None,
         };
         assert_eq!(undone(&Report::default()), None);
         // A kept row is unchanged, and a push does not wait on it.

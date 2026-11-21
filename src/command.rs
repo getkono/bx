@@ -195,6 +195,9 @@ pub(crate) enum Answer {
     Keep,
     /// Write bx's bytes over the edit, which `bx rm` then restores.
     Take,
+    /// Save the edit into the repo, or merge it with the repo's change, as
+    /// `bx add` would: the question's [`plan::Question::save`].
+    Save,
     /// Show the question's view, or the row's diff again, then ask again.
     Show,
 }
@@ -213,6 +216,14 @@ const DELETED_CHOICES: [(&str, Answer); 2] = [
     ("keep it deleted", Answer::Keep),
     ("restore bx's", Answer::Take),
 ];
+
+/// The choice that saves an edit into the repo, where only this machine
+/// changed the file.
+const SAVE: (&str, Answer) = ("save mine to the repo", Answer::Save);
+
+/// The choice that merges an edit with the repo's change, where both sides
+/// changed and merge cleanly.
+const MERGE: (&str, Answer) = ("merge both, here and in the repo", Answer::Save);
 
 /// The choice that draws an edited target's three-way view.
 const SHOW_THREE_WAY: (&str, Answer) = ("show the three-way diff", Answer::Show);
@@ -257,6 +268,11 @@ fn asked(
     } else {
         CHOICES.to_vec()
     };
+    choices.extend(question.save.as_ref().map(
+        |save| {
+            if save.writes_machine() { MERGE } else { SAVE }
+        },
+    ));
     let show = match (&question.three_way, &change.diff) {
         (Some(_), _) if question.asked == Asked::Deleted => Some(SHOW_RESTORED),
         (Some(_), _) => Some(SHOW_THREE_WAY),
@@ -463,22 +479,24 @@ pub(crate) fn converge_answering(
         shown = true;
         let mut taken = std::collections::BTreeSet::new();
         let mut kept = std::collections::BTreeSet::new();
+        let mut saved = std::collections::BTreeSet::new();
         if let Some(settle) = settle.as_deref_mut().filter(|_| asking) {
             for question in &report.questions {
-                if settled(out, env, report, question, &mut *settle)? == Answer::Take {
-                    taken.insert(question.row);
-                } else {
-                    kept.insert(question.row);
-                }
+                match settled(out, env, report, question, &mut *settle)? {
+                    Answer::Take => taken.insert(question.row),
+                    Answer::Save => saved.insert(question.row),
+                    Answer::Keep | Answer::Show => kept.insert(question.row),
+                };
             }
         }
         // Every answer kept the edit: nothing is written, so nothing is
         // confirmed, and the answers are remembered.
-        if !report.work && taken.is_empty() {
+        if !report.work && taken.is_empty() && saved.is_empty() {
             return Ok(plan::Approval {
                 approved: false,
                 taken,
                 kept,
+                saved,
             });
         }
         let approved = if yes {
@@ -492,6 +510,7 @@ pub(crate) fn converge_answering(
             approved: decided(report, approved),
             taken,
             kept,
+            saved,
         })
     })?;
 
@@ -509,6 +528,14 @@ pub(crate) fn converge_answering(
             .filter(|action| action.is_pending() || (mode == Mode::Sync && *action == Action::Sync))
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
+        if !report.saved.is_empty() {
+            writeln!(
+                out,
+                "Saved {} edit(s) into the repo; bx sync commits and pushes them.",
+                report.saved.len()
+            )
+            .map_err(Error::Output)?;
+        }
         // A row apply stopped short of was announced as work and shown so; its
         // reason is known only now, so it is said now.
         for &at in &report.stopped {
@@ -546,6 +573,15 @@ fn settled(
                     plan::render_row(change, question.three_way.as_ref(), palette, &env.home);
                 page(out, &view, env)?;
                 out.flush().map_err(Error::Output)?;
+            }
+            // What saving writes, shown before the one confirmation that
+            // makes it.
+            Answer::Save => {
+                if let Some(save) = &question.save {
+                    out.write_all(save_preview(save, &env.home).as_bytes())
+                        .map_err(Error::Output)?;
+                }
+                return Ok(Answer::Save);
             }
             answer => return Ok(answer),
         }
@@ -1018,7 +1054,7 @@ fn init_with(
             if matches!(row, Adoption::Adopt { .. } | Adoption::Own { .. }) {
                 adopted += 1;
             }
-            say(out, &adoption_row(row))
+            say(out, &adoption_row(row, &env.home))
         });
         match deferred {
             Ok(init::Deferred::No) => {}
@@ -1273,29 +1309,97 @@ pub fn not_built(command: &str, err: &mut dyn Write) -> Result<Exit, Error> {
 /// `bx add PATH`: adopt a file, or every regular file under a directory, byte
 /// for byte.
 ///
+/// A file bx manages that was edited on this machine is saved into the repo,
+/// or merged with the repo's own change ([`adopt::save`]): what that writes
+/// is shown first, as diffs, and carried out only once approved — by `yes`,
+/// or by the answer to a prompt when standard input is a terminal. With
+/// neither, it is refused, and nothing is written for it.
+///
 /// Prints one row per path: `+` adopted, `=` already managed, `~` already
-/// declared and now owned, `-` passed over inside a directory, `!` refused.
-/// Exits 0 when everything named was adopted or already managed, and 2 when
-/// something was refused.
+/// declared and now owned, `<` saved into the repo, `-` passed over inside a
+/// directory, `!` refused or merged with conflicts. Exits 0 when everything
+/// named was adopted, saved or already managed, 2 when something was refused
+/// or a merge conflicted, and 130 when the prompt was abandoned.
 ///
 /// # Errors
 ///
-/// Whatever locating, loading or adopting returns.
-pub fn add(env: &Env, cwd: &Path, path: &str, out: &mut dyn Write) -> Result<Exit, adopt::Error> {
+/// Whatever locating, loading, asking or adopting returns.
+pub fn add(
+    env: &Env,
+    cwd: &Path,
+    path: &str,
+    yes: bool,
+    out: &mut dyn Write,
+) -> Result<Exit, adopt::Error> {
+    add_with(env, cwd, path, yes, out, &mut confirm_save)
+}
+
+/// Ask on the terminal whether to make the saves `add` showed. The default
+/// is **no**, and what was typed ahead is discarded, as [`confirm`] does.
+fn confirm_save() -> Result<bool, adopt::Error> {
+    discard_typeahead(std::io::stdin());
+    inquire::Confirm::new("Save these into the repo?")
+        .with_default(false)
+        .prompt()
+        .map_err(|error| {
+            if init::abandoned(&error) {
+                adopt::Error::Canceled
+            } else {
+                adopt::Error::Prompt(error)
+            }
+        })
+}
+
+/// [`add`], with the confirmation asked through `ask`.
+pub(crate) fn add_with(
+    env: &Env,
+    cwd: &Path,
+    path: &str,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
+) -> Result<Exit, adopt::Error> {
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
-    let rows = adopt::add(&ctx, &target)?;
+    let home = ctx.home().to_path_buf();
+    let asked = adopt::add_asking(&ctx, &target, &mut |saves| {
+        if yes {
+            return Ok(true);
+        }
+        let mut text = format!("bx add {target} will:\n");
+        for row in saves {
+            if let Adoption::Save { save, .. } = row {
+                text.push_str(&save_preview(save, &home));
+            }
+        }
+        out.write_all(text.as_bytes())
+            .map_err(adopt::Error::Output)?;
+        out.flush().map_err(adopt::Error::Output)?;
+        if env.stdin_tty { ask() } else { Ok(false) }
+    });
+    let rows = match asked {
+        Ok(rows) => rows,
+        Err(adopt::Error::Canceled) => {
+            writeln!(out, "Canceled. Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other),
+    };
     let mut text = String::new();
     for row in &rows {
-        text.push_str(&adoption_row(row));
+        text.push_str(&adoption_row(row, &home));
     }
-    let adopted = rows
-        .iter()
-        .filter(|row| matches!(row, Adoption::Adopt { .. }))
-        .count();
+    let count = |pick: fn(&Adoption) -> bool| rows.iter().filter(|row| pick(row)).count();
+    let adopted = count(|row| matches!(row, Adoption::Adopt { .. }));
     text.push_str(&format!(
         "Adopted {adopted} file(s); run `bx plan` to see the machine against the repo.\n"
     ));
+    let saved = count(|row| matches!(row, Adoption::Save { save, .. } if !save.repo.is_empty()));
+    if saved > 0 {
+        text.push_str(&format!(
+            "Saved {saved} edit(s) into the repo; bx sync commits and pushes them.\n"
+        ));
+    }
     out.write_all(text.as_bytes())
         .map_err(adopt::Error::Output)?;
     Ok(if rows.iter().any(Adoption::needs_attention) {
@@ -1305,8 +1409,54 @@ pub fn add(env: &Env, cwd: &Path, path: &str, out: &mut dyn Write) -> Result<Exi
     })
 }
 
+/// What saving one edited file will write, as `add` shows it before asking:
+/// what it does, then each diff.
+fn save_preview(save: &adopt::save::Save, home: &Path) -> String {
+    use adopt::save::How;
+    let target = report::escape(save.target.as_str());
+    let files = save.repo_files(home).join(", ");
+    let mut text = match save.how {
+        How::Save => format!("  < {target}  save your edit into {files}\n"),
+        How::Merged => format!(
+            "  < {target}  merge your edit with the repo's change, into {files} and this \
+             file, keeping yours for bx rm\n"
+        ),
+        How::Conflicted => format!(
+            "  ! {target}  your edit and the repo's change conflict: write the merge, with \
+             conflict markers, into this file, keeping yours for bx rm; the repo is not \
+             changed\n"
+        ),
+    };
+    for diff in &save.diffs {
+        for line in diff.lines() {
+            text.push_str("    ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// What saving one edited file did, as its row after the run.
+fn save_row(save: &adopt::save::Save, home: &Path) -> String {
+    use adopt::save::How;
+    let target = report::escape(save.target.as_str());
+    let files = save.repo_files(home).join(", ");
+    match save.how {
+        How::Save => format!("  < {target}  saved into {files}\n"),
+        How::Merged => format!(
+            "  < {target}  merged with the repo's change, into {files} and this file; bx rm \
+             restores yours\n"
+        ),
+        How::Conflicted => format!(
+            "  ! {target}  merged with conflict markers around both sides; resolve them, \
+             then run bx add {target}\n"
+        ),
+    }
+}
+
 /// One `add` row, with its note and any warning on the lines below it.
-fn adoption_row(row: &Adoption) -> String {
+fn adoption_row(row: &Adoption, home: &Path) -> String {
     let target = row.subject();
     match row {
         Adoption::Adopt {
@@ -1329,6 +1479,7 @@ fn adoption_row(row: &Adoption) -> String {
             line
         }
         Adoption::Own { .. } => format!("  ~ {target}  already declared; bx now owns it\n"),
+        Adoption::Save { save, .. } => save_row(save, home),
         Adoption::Unchanged { .. } => format!("  = {target}  already managed\n"),
         Adoption::Skipped { note, .. } => format!("  - {target}  skipped: {note}\n"),
         Adoption::Refused { note, .. } => format!("  ! {target}  {note}\n"),

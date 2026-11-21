@@ -106,7 +106,7 @@ There are fourteen. You should not need a manual.
 |---|---|
 | `bx` | status: every managed target, and what is pending, in conflict or blocked |
 | `bx init` | guided setup |
-| `bx add PATH` | begin managing a config file, or a directory of them |
+| `bx add PATH` | begin managing a config file, or a directory of them; for a file bx manages that you edited, save your edit into the repo, merging it with the repo's change when both moved, once you confirm the diff (`--yes` asks nothing) |
 | `bx rm PATH` | stop managing it, and restore the original, once you confirm what it shows (`--yes` asks nothing) |
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
@@ -259,8 +259,8 @@ or a login banner without anyone parsing its output:
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 The other commands use the same codes. `bx add` exits `2` when it refused a
-path, `bx rm` when a conflict left something as it was, `bx doctor` when it
-has a finding, no config repo at all among them, and
+path or a merge it wrote conflicts, `bx rm` when a conflict left something as
+it was, `bx doctor` when it has a finding, no config repo at all among them, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
 when it was declined and did not carry the `<` rows it announced, and
 `bx update` and `bx upgrade` when declined, even when all they offered was a
@@ -389,6 +389,25 @@ says what the budget covers.
   Any other
   conflict you settle by hand, in the file or in your configuration, and the
   next `plan` reads what you decided.
+- An edit you want everywhere goes into the repo the way `git add` stages
+  one: `bx add PATH` on a file bx manages writes your bytes into its declared
+  body — the repo file a `file` body names, or the `content` of an inline one,
+  edited in place in the layer that declares it — and a mode you set into
+  its `mode`, then records them as what bx wrote, so the next `plan` is
+  empty and `bx sync` commits and pushes the save. Where the repo changed
+  too, bx merges the two with your `git merge-file`, from the copy it kept of
+  what it last wrote: a clean merge is written to the repo and to your file,
+  whose bytes `bx rm` puts back; a conflicting one changes nothing in the
+  repo, and once you confirm writes the conflict markers into your file, for
+  you to resolve and `bx add` again. It shows the diffs first and asks
+  (`--yes` asks nothing; with no terminal it saves nothing). It refuses a
+  secret, a generated file, a region or include line, a tracked file (which
+  `bx sync` carries already), an inline content with a `{{name}}` in it, a
+  repo file another target also delivers, naming that target, and a repo
+  file holding changes you have not committed, so the commit `bx sync`
+  makes holds only the save. At a
+  terminal, `apply`'s question about an edited file offers the same save, or
+  the merge where it is clean.
 - A file or link bx made that you deleted is never silently re-created. While
   the configuration still wants what bx made there, the deletion stands; once
   it wants something else, it is a modify/delete conflict. Either way, at a

@@ -386,6 +386,25 @@ impl Session {
         }
     }
 
+    /// Record `entry` in the session's ledger, saved with every write when
+    /// the session finishes, under the lock it holds.
+    ///
+    /// For a write whose entry must say something other than what it wrote:
+    /// a conflicted merge `bx add` writes into the user's file is recorded at
+    /// what bx last wrote, so the marked file stays an edit `plan` asks about
+    /// (see [`crate::adopt::save::write_machines`]). Not journalled, as
+    /// [`Session::forget`] is not: a session interrupted between its [`End`]
+    /// frame and its save is recovered from its intents, which record what it
+    /// wrote.
+    ///
+    /// # Errors
+    ///
+    /// What [`Ledger::record`] returns, with the ledger unchanged.
+    pub(crate) fn record(&mut self, entry: NewEntry) -> Result<(), Error> {
+        self.ledger.record(entry)?;
+        Ok(())
+    }
+
     /// Make `request` true at its destination, durably and recoverably.
     ///
     /// The one place the ordering discipline [`crate::journal`] documents is expressed,

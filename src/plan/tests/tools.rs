@@ -695,6 +695,7 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            saved: Default::default(),
             kept: std::collections::BTreeSet::new(),
         })
     })
@@ -753,6 +754,7 @@ fn a_kept_edit_of_an_activation_file_keeps_its_wordcode_from_overriding_it() {
         Ok(Approval {
             approved: false,
             taken: std::collections::BTreeSet::new(),
+            saved: Default::default(),
             kept: std::collections::BTreeSet::from([output]),
         })
     })

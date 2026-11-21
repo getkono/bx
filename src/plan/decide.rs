@@ -338,6 +338,33 @@ impl Op {
         &self.target
     }
 
+    /// What plan observed at the destination when it decided this write.
+    pub(super) const fn planned(&self) -> &Observed {
+        &self.planned
+    }
+
+    /// The whole file this write leaves, for a file bx owns whole on this
+    /// machine: what an edit of it is saved against.
+    pub(super) fn whole(&self) -> Option<&[u8]> {
+        match &self.made {
+            Made::Bytes(bytes) if self.claimed && !self.carry => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// The write a held file's question answered *merge* makes in place of
+    /// this one: the merge's `bytes` at `mode`, over the same observation, so
+    /// a file changed while the question was open is refused as any held
+    /// write is.
+    pub(super) fn merged(&self, bytes: Vec<u8>, mode: Mode) -> Self {
+        Self {
+            base: self.base && bytes.len() <= Base::KEPT_WHOLE,
+            made: Made::Bytes(bytes),
+            mode,
+            ..self.clone()
+        }
+    }
+
     /// The bytes this write leaves, when `apply` keeps them in `restore/`
     /// under their digest — which is the [`LedgerEntry::written`] the write
     /// records — as the base a later edit of the file is measured from.

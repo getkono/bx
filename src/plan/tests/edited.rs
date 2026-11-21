@@ -26,6 +26,7 @@ fn answer(inputs: &Inputs, approved: bool, taken: &[usize]) -> Report {
         Ok(Approval {
             approved,
             taken: taken.iter().copied().collect(),
+            saved: Default::default(),
             kept: BTreeSet::new(),
         })
     })
@@ -39,6 +40,7 @@ fn keep(inputs: &Inputs) -> Report {
         Ok(Approval {
             approved: false,
             taken: BTreeSet::new(),
+            saved: Default::default(),
             kept: report
                 .questions
                 .iter()
@@ -302,6 +304,7 @@ fn a_taken_file_changed_while_its_question_was_open_refuses_the_run_before_any_w
         Ok(Approval {
             approved: true,
             taken: BTreeSet::from([0]),
+            saved: Default::default(),
             kept: BTreeSet::new(),
         })
     });
@@ -340,6 +343,7 @@ fn take_crash_child() {
         Ok(Approval {
             approved: true,
             taken: BTreeSet::from([0]),
+            saved: Default::default(),
             kept: BTreeSet::new(),
         })
     })
@@ -497,6 +501,7 @@ fn keep_and_confirm(inputs: &Inputs, approved: bool) -> Report {
         Ok(Approval {
             approved,
             taken: BTreeSet::new(),
+            saved: Default::default(),
             kept: BTreeSet::from([0]),
         })
     })

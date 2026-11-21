@@ -193,7 +193,8 @@ fn a_symlink_is_refused_rather_than_adopted_as_what_it_points_at() {
     assert!(ledger(&home).is_empty(), "nothing owned");
 
     let mut out = Vec::new();
-    let exit = crate::command::add(&env(home.path()), home.path(), ".link", &mut out).expect("add");
+    let exit =
+        crate::command::add(&env(home.path()), home.path(), ".link", false, &mut out).expect("add");
     assert_eq!(exit, Exit::Pending, "a refusal needs a human");
     assert!(
         String::from_utf8(out)
@@ -359,8 +360,14 @@ fn a_line_that_relocates_a_tool_is_a_warning_naming_it_and_the_file_is_still_ado
 
     let mut out = Vec::new();
     plant(&home, ".other.sh", b"export CARGO_HOME=/x\n", 0o644);
-    let exit =
-        crate::command::add(&env(home.path()), home.path(), "~/.other.sh", &mut out).expect("add");
+    let exit = crate::command::add(
+        &env(home.path()),
+        home.path(),
+        "~/.other.sh",
+        false,
+        &mut out,
+    )
+    .expect("add");
     let text = String::from_utf8(out).expect("UTF-8");
     assert_eq!(exit, Exit::Converged, "a warning is not a refusal");
     assert!(text.contains("    warning: line 1: CARGO_HOME "), "{text}");
@@ -413,7 +420,7 @@ fn a_child_whose_name_is_not_utf8_is_skipped_under_its_own_name() {
     assert_eq!(skipped, ["~/d/\u{fffd}"], "{rows:?}");
 
     let mut out = Vec::new();
-    crate::command::add(&env(home.path()), home.path(), "d", &mut out).expect("add");
+    crate::command::add(&env(home.path()), home.path(), "d", false, &mut out).expect("add");
     let out = String::from_utf8(out).expect("UTF-8");
     assert!(out.contains("  - ~/d/\u{fffd}  skipped: "), "{out}");
     assert!(!out.contains("  - ~/d  skipped"), "{out}");
@@ -1157,14 +1164,14 @@ fn a_missing_path_and_no_repo_are_errors() {
     let mut out = Vec::new();
     let e = env(home.path());
     assert!(matches!(
-        crate::command::add(&e, home.path(), ".nothing", &mut out),
+        crate::command::add(&e, home.path(), ".nothing", false, &mut out),
         Err(Error::Missing(missing)) if missing == "~/.nothing"
     ));
 
     let bare = guarded_home();
     plant(&bare, ".x", b"x\n", 0o644);
-    let err =
-        crate::command::add(&env(bare.path()), bare.path(), ".x", &mut out).expect_err("no repo");
+    let err = crate::command::add(&env(bare.path()), bare.path(), ".x", false, &mut out)
+        .expect_err("no repo");
     assert!(matches!(err, Error::RepoMissing(..)), "{err}");
     assert_eq!(
         err.to_string(),
@@ -1183,8 +1190,8 @@ fn a_repo_path_that_is_not_a_directory_says_so() {
     let held = guarded_home();
     plant(&held, ".x", b"x\n", 0o644);
     plant(&held, ".config/bx", b"a file\n", 0o644);
-    let err =
-        crate::command::add(&env(held.path()), held.path(), ".x", &mut out).expect_err("no repo");
+    let err = crate::command::add(&env(held.path()), held.path(), ".x", false, &mut out)
+        .expect_err("no repo");
     assert_eq!(
         err.to_string(),
         "no bx config repo at ~/.config/bx: something that is not a directory is there; move \
@@ -1194,7 +1201,7 @@ fn a_repo_path_that_is_not_a_directory_says_so() {
     let beneath = guarded_home();
     plant(&beneath, ".x", b"x\n", 0o644);
     plant(&beneath, ".config", b"a file\n", 0o644);
-    let err = crate::command::add(&env(beneath.path()), beneath.path(), ".x", &mut out)
+    let err = crate::command::add(&env(beneath.path()), beneath.path(), ".x", false, &mut out)
         .expect_err("no repo");
     assert_eq!(
         err.to_string(),

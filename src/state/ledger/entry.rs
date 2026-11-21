@@ -232,6 +232,43 @@ pub struct LedgerEntry {
     /// losing only this fact, at its next save.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub superseded_absent: bool,
+    /// The answer *keep* a writing run was last given about this target, with
+    /// what both sides were when it was given: see [`Kept`].
+    ///
+    /// Cleared by every [`Ledger::record`], since a write leaves bytes the
+    /// answer was not about. A record that no longer matches what is on disk
+    /// and what bx wants there is never consulted, so a stale one only means
+    /// the question is put again.
+    ///
+    /// Written only when set, so a ledger that holds none saves
+    /// byte-identically to one written before the field existed, and a build
+    /// that predates it ignores it: losing the record, at worst, puts the
+    /// question again. That is all the record is worth, and why it needs no
+    /// new format version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kept: Option<Kept>,
+}
+
+/// An answer *keep* about a target edited, retargeted, re-moded or deleted
+/// since bx left it, and what was there on both sides when it was given.
+///
+/// While what is on disk and what bx wants there are still exactly these,
+/// the answer stands: the target's row says it was kept and is not asked
+/// about again. Once either side changes the question is put again, about
+/// what it changed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Kept {
+    /// The digest of what was on disk: a regular file's bytes, a symlink's
+    /// text as [`crate::fs::link::digest`] spells it, or [`ContentHash::ZERO`]
+    /// where nothing was.
+    pub found: ContentHash,
+    /// The mode of what was on disk, or `None` where nothing was.
+    pub found_mode: Option<Mode>,
+    /// The digest of what bx wanted there instead: the whole file it would
+    /// have written, or the text of the link it would have made.
+    pub wanted: ContentHash,
+    /// The mode bx wanted it at.
+    pub mode: Mode,
 }
 
 /// What an entry keeps of the priors it no longer restores: the two history
@@ -968,6 +1005,64 @@ mod tests {
             reread.get(&target("~/.bashrc")).expect("entry").region,
             None
         );
+    }
+
+    #[test]
+    fn a_kept_answer_is_remembered_until_the_next_record_and_an_older_build_ignores_it() {
+        #[derive(Deserialize)]
+        struct Before {
+            written: ContentHash,
+        }
+        #[derive(Deserialize)]
+        struct BeforeEnvelope {
+            payload: BeforeView,
+        }
+        #[derive(Deserialize)]
+        struct BeforeView {
+            entries: BTreeMap<Portable, Before>,
+        }
+        let kept = Kept {
+            found: ContentHash::of(b"edited"),
+            found_mode: Some(Mode::DEFAULT_FILE),
+            wanted: ContentHash::of(b"new"),
+            mode: Mode::DEFAULT_FILE,
+        };
+        let home = guarded_home();
+        let (dir, lock) = locked(&home);
+        let mut ledger = Ledger::open(&dir, &lock, home.path()).expect("open").value;
+        ledger.record(entry("~/.a", b"bx")).expect("record");
+        ledger.save().expect("save");
+        let without = std::fs::read(dir.ledger()).expect("read");
+
+        assert!(
+            !ledger.keep(&target("~/.b"), kept.clone()),
+            "no entry, no question to remember"
+        );
+        assert!(ledger.keep(&target("~/.a"), kept.clone()));
+        assert!(
+            !ledger.keep(&target("~/.a"), kept.clone()),
+            "the same answer again changes nothing"
+        );
+        ledger.save().expect("save");
+        let with = std::fs::read(dir.ledger()).expect("read");
+        assert_ne!(with, without, "the answer is written");
+
+        // Reconstructible: a build that predates the field reads the ledger,
+        // and what it loses is only the answer, so the question is put again.
+        let old: BeforeEnvelope = rmp_serde::from_slice(&with).expect("an older build decodes it");
+        assert_eq!(
+            old.payload.entries[&target("~/.a")].written,
+            ContentHash::of(b"bx")
+        );
+        let reread = LedgerView::read(&dir, home.path()).expect("read").value;
+        assert_eq!(reread.get(&target("~/.a")).expect("entry").kept, Some(kept));
+
+        // A write leaves bytes the answer was not about, and the ledger
+        // saves as it did before any answer was given.
+        ledger.record(entry("~/.a", b"bx")).expect("record again");
+        assert_eq!(ledger.get(&target("~/.a")).expect("entry").kept, None);
+        ledger.save().expect("save");
+        assert_eq!(std::fs::read(dir.ledger()).expect("read"), without);
     }
 
     #[test]

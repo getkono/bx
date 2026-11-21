@@ -27,8 +27,8 @@ mod view;
 mod write;
 
 pub use entry::{
-    DIR_BYTES, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, clone_removing,
-    clone_written, dir_digest, dir_prior, removed_written,
+    DIR_BYTES, Kept, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef,
+    clone_removing, clone_written, dir_digest, dir_prior, removed_written,
 };
 pub use view::LedgerView;
 pub use write::Ledger;

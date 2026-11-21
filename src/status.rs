@@ -283,9 +283,19 @@ pub fn long(report: &Report, facts: &Facts, home: &Path) -> String {
         gone.hints
             .push(r#"(use "bx rm <path>" to stop managing one apply leaves alone)"#);
     }
-    let settled = [&apply, &edited, &gone, &attention]
-        .iter()
-        .all(|section| section.rows.is_empty());
+    // A kept answer and an undeclared file are rows `apply` leaves alone, so
+    // neither stops the machine matching; every other row is work or a
+    // question.
+    let only = |section: &Section, label: &str| {
+        section
+            .rows
+            .iter()
+            .all(|row| row.trim_start().starts_with(label))
+    };
+    let settled = apply.rows.is_empty()
+        && attention.rows.is_empty()
+        && only(&edited, "kept:")
+        && only(&gone, "undeclared:");
     for section in [&apply, &edited, &carry, &gone, &attention] {
         blocks.extend(section.text());
     }
@@ -666,6 +676,29 @@ Externals due for an update check (use "bx update")
                 "        changed:  ~/.lock\n\n\
                  nothing to apply, this machine matches the configuration\n"
             ),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_kept_answer_or_an_undeclared_file_still_matches_the_configuration() {
+        let report = Report {
+            changes: vec![
+                change("~/.bashrc", Action::Unchanged, Some("kept")),
+                change("~/.d", Action::Undeclared, Some("bx rm releases it")),
+            ],
+            kept: vec![0],
+            ..Report::default()
+        };
+        let shown = long_of(&report, &facts(Branch::NotGit));
+        for line in [
+            "        kept:     ~/.bashrc\n",
+            "        undeclared: ~/.d\n",
+        ] {
+            assert!(shown.contains(line), "{line:?} in {shown}");
+        }
+        assert!(
+            shown.ends_with("nothing to apply, this machine matches the configuration\n"),
             "{shown}"
         );
     }

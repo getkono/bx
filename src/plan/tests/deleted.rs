@@ -594,3 +594,88 @@ fn keeping_writes_nothing_twice_at(
         assert!(std::fs::symlink_metadata(home.child(path)).is_err());
     }
 }
+
+/// A region entry recorded before bx kept a region digest is measured by the
+/// whole file it last left: the region alone is not that file, so a deletion
+/// of it is a modify/delete conflict, and nothing is written without an
+/// answer.
+#[test]
+fn a_deleted_region_file_whose_entry_has_no_region_digest_is_a_conflict() {
+    let home = guarded_home();
+    region_deleted(&home);
+    let state = StateDir::resolve(home.path());
+    let key = Portable::parse_in("~/.zshrc", home.path()).expect("a path");
+    {
+        let lock = crate::state::ExclusiveLock::acquire(&state).expect("the lock");
+        let mut ledger = crate::state::Ledger::open(&state, &lock, home.path())
+            .expect("open")
+            .value;
+        let stored = ledger.forget(&key).expect("the entry");
+        assert!(stored.region.is_some(), "bx kept a region digest");
+        ledger
+            .record(crate::state::NewEntry::new(
+                key,
+                stored.written,
+                stored.mode,
+                stored.mechanism,
+                crate::state::PriorBytes::Absent,
+            ))
+            .expect("a record with no region digest");
+        ledger.save().expect("save");
+    }
+    let inputs = inputs(&home, &interactive("nvim"));
+
+    let planned = plan(&inputs);
+    let at = zshrc(&planned);
+    assert_eq!(planned.changes[at].action, Action::Conflict);
+    let note = planned.changes[at].note.as_deref().expect("a note");
+    assert!(note.starts_with(decide::DELETED_CHANGED), "{note}");
+    assert!(note.ends_with(decide::ASK_DELETED), "{note}");
+    assert_eq!(the_question(&planned).row, at);
+
+    keeping_writes_nothing_twice_at(&home, &inputs, ".zshrc", at, Action::Conflict);
+}
+
+/// A region target that declares a mode is restored at that mode, not the one
+/// bx last left the file at, and the conflict says so. No configuration
+/// declares one today: a region is written for a generated body alone, and
+/// the placement graph declares no mode, so the target is given one here.
+#[test]
+fn a_deleted_region_file_restored_takes_the_mode_its_target_declares() {
+    let home = guarded_home();
+    region_deleted(&home);
+    let mut inputs = inputs(&home, &interactive("nvim"));
+    let declared = inputs
+        .resolved
+        .targets
+        .iter_mut()
+        .find_map(|resolution| match resolution {
+            Resolution::Ready(target) if target.path.as_str() == "~/.zshrc" => Some(target),
+            _ => None,
+        })
+        .expect("the ~/.zshrc region target");
+    assert!(matches!(
+        declared.attach,
+        crate::config::target::Attach::Region { .. }
+    ));
+    assert_eq!(declared.mode, None, "the placement graph declares none");
+    declared.mode = Some(FileMode::from_bits(0o640));
+
+    let planned = plan(&inputs);
+    let at = zshrc(&planned);
+    assert_eq!(planned.changes[at].action, Action::Conflict);
+    let note = planned.changes[at].note.as_deref().expect("a note");
+    assert!(note.starts_with(decide::DELETED_CHANGED), "{note}");
+    assert!(note.contains("mode 0600 -> 0640"), "{note}");
+    assert!(note.ends_with(decide::ASK_DELETED), "{note}");
+    assert_eq!(the_question(&planned).row, at);
+
+    keeping_writes_nothing_twice_at(&home, &inputs, ".zshrc", at, Action::Conflict);
+
+    let restored = answer(&inputs, &[at]);
+    assert!(restored.executed);
+    assert_eq!(restored.changes[at].action, Action::Create);
+    let now = std::fs::read_to_string(home.child(".zshrc")).expect("restored");
+    assert!(now.starts_with("# >>> bx >>>\n"), "{now}");
+    assert_eq!(mode_of(&home.child(".zshrc")), 0o640, "the declared mode");
+}

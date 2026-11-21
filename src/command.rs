@@ -190,7 +190,8 @@ pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
 /// What the user answered about one file edited since bx wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Answer {
-    /// Leave the edit as it is and skip the file, as every conflict is.
+    /// Leave the edit as it is and skip the file, and remember the answer
+    /// until either side changes, so the question is not put again.
     Keep,
     /// Write bx's bytes over the edit, which `bx rm` then restores.
     Take,
@@ -435,8 +436,9 @@ type Prompts<'a, 'b> = (
 /// with a `settle`: otherwise every edited file is kept, as every conflict
 /// is, so `--yes` never writes over an edit. Each answer of *show* draws the
 /// three-way view and asks again. Where the questions were the only work and
-/// every answer kept the edit, the confirmation is not put and nothing is
-/// written.
+/// every answer kept the edit, the confirmation is not put and no target is
+/// written; each answer *keep* is remembered, so its row says it was kept
+/// and asks nothing until either side changes.
 pub(crate) fn converge_answering(
     inputs: &Inputs,
     env: &Env,
@@ -460,15 +462,24 @@ pub(crate) fn converge_answering(
         out.flush().map_err(Error::Output)?;
         shown = true;
         let mut taken = std::collections::BTreeSet::new();
+        let mut kept = std::collections::BTreeSet::new();
         if let Some(settle) = settle.as_deref_mut().filter(|_| asking) {
             for question in &report.questions {
                 if settled(out, env, report, question, &mut *settle)? == Answer::Take {
                     taken.insert(question.row);
+                } else {
+                    kept.insert(question.row);
                 }
             }
         }
+        // Every answer kept the edit: nothing is written, so nothing is
+        // confirmed, and the answers are remembered.
         if !report.work && taken.is_empty() {
-            return Ok(plan::Approval::from(false));
+            return Ok(plan::Approval {
+                approved: false,
+                taken,
+                kept,
+            });
         }
         let approved = if yes {
             true
@@ -480,6 +491,7 @@ pub(crate) fn converge_answering(
         Ok(plan::Approval {
             approved: decided(report, approved),
             taken,
+            kept,
         })
     })?;
 
@@ -667,6 +679,12 @@ fn sync_answering(
                 out,
                 "Pushed {ahead} commit(s) to {}.",
                 pulled.upstream.short
+            )
+        } else if let Some(undone) = sync::undone(&report) {
+            writeln!(
+                out,
+                "Pushed nothing: {ahead} commit(s) wait on {undone}; settle what this apply \
+                 left undone, then run `bx sync` again."
             )
         } else {
             writeln!(
@@ -1044,7 +1062,10 @@ fn init_with(
     // nothing else; a closing line would be a second, different instruction.
     if report.recovered.is_none() {
         let did = answered.created || answered.saved.is_some() || adopted > 0 || report.executed;
-        say(out, init_closing(exit, did))?;
+        say(
+            out,
+            &init_closing(exit, did, sync::undone(&report).as_deref()),
+        )?;
     }
     Ok(exit)
 }
@@ -1065,24 +1086,30 @@ fn init_canceled(out: &mut dyn Write, then: &str) -> Result<Exit, init::Error> {
 }
 
 /// `init`'s last line: where the machine stands and what to run next. `did`
-/// is whether this run wrote anything at all.
-const fn init_closing(exit: Exit, did: bool) -> &'static str {
-    match (exit, did) {
+/// is whether this run wrote anything at all, and `undone` the rows it left
+/// in conflict or blocked, as [`sync::undone`] names them: what is left is
+/// those, which another `bx init` does not settle, where there are any.
+fn init_closing(exit: Exit, did: bool, undone: Option<&str>) -> String {
+    match (exit, did, undone) {
         // Not "nothing to answer": config left unmanaged is offered again on
         // every interactive run, so this may follow a question.
-        (Exit::Converged, false) => {
-            "Already set up: nothing to apply. Manage a file with `bx add PATH`; change an \
-             answer with `bx init --set NAME=VALUE`.\n"
-        }
-        (Exit::Converged, true) => {
-            "Set up. Manage a file with `bx add PATH`; change an answer with \
-             `bx init --set NAME=VALUE`.\n"
-        }
-        (Exit::Pending, _) => {
+        (Exit::Converged, false, _) => "Already set up: nothing to apply. Manage a file with \
+                                        `bx add PATH`; change an answer with `bx init --set \
+                                        NAME=VALUE`.\n"
+            .to_string(),
+        (Exit::Converged, true, _) => "Set up. Manage a file with `bx add PATH`; change an \
+                                       answer with `bx init --set NAME=VALUE`.\n"
+            .to_string(),
+        (Exit::Pending, _, Some(undone)) => format!(
+            "Not finished: {undone} left undone; see the plan above, settle them, then run `bx \
+             apply` again.\n"
+        ),
+        (Exit::Pending, _, None) => {
             "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
+                .to_string()
         }
         // Neither is an exit a plan produces.
-        (Exit::Error | Exit::Canceled, _) => "",
+        (Exit::Error | Exit::Canceled, ..) => String::new(),
     }
 }
 

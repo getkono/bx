@@ -390,7 +390,9 @@ pub fn render(report: &Report, view: View, palette: Palette, home: &Path) -> Str
     for (at, change) in report.changes.iter().enumerate() {
         // A deletion that stands is unchanged, and still said, as `git
         // status` says one: it is a question a writing run asks.
-        let asked = report.questions.iter().any(|question| question.row == at);
+        // So is a row whose question stands answered *keep*.
+        let asked =
+            report.questions.iter().any(|question| question.row == at) || report.kept.contains(&at);
         if view == View::Plan
             && change.action == Action::Unchanged
             && !interrupted(report)

@@ -131,6 +131,12 @@ pub struct Report {
     /// writing run asks at a terminal. Its row is a conflict, or a deletion
     /// that stands, whose note says so in every mode.
     pub questions: Vec<Question>,
+    /// Each row whose question was answered *keep* — by an earlier run, while
+    /// both sides are still what they were then, or by this one — by index
+    /// into [`Report::changes`], ascending. Its row is unchanged, says it was
+    /// kept, and is shown in every view, as a deletion that stands is; it is
+    /// not one of [`Report::questions`], and nothing waits on it.
+    pub kept: Vec<usize>,
     /// Whether a writing run has work to write beside what its questions are
     /// answered with. Set before `approve` is asked, so it can tell whether
     /// to put the one confirmation once every question is answered *keep*.
@@ -206,10 +212,35 @@ impl Asked {
         let stood = note
             .filter(|_| self == Self::Deleted)
             .map(|note| note.replace(decide::DELETED, STOOD));
-        match stood.as_deref().or(note) {
-            Some(note) if note.contains(self.ask()) => note.replace(self.ask(), self.taken()),
-            Some(note) => format!("{note}; {}", self.taken()),
-            None => self.taken().to_string(),
+        Self::replaced(stood.as_deref().or(note), self.ask(), self.taken())
+    }
+
+    /// What takes [`Asked::ask`]'s place in the row's note while its
+    /// question stands answered *keep*.
+    const fn kept_as(self) -> &'static str {
+        match self {
+            Self::Edited => KEPT,
+            Self::Mode => KEPT_MODE,
+            Self::Region => KEPT_REGION,
+            Self::Retargeted => KEPT_RETARGETED,
+            Self::Deleted => KEPT_DELETED,
+        }
+    }
+
+    /// `note`, the row's, while its question stands answered *keep*: the
+    /// question gives way to the answer, and every other part of the note
+    /// stays, as [`Asked::answered`] keeps it.
+    pub(crate) fn kept(self, note: Option<&str>) -> String {
+        Self::replaced(note, self.ask(), self.kept_as())
+    }
+
+    /// `note` with `ask` replaced by `with`, or `with` added where it does
+    /// not say `ask`.
+    fn replaced(note: Option<&str>, ask: &str, with: &str) -> String {
+        match note {
+            Some(note) if note.contains(ask) => note.replace(ask, with),
+            Some(note) => format!("{note}; {with}"),
+            None => with.to_string(),
         }
     }
 }
@@ -223,13 +254,18 @@ pub struct Approval {
     /// Each [`Question::row`] answered *take bx's*. A row not named here is
     /// skipped, as every conflict is.
     pub taken: BTreeSet<usize>,
+    /// Each [`Question::row`] answered *keep*, which is remembered in the
+    /// ledger so the question is not put again while both sides stay as
+    /// they are — unless the run is declined, which remembers nothing. A row
+    /// named in neither set was not answered, and is asked again.
+    pub kept: BTreeSet<usize>,
 }
 
 impl From<bool> for Approval {
     fn from(approved: bool) -> Self {
         Self {
             approved,
-            taken: BTreeSet::new(),
+            ..Self::default()
         }
     }
 }
@@ -249,6 +285,27 @@ pub(crate) const TAKEN_RETARGETED: &str = "you took bx's target, and bx rm resto
 
 /// What a deleted target's row says once its answer restored it.
 pub(crate) const RESTORED: &str = "you restored bx's";
+
+/// What an edited file's row says while its answer *keep* stands.
+pub(crate) const KEPT: &str =
+    "you kept your edit, and bx asks again once it or what bx wants there changes";
+
+/// What a file's row says while its answer *keep* about its mode stands.
+pub(crate) const KEPT_MODE: &str =
+    "you kept your mode, and bx asks again once it or what bx wants there changes";
+
+/// What an edited region's row says while its answer *keep* stands.
+pub(crate) const KEPT_REGION: &str = "you kept your edit to bx's region, and bx asks again once \
+                                      the file or what bx wants there changes";
+
+/// What a retargeted link's row says while its answer *keep* stands.
+pub(crate) const KEPT_RETARGETED: &str =
+    "you kept your target, and bx asks again once it or what bx wants there changes";
+
+/// What a deleted target's row says while its answer *keep it deleted*
+/// stands.
+pub(crate) const KEPT_DELETED: &str = "you kept it deleted, and bx asks again once something is \
+                                       there or what bx wants there changes";
 
 /// What a pending link's child asked about says in place of its question:
 /// its commit arrived only after this run's questions were put.
@@ -316,7 +373,13 @@ pub fn run(
 /// makes is the one the decision produced. An answer selects that write; it
 /// never decides one. `approve` is asked when there is work to write or a
 /// question to answer, and a run whose only work was its questions, all
-/// answered *keep*, writes nothing and opens no session.
+/// answered *keep*, writes no target and opens no session.
+///
+/// An answer *keep* is remembered in the target's ledger entry, against
+/// what both sides were when it was given, unless the run is declined: while
+/// both are still exactly that, every later run's row says it was kept and
+/// asks nothing. A row answered *take bx's* is written, and its write
+/// clears any answer remembered there.
 ///
 /// # Errors
 ///
@@ -470,6 +533,7 @@ fn decide_and_write(
     targets.append(&mut expansion.targets);
     let decided = decide::decide_all(&targets, &ctx)?;
     report.changes = decided.changes;
+    report.kept = decided.kept;
     // What bx last wrote at each edited file, read back from where `apply`
     // kept it, is the base of the view its question offers.
     report.questions = decided
@@ -548,11 +612,24 @@ fn decide_and_write(
                     tied.row == *row && tied.asked() && !approval.taken.contains(&tied.source)
                 })
             };
+            // Each question answered *keep*, with what both its sides were
+            // when it was: remembered unless the run is declined.
+            let keeps: Vec<Answered> = held
+                .iter()
+                .filter(|(row, _)| approval.kept.contains(row))
+                .map(|(row, op)| Answered {
+                    row: *row,
+                    target: op.target().clone(),
+                    both: op.kept(),
+                    asked: op.asked(ledger.get(op.target())),
+                })
+                .collect();
             let taken: Vec<_> = held
                 .drain(..)
                 .filter(|(row, _)| approval.taken.contains(row) && !alone(row))
                 .collect();
             if !report.work && taken.is_empty() {
+                remember_kept(inputs, &keeps, &mut tied, &mut report)?;
                 track::agree(inputs, &bases, &agreed, mode, false)?;
                 return Ok(report);
             }
@@ -674,11 +751,62 @@ fn decide_and_write(
             if !inputs.activations.is_empty() {
                 record_activations(&inputs.state, &report.activations)?;
             }
+            remember_kept(inputs, &keeps, &mut tied, &mut report)?;
             report.executed = true;
             track::agree(inputs, &bases, &agreed, mode, true)?;
             Ok(report)
         }
     }
+}
+
+/// A question this run was answered *keep* about.
+struct Answered {
+    /// Its row, by index into [`Report::changes`].
+    row: usize,
+    /// The target it is about.
+    target: Portable,
+    /// What both its sides were when it was answered.
+    both: state::Kept,
+    /// What it asked.
+    asked: Asked,
+}
+
+/// Remember each answer in `kept` in the ledger, under the exclusive lock,
+/// and turn its row into the kept row the next run's plan shows, with any
+/// wordcode tied to it: see [`decide::keep_rows`].
+///
+/// Bookkeeping only, as [`record_activations`] is: no target is touched, so
+/// it is made outside any session, and a ledger already holding every answer
+/// is not written. A record lost — a crash before the save, a ledger an
+/// older bx saved since — costs only the question, put again.
+fn remember_kept(
+    inputs: &Inputs,
+    kept: &[Answered],
+    tied: &mut Vec<decide::Tied>,
+    report: &mut Report,
+) -> Result<(), Error> {
+    if kept.is_empty() {
+        return Ok(());
+    }
+    inputs.state.ensure()?;
+    let lock = ExclusiveLock::acquire(&inputs.state)?;
+    let mut ledger = state::Ledger::open(&inputs.state, &lock, &inputs.home)?.value;
+    let mut changed = false;
+    for answer in kept {
+        changed |= ledger.keep(&answer.target, answer.both.clone());
+    }
+    if changed {
+        ledger.save()?;
+    }
+    let answered: Vec<_> = kept
+        .iter()
+        .map(|answer| (answer.row, answer.asked))
+        .collect();
+    report
+        .kept
+        .extend(decide::keep_rows(&mut report.changes, tied, &answered));
+    report.kept.sort_unstable();
+    Ok(())
 }
 
 /// Remove each checkout nothing declares any more that `plan` announced as
@@ -821,6 +949,12 @@ fn link_pending(
             .as_deref()
             .map(|note| note.replace(ask, ASK_NEXT));
     }
+    // A child an earlier run was answered *keep* about is said kept, as any
+    // target is, at the row it is appended as.
+    let first = report.changes.len();
+    report
+        .kept
+        .extend(decided.kept.iter().map(|row| first + row));
     for change in decided.changes {
         // A child that is a conflict or blocked was never shown as one, so
         // it is said with the rows apply stopped short of.

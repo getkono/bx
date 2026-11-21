@@ -153,9 +153,6 @@ pub struct Save {
     /// write is staged against, and what a save records as the file `bx rm`
     /// gives back.
     pub(crate) observed: Observed,
-    /// What bx last wrote there, and the mode it set, which a conflicted
-    /// merge's entry keeps.
-    pub(crate) base: (ContentHash, Mode),
     /// The diffs to show before it is confirmed: each repo file, then the
     /// machine file for a merge.
     pub diffs: Vec<String>,
@@ -224,10 +221,10 @@ impl Save {
 /// later edit is merged from.
 ///
 /// The session keeps the bytes each write displaces, the user's own, as the
-/// prior `bx rm` restores. A conflicted merge's entry is recorded at what bx
-/// last wrote in that same session, saved with its write under the one lock,
-/// so the marked file is an edit `plan` asks about rather than bytes of bx's
-/// an `apply` would replace.
+/// prior `bx rm` restores. A conflicted merge's write records its entry at
+/// what bx last wrote, and its journal intent says so, so the marked file is
+/// an edit `plan` asks about rather than bytes of bx's an `apply` would
+/// replace — after this session finishes, and after a recovery of it.
 ///
 /// # Errors
 ///
@@ -246,21 +243,14 @@ pub(crate) fn write_machines(
         let scope = merges.iter().map(|save| save.target.clone()).collect();
         let mut session = Session::open_locked(state, SessionKind::Apply, home, scope, lock)?;
         for save in &merges {
-            session.apply(save.request(home))?;
-        }
-        // In the same session, so the ledger is saved once, under the one
-        // lock, never claiming the marked file as bx's.
-        for save in merges.iter().filter(|save| save.how == How::Conflicted) {
-            let (written, mode) = save.base;
-            session.record(NewEntry::new(
-                save.target.clone(),
-                written,
-                mode,
-                Mechanism::Own,
-                // Kept: the write already took the user's bytes as the
-                // prior, and an absent prior never replaces a stored one.
-                PriorBytes::Absent,
-            ))?;
+            if save.how == How::Conflicted {
+                // Left at what bx last wrote by the write itself, and named
+                // so in its journal intent: neither the session nor a
+                // recovery of it ever claims the marked file as bx's.
+                session.apply_keeping_written(save.request(home))?;
+            } else {
+                session.apply(save.request(home))?;
+            }
         }
         session.finish()?;
     }
@@ -380,7 +370,6 @@ fn decided(
         bytes,
         mode,
         observed: observed.clone(),
-        base: (entry.written, entry.mode),
         diffs,
     })
 }

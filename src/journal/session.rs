@@ -54,6 +54,9 @@ pub struct Session {
     /// nothing `plan` promised to remove.
     forgotten: std::collections::BTreeSet<PathBuf>,
     crash: Crash,
+    /// Whether the next file write leaves the ledger's record of what bx
+    /// last wrote as it is. Set only for one [`Session::apply_keeping_written`].
+    keep_written: bool,
     /// Called with the destination just before a write is published, so a test
     /// can make the publish fail the way a concurrent change to the destination
     /// would.
@@ -319,6 +322,7 @@ impl Session {
             released: std::collections::BTreeSet::new(),
             forgotten: std::collections::BTreeSet::new(),
             crash: Crash::from_env(),
+            keep_written: false,
             #[cfg(test)]
             before_publish: None,
             #[cfg(test)]
@@ -386,23 +390,31 @@ impl Session {
         }
     }
 
-    /// Record `entry` in the session's ledger, saved with every write when
-    /// the session finishes, under the lock it holds.
+    /// [`Session::apply`] a file write `request`, leaving the ledger's record
+    /// of what bx last wrote to its target — the digest and the mode — as it
+    /// is, rather than recording the bytes it writes.
     ///
     /// For a write whose entry must say something other than what it wrote:
     /// a conflicted merge `bx add` writes into the user's file is recorded at
     /// what bx last wrote, so the marked file stays an edit `plan` asks about
-    /// (see [`crate::adopt::save::write_machines`]). Not journalled, as
-    /// [`Session::forget`] is not: a session interrupted between its [`End`]
-    /// frame and its save is recovered from its intents, which record what it
-    /// wrote.
+    /// (see [`crate::adopt::save::write_machines`]). The prior and the claimed
+    /// directories are recorded as for any write. The write's [`Intent`] says
+    /// so in [`Intent::keeps_written`], so a session interrupted after its
+    /// [`End`] frame — before its ledger save or after it — is recovered to
+    /// the same entry, never to one claiming the written bytes as bx's. Only a
+    /// [`Content::Bytes`] request bx owns, to a target the ledger already
+    /// holds, is recorded this way; any other is applied as [`Session::apply`]
+    /// applies it.
     ///
     /// # Errors
     ///
-    /// What [`Ledger::record`] returns, with the ledger unchanged.
-    pub(crate) fn record(&mut self, entry: NewEntry) -> Result<(), Error> {
-        self.ledger.record(entry)?;
-        Ok(())
+    /// What [`Session::apply`] returns.
+    pub(crate) fn apply_keeping_written(&mut self, request: Request) -> Result<(), Error> {
+        self.keep_written = true;
+        let applied = self.apply(request);
+        // Consumed by the write it was for, and never carried to the next.
+        self.keep_written = false;
+        applied
     }
 
     /// Make `request` true at its destination, durably and recoverably.
@@ -686,6 +698,15 @@ impl Session {
         // constrain it. `missing_parents` leaves the same directories out of what is
         // read beforehand, and `claimable` drops them from what `stage` made.
         let created_dirs = missing_parents(&dest, &self.home, &self.created);
+        // What bx last wrote, where `apply_keeping_written` asked for the
+        // entry to stay at it: only for a target bx owns and already holds.
+        let kept = match ownership {
+            Ownership::Owned(_) if std::mem::take(&mut self.keep_written) => self
+                .ledger
+                .get(&target)
+                .map(|entry| (entry.written, entry.mode)),
+            Ownership::Owned(_) | Ownership::Released => None,
+        };
         // Assembled now, while the writer still holds the prior, and handed to
         // the ledger only once the write has landed. `None` is the restore half
         // of `bx rm`: bx is handing the target back, so there is nothing left for
@@ -703,11 +724,14 @@ impl Session {
                     //
                     // Assembled from the observation rather than a staged
                     // write, because none exists yet: the same fields
-                    // `NewEntry::for_write` fills in, from the same prior.
+                    // `NewEntry::for_write` fills in, from the same prior,
+                    // at what bx last wrote where `apply_keeping_written`
+                    // asked for that.
+                    let (written, at) = kept.unwrap_or((ContentHash::of(bytes), mode));
                     let entry = NewEntry::new(
                         target.clone(),
-                        ContentHash::of(bytes),
-                        mode,
+                        written,
+                        at,
                         mechanism.clone(),
                         PriorBytes::of(&observed),
                     )
@@ -745,6 +769,7 @@ impl Session {
             ledger_written,
             dir: false,
             link: false,
+            keeps_written: kept.is_some(),
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -952,6 +977,7 @@ impl Session {
             ledger_written,
             dir: false,
             link: true,
+            keeps_written: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1065,6 +1091,7 @@ impl Session {
             ledger_written: self.ledger.get(&target).map(|entry| entry.written),
             dir: false,
             link,
+            keeps_written: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1185,6 +1212,7 @@ impl Session {
             ledger_written,
             dir: true,
             link: false,
+            keeps_written: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 
@@ -1256,6 +1284,7 @@ impl Session {
             ledger_written: self.ledger.get(&target).map(|entry| entry.written),
             dir: true,
             link: false,
+            keeps_written: false,
         }))?;
         self.crash.reached(index, Phase::AfterIntent);
 

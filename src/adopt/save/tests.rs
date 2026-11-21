@@ -368,6 +368,85 @@ fn rm_after_a_conflicted_merge_leaves_the_marked_file_as_a_conflict() {
     assert_eq!(written(&home), ContentHash::of(BASE), "still declared");
 }
 
+/// The home the conflicted-merge crash child saves in.
+const CONFLICT_CRASH_HOME: &str = "BX_ADD_CONFLICT_CRASH_HOME";
+
+#[test]
+#[ignore = "spawned by the conflicted-merge crash harness; it aborts on purpose"]
+fn conflicted_merge_crash_child() {
+    let Some(home) = std::env::var_os(CONFLICT_CRASH_HOME) else {
+        return;
+    };
+    let home = Path::new(&home);
+    let mut out = Vec::new();
+    crate::command::add(&env(home), home, ".rc", true, &mut out).expect("add");
+}
+
+#[test]
+fn a_conflicted_merge_killed_as_its_session_finishes_recovers_to_an_edit_plan_asks_about() {
+    // The defect: the write's journal intent named the marked bytes as what
+    // bx left, so a crash after the `End` frame — before the ledger save, or
+    // after it and before the journal went — had recovery record the marked
+    // file as bx's own, and the next apply wrote the repo's bytes over it
+    // unasked.
+    for phase in crate::journal::tests::finish_crash_phases() {
+        let home = applied(FILE_BODY, BASE);
+        std::fs::write(rc(&home), b"one\nmine\nthree\n").expect("edit here");
+        std::fs::write(home.child(".config/bx/files/rc"), b"one\ntheirs\nthree\n").expect("there");
+
+        let output =
+            crate::testing::ignored_child("adopt::save::tests::conflicted_merge_crash_child")
+                .env("BX_CRASH_AT", format!("1:{phase}"))
+                .env(CONFLICT_CRASH_HOME, home.path())
+                .env_remove("LLVM_PROFILE_FILE")
+                .output()
+                .expect("spawn the crash child");
+        assert!(!output.status.success(), "{phase}: the child did not stop");
+        let state = StateDir::resolve(home.path());
+        assert!(state.journal().exists(), "{phase}: interrupted");
+        let marked = std::fs::read(rc(&home)).expect("the marked file");
+        assert!(
+            String::from_utf8_lossy(&marked).contains("<<<<<<< yours\nmine\n"),
+            "{phase}: the merge landed"
+        );
+
+        let mut out = Vec::new();
+        crate::command::apply(&env(home.path()), true, &mut out).expect("the recovering apply");
+        let text = String::from_utf8(out).expect("UTF-8");
+        assert!(!state.journal().exists(), "{phase}: recovered: {text}");
+        assert_eq!(
+            std::fs::read(rc(&home)).expect("read"),
+            marked,
+            "{phase}: never written over unasked: {text}"
+        );
+        assert_eq!(
+            written(&home),
+            ContentHash::of(BASE),
+            "{phase}: still bx's last write"
+        );
+        let (exit, shown) = plan(&home);
+        assert_eq!(
+            exit,
+            Exit::Pending,
+            "{phase}: an edit plan asks about: {shown}"
+        );
+        assert!(
+            shown.contains("edited since bx last wrote it"),
+            "{phase}: {shown}"
+        );
+
+        // And the apply after it, with nobody to ask, leaves the edit.
+        let mut out = Vec::new();
+        crate::command::apply(&env(home.path()), true, &mut out).expect("the next apply");
+        assert_eq!(
+            std::fs::read(rc(&home)).expect("read"),
+            marked,
+            "{phase}: {}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+}
+
 #[test]
 fn both_sides_changed_with_no_base_kept_is_refused() {
     let home = applied(FILE_BODY, BASE);

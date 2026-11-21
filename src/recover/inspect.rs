@@ -99,7 +99,9 @@ pub(super) enum Step {
 /// user's original out of reach of `rm`.
 ///
 /// So a write the ledger already holds is skipped. "Already holds" is the
-/// stored entry being at the intent's `after` digest and mode while the ledger
+/// stored entry being at the intent's `after` digest and mode (or still at
+/// [`Intent::ledger_written`], where [`Intent::keeps_written`] says the
+/// session left it there) while the ledger
 /// the session opened was not at that digest ([`Intent::ledger_written`]). An
 /// entry still at `after` that the session also found there is re-recorded,
 /// which is idempotent: nothing in the stored entry turns on whether it was
@@ -216,7 +218,22 @@ pub(super) fn decide(
         )
     };
     let written = match (intent.after, intent.mechanism.clone(), &intent.before) {
-        (Written::Present { digest, mode }, Some(mechanism), _) => Some((digest, mode, mechanism)),
+        // At what the session records it at, which is `after` unless the
+        // intent keeps what bx last wrote: a conflicted merge does, so the
+        // marked file stays an edit `plan` asks about. At the stored entry's
+        // mode, which the session left as it was, while the ledger holds it.
+        (Written::Present { digest, mode }, Some(mechanism), _) => {
+            match intent.ledger_written.filter(|_| intent.keeps_written) {
+                None => Some((digest, mode, mechanism)),
+                Some(written) => {
+                    let mode = ledger
+                        .and_then(|ledger| ledger.get(&intent.target))
+                        .filter(|stored| stored.written == written)
+                        .map_or(mode, |stored| stored.mode);
+                    Some((written, mode, mechanism))
+                }
+            }
+        }
         // A removal that kept its entry — a tracked target's deletion carried
         // to its other side — is recorded as the session records it: at the
         // absence, at the mode of the bytes it removed, which become its prior.

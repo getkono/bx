@@ -153,7 +153,8 @@ pub struct Intent {
     ///
     /// The one fact a terminated journal cannot otherwise tell recovery: whether
     /// the ledger save in [`Session::finish`](super::Session::finish) happened before the process died.
-    /// A save that happened leaves the target recorded at [`Intent::after`]; one
+    /// A save that happened leaves the target recorded at [`Intent::after`]
+    /// (or still at this digest, where [`Intent::keeps_written`] says so); one
     /// that did not leaves it at this digest. Recovery rebuilds only the second,
     /// because re-recording the first hands the ledger bx's own earlier output
     /// as if a third party had written it. See [`crate::recover`].
@@ -185,6 +186,19 @@ pub struct Intent {
     /// acting on it.
     #[serde(default)]
     pub link: bool,
+    /// Whether the session leaves the ledger's record of what bx last wrote
+    /// to this target as it found it — [`Intent::ledger_written`], at the
+    /// mode the entry holds — rather than recording [`Intent::after`].
+    ///
+    /// A conflicted merge `bx add` writes into the user's file is recorded
+    /// this way, so the marked file stays an edit `plan` asks about (see
+    /// `adopt::save::write_machines`). Recovery records a terminated write
+    /// that says so at `ledger_written`, never at `after`, so a crash after
+    /// the write never hands the marked file to the ledger as bx's own.
+    /// Left out of the frame when `false`, so a journal holding no such write
+    /// is encoded as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_written: bool,
 }
 
 impl Intent {

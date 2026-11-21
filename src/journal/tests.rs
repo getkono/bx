@@ -254,6 +254,7 @@ pub(crate) fn intent(target: &Portable, dest: &Path, bytes: &[u8]) -> Intent {
         ledger_written: None,
         dir: false,
         link: false,
+        keeps_written: false,
     }
 }
 

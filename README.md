@@ -145,7 +145,8 @@ module, edited by hand, and a secret is encrypted or re-encrypted to them with
 `local.toml`, `~/.ssh/id_ed25519` when it names none: an age identity file, as
 `age-keygen` or `age -p` writes it, or any ssh private key age reads. A
 passphrase-protected one is never asked for by `plan` or `apply`; only
-`bx secret list` asks, and only at a terminal.
+`bx secret list` asks, and only at a terminal, once per secret; Esc at the
+prompt lists the rest as locked without asking again.
 
 ### Reading a plan
 

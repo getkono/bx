@@ -1102,8 +1102,9 @@ fn recovered(report: &Report, outcome: &crate::recover::Outcome) -> String {
 /// The one command that may ask for an identity's passphrase, and only when
 /// standard input is a terminal; without one a locked identity is reported as
 /// locked. Each secret is checked on its own, so a locked identity is asked
-/// for once per secret: nothing keeps a passphrase between them. Nothing is
-/// written.
+/// for once per secret: nothing keeps a passphrase between them. A prompt
+/// left with Esc or Ctrl-C asks nothing more: the rest of the secrets locked
+/// by that identity are listed as locked. Nothing is written.
 ///
 /// Exits [`Exit::Converged`] when every secret can be decrypted, and
 /// [`Exit::Pending`] when one cannot.
@@ -1116,21 +1117,37 @@ pub fn secret_list(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     secret_list_with(env, out, &mut ask_passphrase)
 }
 
-/// Ask on the terminal for an identity's passphrase, masked. A prompt that
-/// fails or is cancelled is no passphrase, and the identity stays locked.
-fn ask_passphrase(shown: &str) -> Option<Passphrase> {
-    inquire::Password::new(&format!("Passphrase for {shown}:"))
+/// What a passphrase prompt answered.
+enum Asked {
+    /// The passphrase typed.
+    Given(Passphrase),
+    /// None: the prompt failed. The identity stays locked, and the next
+    /// secret asks again.
+    Nothing,
+    /// The prompt was left with Esc or Ctrl-C: ask about this identity no
+    /// more.
+    Left,
+}
+
+/// Ask on the terminal for an identity's passphrase, masked.
+fn ask_passphrase(shown: &str) -> Asked {
+    use inquire::InquireError::{OperationCanceled, OperationInterrupted};
+
+    match inquire::Password::new(&format!("Passphrase for {shown}:"))
         .without_confirmation()
         .prompt()
-        .ok()
-        .map(Passphrase::from)
+    {
+        Ok(passphrase) => Asked::Given(Passphrase::from(passphrase)),
+        Err(OperationCanceled | OperationInterrupted) => Asked::Left,
+        Err(_) => Asked::Nothing,
+    }
 }
 
 /// [`secret_list`], with the passphrase asked through `ask`.
 fn secret_list_with(
     env: &Env,
     out: &mut dyn Write,
-    ask: &mut dyn FnMut(&str) -> Option<Passphrase>,
+    ask: &mut dyn FnMut(&str) -> Asked,
 ) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
     let secrets = &inputs.resolved().secrets;
@@ -1139,6 +1156,9 @@ fn secret_list_with(
 
     let mut text = String::new();
     let mut all = true;
+    // Nothing asks without a terminal. One identity decrypts every secret,
+    // so a prompt left once is left for all that follow.
+    let mut ask_no_more = !env.stdin_tty;
     for (declared, resolution) in inputs.declared_targets() {
         let Body::Secret(written) = &declared.body else {
             continue;
@@ -1156,8 +1176,17 @@ fn secret_list_with(
                 let status = plan::read_repo_file(target, inputs.repo(), rel)
                     .map_err(|error| format!("unreadable: {error}"))
                     .and_then(|bytes| {
-                        let unlock = if env.stdin_tty {
-                            Unlock::Ask(&mut *ask)
+                        let asks = !ask_no_more;
+                        let mut asking = |shown: &str| match ask(shown) {
+                            Asked::Given(passphrase) => Some(passphrase),
+                            Asked::Nothing => None,
+                            Asked::Left => {
+                                ask_no_more = true;
+                                None
+                            }
+                        };
+                        let unlock = if asks {
+                            Unlock::Ask(&mut asking)
                         } else {
                             Unlock::Never
                         };

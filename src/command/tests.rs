@@ -36,8 +36,8 @@ fn prompts_child() {
     let settled = ask_edited("~/.a was edited", &CHOICES);
     assert!(matches!(settled, Err(Error::Prompt(NotTTY))), "{settled:?}");
     assert!(
-        ask_passphrase("~/.ssh/id_ed25519").is_none(),
-        "a prompt with no terminal is no passphrase"
+        matches!(ask_passphrase("~/.ssh/id_ed25519"), Asked::Nothing),
+        "a prompt with no terminal is no passphrase, and not one left with Esc"
     );
     // `init`'s questions: a value, asked afresh or again after a
     // problem, and the files to adopt.
@@ -1041,7 +1041,7 @@ fn seal(home: &crate::testing::GuardedHome, name: &str, recipient: &str) {
         .expect("the ciphertext");
 }
 
-fn no_passphrase(_: &str) -> Option<Passphrase> {
+fn no_passphrase(_: &str) -> Asked {
     panic!("nothing should have asked for a passphrase")
 }
 
@@ -1130,7 +1130,7 @@ fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret()
     let mut out = Vec::new();
     let exit = secret_list_with(&tty, &mut out, &mut |shown| {
         asked.push(shown.to_string());
-        Some(Passphrase::from(LOCKED_PASSPHRASE))
+        Asked::Given(Passphrase::from(LOCKED_PASSPHRASE))
     })
     .expect("listed");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
@@ -1143,6 +1143,65 @@ fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret()
         ["~/.ssh/id_ed25519", "~/.ssh/id_ed25519"],
         "asked once per secret: nothing keeps a passphrase"
     );
+
+    // A prompt that failed asks again for the next secret.
+    let mut asked = 0;
+    let mut out = Vec::new();
+    secret_list_with(&tty, &mut out, &mut |_| {
+        asked += 1;
+        Asked::Nothing
+    })
+    .expect("listed");
+    assert_eq!(asked, 2, "{}", text(&out));
+}
+
+#[test]
+fn d1_secret_list_left_at_a_passphrase_prompt_asks_for_that_identity_no_more() {
+    use crate::secret::tests::{LOCKED_SSH_KEY, LOCKED_SSH_PUB};
+
+    let home = guarded_home();
+    home.write(".ssh/id_ed25519", LOCKED_SSH_KEY);
+    for name in ["one", "two", "three"] {
+        seal(&home, name, LOCKED_SSH_PUB);
+    }
+    seed(
+        home.path(),
+        &[
+            secret_target("one"),
+            secret_target("two"),
+            secret_target("three"),
+        ]
+        .concat(),
+    );
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+
+    let mut asked = 0;
+    let mut out = Vec::new();
+    let exit = secret_list_with(&tty, &mut out, &mut |_| {
+        asked += 1;
+        Asked::Left
+    })
+    .expect("listed");
+
+    assert_eq!(asked, 1, "Esc on the first prompt skips the other two");
+    assert_eq!(exit, Exit::Pending);
+    let locked = "not decryptable: the identity ~/.ssh/id_ed25519 is locked by a passphrase";
+    let lines: Vec<&str> = text(&out).lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "every secret is still listed: {}",
+        text(&out)
+    );
+    for (line, name) in lines.iter().zip(["one", "two", "three"]) {
+        assert!(
+            line.starts_with(&format!("  ~/{name}  secrets/{name}.age  {locked}")),
+            "{line}"
+        );
+    }
 }
 
 #[test]

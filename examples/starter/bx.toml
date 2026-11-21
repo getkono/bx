@@ -15,8 +15,8 @@ path     = "~/.config/starship.toml"
 file     = "home/.config/starship.toml"
 requires = ["starship"]
 
-# `starship init` runs when `bx plan` does and its output is cached, so a shell
-# start does not run it again. Install starship later and `bx apply` picks it up.
+# `bx apply` runs `starship init` and caches its output, so a shell start does
+# not run it again. Install starship later and `bx apply` picks it up.
 [[activation]]
 name    = "starship"
 command = ["starship", "init", "{shell}"]

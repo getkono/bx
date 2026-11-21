@@ -589,6 +589,7 @@ fn a_scope_entry_the_loader_would_refuse_is_refused_before_the_journal_exists() 
                 ledger_written: None,
                 dir: false,
                 link: false,
+                keeps_written: false,
             }),
         ],
     );

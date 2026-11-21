@@ -1,4 +1,4 @@
-//! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
+//! The bodies of `bx status`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
 //! `bx update`, `bx upgrade`, `bx doctor`, `bx add`, `bx rm`,
 //! `bx secret list`, `bx abandon` and `bx self-upgrade`, and the refusal of
 //! `bx shell-init` and `bx __complete`, which have none yet.
@@ -32,6 +32,7 @@ use crate::plan::{self, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
+use crate::status;
 use crate::sync;
 use crate::update::{self, run, run::Scope};
 use crate::upgrade;
@@ -48,6 +49,9 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
         upgrade::Request { check, force },
         crate::VERSION,
         &upgrade::install_dir()?,
+        // No usable home is no reason to refuse an upgrade: the directory is
+        // then named as it is.
+        paths::home().ok().as_deref(),
         upgrade::INSTALLER_URL,
         &std::env::var_os("PATH").unwrap_or_default(),
         out,
@@ -60,9 +64,10 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
 ///
 /// # Errors
 ///
-/// Whatever loading the configuration returns, and [`Error::Output`] when
-/// `out` cannot be written. A check that cannot ask what it needs — systemd's
-/// user session unreachable — is a finding, not an error.
+/// Whatever loading the configuration returns, but for a missing config
+/// repo, and [`Error::Output`] when `out` cannot be written. No config repo,
+/// like a check that cannot ask what it needs — systemd's user session
+/// unreachable — is a finding, not an error.
 pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     doctor_with(
         env,
@@ -71,6 +76,26 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
         &systemd::Systemctl::default(),
         &Git::new(env),
     )
+}
+
+/// What doctor says of a config repo that loading found missing in the way
+/// `absence` says: only [`plan::Absence::Nothing`] is one `bx init` mends as
+/// it stands, so each is said as it is.
+fn no_repo_note(absence: plan::Absence) -> &'static str {
+    match absence {
+        plan::Absence::NotADirectory => {
+            "is not a directory, so there is no configuration to check; move it aside, and \
+             `bx init` creates the config repo"
+        }
+        plan::Absence::BeneathNonDirectory => {
+            "lies beneath a path that is not a directory, so there is no configuration to \
+             check; `bx init` creates the config repo once that path is a directory"
+        }
+        plan::Absence::Nothing => {
+            "does not exist, so there is no configuration to check; `bx init` creates the \
+             config repo"
+        }
+    }
 }
 
 /// [`doctor`], looking for declared tools along `path`, asking systemd
@@ -82,7 +107,26 @@ fn doctor_with(
     systemd: &dyn systemd::Query,
     git: &Git,
 ) -> Result<Exit, Error> {
-    let inputs = Inputs::load(env)?;
+    let inputs = match Inputs::load(env) {
+        Ok(inputs) => inputs,
+        // No config repo is the first thing a human should look at, not a
+        // failure to look: said as a finding, and nothing else is checked,
+        // as every other check reads the configuration.
+        Err(Error::RepoMissing(repo, absence)) => {
+            let report = doctor::Report {
+                findings: vec![doctor::Finding {
+                    subject: repo,
+                    origin: None,
+                    note: no_repo_note(absence).to_string(),
+                }],
+                notes: Vec::new(),
+            };
+            out.write_all(doctor::render(&report, &env.home).as_bytes())
+                .map_err(Error::Output)?;
+            return Ok(doctor::exit(&report));
+        }
+        Err(other) => return Err(other),
+    };
     let unit_dir = paths::systemd_user_dir_in(&env.home, env.xdg_config_home.as_deref());
     let report = doctor::run(
         &inputs,
@@ -101,28 +145,45 @@ fn doctor_with(
     Ok(doctor::exit(&report))
 }
 
-/// Bare `bx`: every target, unchanged ones included.
+/// `bx status`: where this machine stands, as `git status` says it —
+/// [`status::long`], or with `short` [`status::short`] — exiting as `plan`
+/// does.
 ///
-/// Writes nothing, but it is not free of processes: deciding the plan runs
-/// each declared activation's command whose output is not cached yet, and asks
-/// the user's `git` about each declared external's checkout.
+/// Writes nothing, but it is not free of processes: it runs the one
+/// traversal `plan` runs, which runs each declared activation's command
+/// whose output is not cached yet and asks the user's `git` about each
+/// declared external's checkout; and the long form asks the config repo's
+/// `git` where its branch stands and what bx carried into it uncommitted,
+/// fetching nothing ([`status::Facts::gather`]).
 ///
 /// # Errors
 ///
 /// Whatever loading or deciding returns, and [`Error::Output`] when `out`
 /// cannot be written.
-pub fn status(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
-    show(env, View::Status, out)
+pub fn status(env: &Env, short: bool, out: &mut dyn Write) -> Result<Exit, Error> {
+    let inputs = Inputs::load(env)?;
+    let report = plan::run(&inputs, Mode::Plan, &mut |_| Ok(false))?;
+    let text = if short {
+        status::short(&report)
+    } else {
+        status::long(
+            &report,
+            &status::Facts::gather(&inputs, &Git::new(env)),
+            &env.home,
+        )
+    };
+    out.write_all(text.as_bytes()).map_err(Error::Output)?;
+    Ok(plan::exit(&report, Mode::Plan))
 }
 
 /// `bx plan`: what `apply` would do, writing nothing.
 ///
-/// Spawns what [`status`] spawns: uncached activation commands, and `git` for
-/// declared externals.
+/// Spawns what [`status()`] spawns but the config repo's `git`: uncached
+/// activation commands, and `git` for declared externals.
 ///
 /// # Errors
 ///
-/// As [`status`].
+/// As [`status()`].
 pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     show(env, View::Plan, out)
 }
@@ -137,7 +198,7 @@ pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 ///
 /// [`Error::NeedsConfirmation`] when there is something to write, no `yes`,
 /// and no terminal to ask on; [`Error::Prompt`] when the prompt fails; and
-/// otherwise as [`status`], plus whatever recovery and the session return. A
+/// otherwise as [`status()`], plus whatever recovery and the session return. A
 /// prompt abandoned with Esc or Ctrl-C, or a pager ended with Ctrl-C before
 /// it, is not an error: it is said in a line and exits [`Exit::Canceled`].
 pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
@@ -147,10 +208,14 @@ pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
 /// What the user answered about one file edited since bx wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Answer {
-    /// Leave the edit as it is and skip the file, as every conflict is.
+    /// Leave the edit as it is and skip the file, and remember the answer
+    /// until either side changes, so the question is not put again.
     Keep,
     /// Write bx's bytes over the edit, which `bx rm` then restores.
     Take,
+    /// Save the edit into the repo, or merge it with the repo's change, as
+    /// `bx add` would: the question's [`plan::Question::save`].
+    Save,
     /// Show the question's view, or the row's diff again, then ask again.
     Show,
 }
@@ -169,6 +234,14 @@ const DELETED_CHOICES: [(&str, Answer); 2] = [
     ("keep it deleted", Answer::Keep),
     ("restore bx's", Answer::Take),
 ];
+
+/// The choice that saves an edit into the repo, where only this machine
+/// changed the file.
+const SAVE: (&str, Answer) = ("save mine to the repo", Answer::Save);
+
+/// The choice that merges an edit with the repo's change, where both sides
+/// changed and merge cleanly.
+const MERGE: (&str, Answer) = ("merge both, here and in the repo", Answer::Save);
 
 /// The choice that draws an edited target's three-way view.
 const SHOW_THREE_WAY: (&str, Answer) = ("show the three-way diff", Answer::Show);
@@ -213,6 +286,11 @@ fn asked(
     } else {
         CHOICES.to_vec()
     };
+    choices.extend(question.save.as_ref().map(
+        |save| {
+            if save.writes_machine() { MERGE } else { SAVE }
+        },
+    ));
     let show = match (&question.three_way, &change.diff) {
         (Some(_), _) if question.asked == Asked::Deleted => Some(SHOW_RESTORED),
         (Some(_), _) => Some(SHOW_THREE_WAY),
@@ -407,8 +485,9 @@ type Prompts<'a, 'b> = (
 /// with a `settle`: otherwise every edited file is kept, as every conflict
 /// is, so `--yes` never writes over an edit. Each answer of *show* draws the
 /// three-way view and asks again. Where the questions were the only work and
-/// every answer kept the edit, the confirmation is not put and nothing is
-/// written.
+/// every answer kept the edit, the confirmation is not put and no target is
+/// written; each answer *keep* is remembered, so its row says it was kept
+/// and asks nothing until either side changes.
 pub(crate) fn converge_answering(
     inputs: &Inputs,
     env: &Env,
@@ -432,15 +511,26 @@ pub(crate) fn converge_answering(
         out.flush().map_err(Error::Output)?;
         shown = true;
         let mut taken = std::collections::BTreeSet::new();
+        let mut kept = std::collections::BTreeSet::new();
+        let mut saved = std::collections::BTreeSet::new();
         if let Some(settle) = settle.as_deref_mut().filter(|_| asking) {
             for question in &report.questions {
-                if settled(out, env, report, question, &mut *settle)? == Answer::Take {
-                    taken.insert(question.row);
-                }
+                match settled(out, env, report, question, &mut *settle)? {
+                    Answer::Take => taken.insert(question.row),
+                    Answer::Save => saved.insert(question.row),
+                    Answer::Keep | Answer::Show => kept.insert(question.row),
+                };
             }
         }
-        if !report.work && taken.is_empty() {
-            return Ok(plan::Approval::from(false));
+        // Every answer kept the edit: nothing is written, so nothing is
+        // confirmed, and the answers are remembered.
+        if !report.work && taken.is_empty() && saved.is_empty() {
+            return Ok(plan::Approval {
+                approved: false,
+                taken,
+                kept,
+                saved,
+            });
         }
         let approved = if yes {
             true
@@ -452,6 +542,8 @@ pub(crate) fn converge_answering(
         Ok(plan::Approval {
             approved: decided(report, approved),
             taken,
+            kept,
+            saved,
         })
     })?;
 
@@ -469,6 +561,14 @@ pub(crate) fn converge_answering(
             .filter(|action| action.is_pending() || (mode == Mode::Sync && *action == Action::Sync))
             .count();
         writeln!(out, "Applied {written} change(s).").map_err(Error::Output)?;
+        if !report.saved.is_empty() {
+            writeln!(
+                out,
+                "Saved {} edit(s) into the repo; bx sync commits and pushes them.",
+                report.saved.len()
+            )
+            .map_err(Error::Output)?;
+        }
         // A row apply stopped short of was announced as work and shown so; its
         // reason is known only now, so it is said now.
         for &at in &report.stopped {
@@ -506,6 +606,15 @@ fn settled(
                     plan::render_row(change, question.three_way.as_ref(), palette, &env.home);
                 page(out, &view, env)?;
                 out.flush().map_err(Error::Output)?;
+            }
+            // What saving writes, shown before the one confirmation that
+            // makes it.
+            Answer::Save => {
+                if let Some(save) = &question.save {
+                    out.write_all(save_preview(save, &env.home).as_bytes())
+                        .map_err(Error::Output)?;
+                }
+                return Ok(Answer::Save);
             }
             answer => return Ok(answer),
         }
@@ -640,6 +749,12 @@ fn sync_answering(
                 "Pushed {ahead} commit(s) to {}.",
                 pulled.upstream.short
             )
+        } else if let Some(undone) = sync::undone(&report) {
+            writeln!(
+                out,
+                "Pushed nothing: {ahead} commit(s) wait on {undone}; settle what this apply \
+                 left undone, then run `bx sync` again."
+            )
         } else {
             writeln!(
                 out,
@@ -718,11 +833,15 @@ impl UpdateMode {
 /// Every way it ends settles what the stamps offer, so no shell asks it again:
 /// run to the end, [`update::finished`] clears the offer and `last-check`;
 /// declined, abandoned at the question, refused or failed, [`update::settled`]
-/// answers it and says why in `last-check`. Only [`update::Error::Busy`] records nothing, as
-/// the run holding the stamps settles them.
+/// answers it and says why in `last-check`. Only [`update::Error::Busy`]
+/// records nothing, as the run holding the stamps settles them, and
+/// [`Error::NeedsConfirmation`], as nobody was asked.
 ///
-/// Without `yes` it needs a terminal to ask on, and refuses before reaching
-/// the network.
+/// Without `yes` and a terminal it looks first, as `bx apply` does: it pulls,
+/// says what it found and shows the plan, and refuses only where there is
+/// something to confirm — a lock to change, or a plan to write. With nothing
+/// to confirm it runs to the end. Declined, it exits [`Exit::Pending`], as a
+/// declined `bx apply` does, even where only the lock was offered.
 ///
 /// # Errors
 ///
@@ -963,8 +1082,12 @@ fn init_with(
     let mut adopted = 0_usize;
     if interactive {
         let deferred = init::adopt_offered(env, ask, &mut |row| {
-            adopted += 1;
-            say(out, &adoption_row(row))
+            // Only a row that changed what bx manages is something this run
+            // did: one passed over, refused or already managed is not.
+            if matches!(row, Adoption::Adopt { .. } | Adoption::Own { .. }) {
+                adopted += 1;
+            }
+            say(out, &adoption_row(row, &env.home))
         });
         match deferred {
             Ok(init::Deferred::No) => {}
@@ -1008,7 +1131,10 @@ fn init_with(
     // nothing else; a closing line would be a second, different instruction.
     if report.recovered.is_none() {
         let did = answered.created || answered.saved.is_some() || adopted > 0 || report.executed;
-        say(out, init_closing(exit, did))?;
+        say(
+            out,
+            &init_closing(exit, did, sync::undone(&report).as_deref()),
+        )?;
     }
     Ok(exit)
 }
@@ -1029,24 +1155,30 @@ fn init_canceled(out: &mut dyn Write, then: &str) -> Result<Exit, init::Error> {
 }
 
 /// `init`'s last line: where the machine stands and what to run next. `did`
-/// is whether this run wrote anything at all.
-const fn init_closing(exit: Exit, did: bool) -> &'static str {
-    match (exit, did) {
+/// is whether this run wrote anything at all, and `undone` the rows it left
+/// in conflict or blocked, as [`sync::undone`] names them: what is left is
+/// those, which another `bx init` does not settle, where there are any.
+fn init_closing(exit: Exit, did: bool, undone: Option<&str>) -> String {
+    match (exit, did, undone) {
         // Not "nothing to answer": config left unmanaged is offered again on
         // every interactive run, so this may follow a question.
-        (Exit::Converged, false) => {
-            "Already set up: nothing to apply. Manage a file with `bx add PATH`; change an \
-             answer with `bx init --set NAME=VALUE`.\n"
-        }
-        (Exit::Converged, true) => {
-            "Set up. Manage a file with `bx add PATH`; change an answer with \
-             `bx init --set NAME=VALUE`.\n"
-        }
-        (Exit::Pending, _) => {
+        (Exit::Converged, false, _) => "Already set up: nothing to apply. Manage a file with \
+                                        `bx add PATH`; change an answer with `bx init --set \
+                                        NAME=VALUE`.\n"
+            .to_string(),
+        (Exit::Converged, true, _) => "Set up. Manage a file with `bx add PATH`; change an \
+                                       answer with `bx init --set NAME=VALUE`.\n"
+            .to_string(),
+        (Exit::Pending, _, Some(undone)) => format!(
+            "Not finished: {undone} left undone; see the plan above, settle them, then run `bx \
+             apply` again.\n"
+        ),
+        (Exit::Pending, _, None) => {
             "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
+                .to_string()
         }
         // Neither is an exit a plan produces.
-        (Exit::Error | Exit::Canceled, _) => "",
+        (Exit::Error | Exit::Canceled, ..) => String::new(),
     }
 }
 
@@ -1084,8 +1216,9 @@ fn recovered(report: &Report, outcome: &crate::recover::Outcome) -> String {
 /// The one command that may ask for an identity's passphrase, and only when
 /// standard input is a terminal; without one a locked identity is reported as
 /// locked. Each secret is checked on its own, so a locked identity is asked
-/// for once per secret: nothing keeps a passphrase between them. Nothing is
-/// written.
+/// for once per secret: nothing keeps a passphrase between them. A prompt
+/// left with Esc or Ctrl-C asks nothing more: the rest of the secrets locked
+/// by that identity are listed as locked. Nothing is written.
 ///
 /// Exits [`Exit::Converged`] when every secret can be decrypted, and
 /// [`Exit::Pending`] when one cannot.
@@ -1098,25 +1231,40 @@ pub fn secret_list(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     secret_list_with(env, out, &mut ask_passphrase)
 }
 
-/// Ask on the terminal for an identity's passphrase, masked. A prompt that
-/// fails or is cancelled is no passphrase, and the identity stays locked.
-/// What was typed ahead is discarded first, so a command typed while the
-/// last one ran is never taken as the passphrase.
-fn ask_passphrase(shown: &str) -> Option<Passphrase> {
-    asked_afresh(|| {
+/// What a passphrase prompt answered.
+enum Asked {
+    /// The passphrase typed.
+    Given(Passphrase),
+    /// None: the prompt failed. The identity stays locked, and the next
+    /// secret asks again.
+    Nothing,
+    /// The prompt was left with Esc or Ctrl-C: ask about this identity no
+    /// more.
+    Left,
+}
+
+/// Ask on the terminal for an identity's passphrase, masked. What was typed
+/// ahead is discarded first, so a command typed while the last one ran is
+/// never taken as the passphrase.
+fn ask_passphrase(shown: &str) -> Asked {
+    use inquire::InquireError::{OperationCanceled, OperationInterrupted};
+
+    match asked_afresh(|| {
         inquire::Password::new(&format!("Passphrase for {shown}:"))
             .without_confirmation()
             .prompt()
-    })
-    .ok()
-    .map(Passphrase::from)
+    }) {
+        Ok(passphrase) => Asked::Given(Passphrase::from(passphrase)),
+        Err(OperationCanceled | OperationInterrupted) => Asked::Left,
+        Err(_) => Asked::Nothing,
+    }
 }
 
 /// [`secret_list`], with the passphrase asked through `ask`.
 fn secret_list_with(
     env: &Env,
     out: &mut dyn Write,
-    ask: &mut dyn FnMut(&str) -> Option<Passphrase>,
+    ask: &mut dyn FnMut(&str) -> Asked,
 ) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
     let secrets = &inputs.resolved().secrets;
@@ -1125,6 +1273,9 @@ fn secret_list_with(
 
     let mut text = String::new();
     let mut all = true;
+    // Nothing asks without a terminal. One identity decrypts every secret,
+    // so a prompt left once is left for all that follow.
+    let mut ask_no_more = !env.stdin_tty;
     for (declared, resolution) in inputs.declared_targets() {
         let Body::Secret(written) = &declared.body else {
             continue;
@@ -1142,8 +1293,17 @@ fn secret_list_with(
                 let status = plan::read_repo_file(target, inputs.repo(), rel)
                     .map_err(|error| format!("unreadable: {error}"))
                     .and_then(|bytes| {
-                        let unlock = if env.stdin_tty {
-                            Unlock::Ask(&mut *ask)
+                        let asks = !ask_no_more;
+                        let mut asking = |shown: &str| match ask(shown) {
+                            Asked::Given(passphrase) => Some(passphrase),
+                            Asked::Nothing => None,
+                            Asked::Left => {
+                                ask_no_more = true;
+                                None
+                            }
+                        };
+                        let unlock = if asks {
+                            Unlock::Ask(&mut asking)
                         } else {
                             Unlock::Never
                         };
@@ -1185,36 +1345,98 @@ pub fn not_built(command: &str, err: &mut dyn Write) -> Result<Exit, Error> {
 /// `bx add PATH`: adopt a file, or every regular file under a directory, byte
 /// for byte.
 ///
+/// A file bx manages that was edited on this machine is saved into the repo,
+/// or merged with the repo's own change ([`adopt::save`]): what that writes
+/// is shown first, as diffs, and carried out only once approved — by `yes`,
+/// or by the answer to a prompt when standard input is a terminal. With
+/// neither, it is refused, and nothing is written for it.
+///
 /// Prints one row per path: `+` adopted, `=` already managed, `~` already
-/// declared and now owned, `-` passed over inside a directory, `!` refused.
-/// Exits 0 when everything named was adopted or already managed, and 2 when
-/// something was refused.
+/// declared and now owned, `<` saved into the repo, `-` passed over inside a
+/// directory, `!` refused or merged with conflicts. Exits 0 when everything
+/// named was adopted, saved or already managed, 2 when something was refused
+/// or a merge conflicted, and 130 when the prompt was abandoned.
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
-/// or adopting returns.
+/// Whatever locating, loading, asking or adopting returns.
 pub fn add(
     env: &Env,
     cwd: &Path,
-    path: Option<&str>,
+    path: &str,
+    yes: bool,
     out: &mut dyn Write,
 ) -> Result<Exit, adopt::Error> {
-    let path = path.ok_or(adopt::Error::NoPath("add"))?;
+    add_with(env, cwd, path, yes, out, &mut confirm_save)
+}
+
+/// Ask on the terminal whether to make the saves `add` showed. The default
+/// is **no**, and what was typed ahead is discarded, as [`confirm`] does.
+fn confirm_save() -> Result<bool, adopt::Error> {
+    asked_afresh(|| {
+        inquire::Confirm::new("Save these into the repo?")
+            .with_default(false)
+            .prompt()
+    })
+    .map_err(|error| {
+        if init::abandoned(&error) {
+            adopt::Error::Canceled
+        } else {
+            adopt::Error::Prompt(error)
+        }
+    })
+}
+
+/// [`add`], with the confirmation asked through `ask`.
+pub(crate) fn add_with(
+    env: &Env,
+    cwd: &Path,
+    path: &str,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
+) -> Result<Exit, adopt::Error> {
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
-    let rows = adopt::add(&ctx, &target)?;
+    let home = ctx.home().to_path_buf();
+    let asked = adopt::add_asking(&ctx, &target, &mut |saves| {
+        if yes {
+            return Ok(true);
+        }
+        let mut text = format!("bx add {target} will:\n");
+        for row in saves {
+            if let Adoption::Save { save, .. } = row {
+                text.push_str(&save_preview(save, &home));
+            }
+        }
+        out.write_all(text.as_bytes())
+            .map_err(adopt::Error::Output)?;
+        out.flush().map_err(adopt::Error::Output)?;
+        if env.stdin_tty { ask() } else { Ok(false) }
+    });
+    let rows = match asked {
+        Ok(rows) => rows,
+        Err(adopt::Error::Canceled) => {
+            writeln!(out, "Canceled. Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(other) => return Err(other),
+    };
     let mut text = String::new();
     for row in &rows {
-        text.push_str(&adoption_row(row));
+        text.push_str(&adoption_row(row, &home));
     }
-    let adopted = rows
-        .iter()
-        .filter(|row| matches!(row, Adoption::Adopt { .. }))
-        .count();
+    let count = |pick: fn(&Adoption) -> bool| rows.iter().filter(|row| pick(row)).count();
+    let adopted = count(|row| matches!(row, Adoption::Adopt { .. }));
     text.push_str(&format!(
         "Adopted {adopted} file(s); run `bx plan` to see the machine against the repo.\n"
     ));
+    let saved = count(|row| matches!(row, Adoption::Save { save, .. } if !save.repo.is_empty()));
+    if saved > 0 {
+        text.push_str(&format!(
+            "Saved {saved} edit(s) into the repo; bx sync commits and pushes them.\n"
+        ));
+    }
     out.write_all(text.as_bytes())
         .map_err(adopt::Error::Output)?;
     Ok(if rows.iter().any(Adoption::needs_attention) {
@@ -1224,8 +1446,54 @@ pub fn add(
     })
 }
 
+/// What saving one edited file will write, as `add` shows it before asking:
+/// what it does, then each diff.
+fn save_preview(save: &adopt::save::Save, home: &Path) -> String {
+    use adopt::save::How;
+    let target = report::escape(save.target.as_str());
+    let files = save.repo_files(home).join(", ");
+    let mut text = match save.how {
+        How::Save => format!("  < {target}  save your edit into {files}\n"),
+        How::Merged => format!(
+            "  < {target}  merge your edit with the repo's change, into {files} and this \
+             file, keeping yours for bx rm\n"
+        ),
+        How::Conflicted => format!(
+            "  ! {target}  your edit and the repo's change conflict: write the merge, with \
+             conflict markers, into this file, keeping yours for bx rm; the repo is not \
+             changed\n"
+        ),
+    };
+    for diff in &save.diffs {
+        for line in diff.lines() {
+            text.push_str("    ");
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
+    text
+}
+
+/// What saving one edited file did, as its row after the run.
+fn save_row(save: &adopt::save::Save, home: &Path) -> String {
+    use adopt::save::How;
+    let target = report::escape(save.target.as_str());
+    let files = save.repo_files(home).join(", ");
+    match save.how {
+        How::Save => format!("  < {target}  saved into {files}\n"),
+        How::Merged => format!(
+            "  < {target}  merged with the repo's change, into {files} and this file; bx rm \
+             restores yours\n"
+        ),
+        How::Conflicted => format!(
+            "  ! {target}  merged with conflict markers around both sides; resolve them, \
+             then run bx add {target}\n"
+        ),
+    }
+}
+
 /// One `add` row, with its note and any warning on the lines below it.
-fn adoption_row(row: &Adoption) -> String {
+fn adoption_row(row: &Adoption, home: &Path) -> String {
     let target = row.subject();
     match row {
         Adoption::Adopt {
@@ -1248,6 +1516,7 @@ fn adoption_row(row: &Adoption) -> String {
             line
         }
         Adoption::Own { .. } => format!("  ~ {target}  already declared; bx now owns it\n"),
+        Adoption::Save { save, .. } => save_row(save, home),
         Adoption::Unchanged { .. } => format!("  = {target}  already managed\n"),
         Adoption::Skipped { note, .. } => format!("  - {target}  skipped: {note}\n"),
         Adoption::Refused { note, .. } => format!("  ! {target}  {note}\n"),
@@ -1257,29 +1526,113 @@ fn adoption_row(row: &Adoption) -> String {
 /// `bx rm PATH`: stop managing a target, or every target beneath a directory,
 /// restoring what bx displaced.
 ///
-/// Exits 0 when everything was handed back, or nothing was managed there, and
-/// 2 when a conflict left something as it was.
+/// What it is about to do is shown first, one row per target, and carried
+/// out only once approved: by `yes`, or by the answer to a prompt when
+/// standard input is a terminal. With neither, the rows are shown and
+/// nothing is changed. A preview with nothing to change is not asked about.
+///
+/// Exits 0 when everything was handed back, or nothing was managed there, 2
+/// when a conflict left something as it was or the prompt was declined, and
+/// 130 when the prompt was abandoned.
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
-/// or restoring returns.
+/// [`adopt::Error::NeedsConfirmation`] with something to change, no `yes`
+/// and no terminal, and whatever locating, loading, asking or restoring
+/// returns. [`adopt::Error::Undeclare`] comes
+/// after the rows it holds are written.
 pub fn rm(
     env: &Env,
     cwd: &Path,
-    path: Option<&str>,
+    path: &str,
+    yes: bool,
     out: &mut dyn Write,
 ) -> Result<Exit, adopt::Error> {
-    let path = path.ok_or(adopt::Error::NoPath("rm"))?;
+    rm_with(env, cwd, path, yes, out, &mut confirm_rm)
+}
+
+/// Ask on the terminal whether to carry out the rows `rm` showed. The
+/// default is **no**, and what was typed ahead is discarded, as [`confirm`]
+/// does.
+fn confirm_rm() -> Result<bool, adopt::Error> {
+    asked_afresh(|| {
+        inquire::Confirm::new("Stop managing these and hand them back?")
+            .with_default(false)
+            .prompt()
+    })
+    .map_err(|error| {
+        if init::abandoned(&error) {
+            adopt::Error::Canceled
+        } else {
+            adopt::Error::Prompt(error)
+        }
+    })
+}
+
+/// [`rm`], with the confirmation asked through `ask`.
+fn rm_with(
+    env: &Env,
+    cwd: &Path,
+    path: &str,
+    yes: bool,
+    out: &mut dyn Write,
+    ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
+) -> Result<Exit, adopt::Error> {
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
-    let removals = adopt::rm(&ctx, &target)?;
+    let home = ctx.home().to_path_buf();
+    let decided = adopt::rm_asking(&ctx, &target, &mut |rows| {
+        if yes {
+            return Ok(true);
+        }
+        let mut text = format!("bx rm {target} will:\n");
+        for row in rows {
+            text.push_str(&removal_row(row, &home, Tense::Will));
+        }
+        out.write_all(text.as_bytes())
+            .map_err(adopt::Error::Output)?;
+        out.flush().map_err(adopt::Error::Output)?;
+        if env.stdin_tty {
+            ask()
+        } else {
+            Err(adopt::Error::NeedsConfirmation)
+        }
+    });
+    let removals = match decided {
+        Ok(Some(removals)) => removals,
+        Ok(None) => {
+            writeln!(out, "Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Pending);
+        }
+        Err(adopt::Error::Canceled) => {
+            writeln!(out, "Canceled. Nothing was changed.").map_err(adopt::Error::Output)?;
+            return Ok(Exit::Canceled);
+        }
+        Err(adopt::Error::Undeclare {
+            rows,
+            layer,
+            source,
+        }) => {
+            let mut text = String::new();
+            for row in &rows {
+                text.push_str(&removal_row(row, &home, Tense::Did));
+            }
+            out.write_all(text.as_bytes())
+                .map_err(adopt::Error::Output)?;
+            return Err(adopt::Error::Undeclare {
+                rows,
+                layer,
+                source,
+            });
+        }
+        Err(other) => return Err(other),
+    };
     let mut text = String::new();
     if removals.is_empty() {
         text.push_str(&format!("{target} is not managed by bx; nothing to do.\n"));
     }
     for removal in &removals {
-        text.push_str(&removal_row(removal, ctx.home()));
+        text.push_str(&removal_row(removal, &home, Tense::Did));
     }
     out.write_all(text.as_bytes())
         .map_err(adopt::Error::Output)?;
@@ -1295,25 +1648,52 @@ pub fn rm(
     )
 }
 
-/// One `rm` row.
-fn removal_row(removal: &Removal, home: &Path) -> String {
+/// Whether an `rm` row says what is about to be done or what was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tense {
+    /// The preview, before the question.
+    Will,
+    /// The result.
+    Did,
+}
+
+/// One `rm` row, in `tense`.
+fn removal_row(removal: &Removal, home: &Path, tense: Tense) -> String {
     let target = removal.restored.target();
-    let did = match &removal.restored {
-        Restored::Reverted { .. } => "put back the file bx replaced".to_string(),
-        Restored::Removed { .. } => "removed the file bx created".to_string(),
-        Restored::AlreadyGone { .. } => "was already gone".to_string(),
-        Restored::Kept { .. } => {
-            "left as you edited it; nothing declares it, so bx stops managing it".to_string()
+    let will = tense == Tense::Will;
+    let did = match (&removal.restored, will) {
+        (Restored::Reverted { .. }, false) => "put back the file bx replaced",
+        (Restored::Reverted { .. }, true) => "puts back the file bx replaced",
+        (Restored::Removed { .. }, false) => "removed the file bx created",
+        (Restored::Removed { .. }, true) => "removes the file bx created",
+        (Restored::AlreadyGone { .. }, false) => "was already gone",
+        (Restored::AlreadyGone { .. }, true) => "is already gone; bx stops managing it",
+        (Restored::Kept { .. }, false) => {
+            "left as you edited it; nothing declares it, so bx stops managing it"
         }
-        Restored::Unmanaged { .. } => "left as it is; bx never wrote it".to_string(),
-        Restored::Conflict { note, .. } => {
-            return format!("  ! {target}  {note}; still managed\n");
+        (Restored::Kept { .. }, true) => {
+            "is left as you edited it; nothing declares it, so bx stops managing it"
+        }
+        (Restored::Unmanaged { .. }, false) => "left as it is; bx never wrote it",
+        (Restored::Unmanaged { .. }, true) => "is left as it is; bx never wrote it",
+        (Restored::Conflict { note, .. }, _) => {
+            let stays = if will {
+                "stays managed"
+            } else {
+                "still managed"
+            };
+            return format!("  ! {target}  {note}; {stays}\n");
         }
     };
     let mut line = format!("  - {target}  {did}");
+    let declared = if will {
+        "; undeclared from"
+    } else {
+        "; no longer declared in"
+    };
     for layer in &removal.undeclared {
         line.push_str(&format!(
-            "; no longer declared in {}",
+            "{declared} {}",
             crate::paths::to_portable(layer, home)
         ));
     }

@@ -107,6 +107,13 @@ pub(super) enum Step {
 /// last output over a user's edit and dies before the save leaves the ledger
 /// at `after` without the edit, and skipping that would lose it.
 ///
+/// A write [`Intent::keeps_written`] marks is never skipped: it is recorded at
+/// [`Intent::ledger_written`], which is the digest the session found, so it is
+/// always recorded again whether or not the save happened. That does no harm.
+/// Its `before` is the same bytes the session's own record adopted as the
+/// prior, and adopting them a second time leaves the prior, the superseded
+/// history, and the claimed directories as they were.
+///
 /// [`pending`]: super::pending
 /// [`resolve`]: super::rollback::resolve
 pub(super) fn decide(
@@ -216,7 +223,22 @@ pub(super) fn decide(
         )
     };
     let written = match (intent.after, intent.mechanism.clone(), &intent.before) {
-        (Written::Present { digest, mode }, Some(mechanism), _) => Some((digest, mode, mechanism)),
+        // At what the session records it at, which is `after` unless the
+        // intent keeps what bx last wrote: a conflicted merge does, so the
+        // marked file stays an edit `plan` asks about. At the stored entry's
+        // mode, which the session left as it was, while the ledger holds it.
+        (Written::Present { digest, mode }, Some(mechanism), _) => {
+            match intent.ledger_written.filter(|_| intent.keeps_written) {
+                None => Some((digest, mode, mechanism)),
+                Some(written) => {
+                    let mode = ledger
+                        .and_then(|ledger| ledger.get(&intent.target))
+                        .filter(|stored| stored.written == written)
+                        .map_or(mode, |stored| stored.mode);
+                    Some((written, mode, mechanism))
+                }
+            }
+        }
         // A removal that kept its entry — a tracked target's deletion carried
         // to its other side — is recorded as the session records it: at the
         // absence, at the mode of the bytes it removed, which become its prior.

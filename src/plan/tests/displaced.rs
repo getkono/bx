@@ -13,6 +13,8 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            saved: Default::default(),
+            kept: std::collections::BTreeSet::new(),
         })
     })
     .expect("apply runs")
@@ -245,6 +247,140 @@ fn take_over_a_retargeted_link_and_rm_restores_the_users_text() {
 
     rm(&home);
     assert_eq!(text_of(&home.child(".tool")), Path::new("/opt/theirs"));
+}
+
+/// An `apply` approved, answering *keep* for every question it puts.
+fn keep(inputs: &Inputs) -> Report {
+    answered(inputs, Mode::Apply, &mut |report| {
+        Ok(Approval {
+            approved: true,
+            taken: std::collections::BTreeSet::new(),
+            saved: Default::default(),
+            kept: report
+                .questions
+                .iter()
+                .map(|question| question.row)
+                .collect(),
+        })
+    })
+    .expect("apply runs")
+}
+
+/// `~/.a` written by bx at its default `0644`, then chmod-ed to `0600` by
+/// hand with its bytes still bx's: a mode question.
+fn mode_changed(home: &GuardedHome) -> Inputs {
+    let written = inputs(home, &inline("~/.a", "bx\\n"));
+    assert!(apply(&written).executed);
+    std::fs::set_permissions(home.child(".a"), std::fs::Permissions::from_mode(0o600))
+        .expect("the user's chmod");
+    written
+}
+
+/// Whether `report`'s only row stands answered *keep* about its mode. The
+/// apply that took the answer still lists the question it put; a later plan
+/// puts none.
+fn kept_mode(report: &Report) -> bool {
+    report.kept == vec![0]
+        && report.actions() == vec![Action::Unchanged]
+        && report.changes[0].note.as_deref()
+            == Some(
+                format!(
+                    "its mode changed since bx wrote it; mode 0600 -> 0644; {}",
+                    super::super::KEPT_MODE
+                )
+                .as_str(),
+            )
+}
+
+#[test]
+fn a_kept_mode_is_remembered_and_asked_again_once_the_found_mode_changes() {
+    let home = guarded_home();
+    let inputs = mode_changed(&home);
+    assert_eq!(plan(&inputs).questions[0].asked, Asked::Mode);
+
+    let kept = keep(&inputs);
+    assert!(!kept.executed, "keeping writes no target");
+    assert!(kept_mode(&kept), "{:?}", kept.changes);
+    let planned = plan(&inputs);
+    assert!(kept_mode(&planned), "the answer stands");
+    assert!(planned.questions.is_empty());
+    assert_eq!(mode_of(&home.child(".a")), 0o600, "the user's mode stays");
+
+    // The user changed the mode again: the question is put about it.
+    std::fs::set_permissions(home.child(".a"), std::fs::Permissions::from_mode(0o640))
+        .expect("a second chmod");
+    let again = plan(&inputs);
+    assert_eq!(again.actions(), vec![Action::Conflict]);
+    assert_eq!(again.questions.len(), 1);
+    assert_eq!(again.questions[0].asked, Asked::Mode);
+    assert!(again.kept.is_empty());
+}
+
+#[test]
+fn a_kept_mode_is_asked_again_once_the_mode_bx_wants_changes() {
+    let home = guarded_home();
+    let inputs = mode_changed(&home);
+    assert!(kept_mode(&keep(&inputs)));
+
+    // The configuration now wants another mode, which is neither side the
+    // answer was about.
+    let wider = super::inputs(
+        &home,
+        &format!("{}mode = \"0700\"\n", inline("~/.a", "bx\\n")),
+    );
+    let again = plan(&wider);
+    assert_eq!(again.actions(), vec![Action::Conflict]);
+    assert_eq!(again.questions.len(), 1);
+    assert_eq!(again.questions[0].asked, Asked::Mode);
+    assert!(again.kept.is_empty());
+    assert_eq!(mode_of(&home.child(".a")), 0o600, "nothing was written");
+}
+
+#[test]
+fn a_kept_region_edit_is_remembered_and_asked_again_once_the_file_changes() {
+    let home = guarded_home();
+    let (inputs, edited) = region_edited_inside(&home);
+    let planned = plan(&inputs);
+    let at = zshrc(&planned);
+    let asked = planned.changes[at].note.clone().expect("a note");
+
+    let kept = keep(&inputs);
+    assert_eq!(kept.changes[at].action, Action::Unchanged);
+    assert!(kept.kept.contains(&at));
+    assert_eq!(
+        std::fs::read_to_string(home.child(".zshrc")).expect("kept"),
+        edited,
+        "the edit is left as it is"
+    );
+
+    // The next plan says it was kept, shows no diff, and asks nothing.
+    let again = plan(&inputs);
+    let at = zshrc(&again);
+    assert_eq!(again.changes[at].action, Action::Unchanged);
+    assert_eq!(again.changes[at].diff, None);
+    assert!(again.questions.is_empty(), "{:?}", again.questions);
+    assert_eq!(again.kept, vec![at]);
+    assert_eq!(
+        again.changes[at].note.as_deref(),
+        Some(
+            asked
+                .replace(decide::ASK_REGION, super::super::KEPT_REGION)
+                .as_str()
+        )
+    );
+    assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+
+    // The file changed: the question is put again.
+    home.write(".zshrc", &edited.replace("edited\n", "edited twice\n"));
+    let changed = plan(&inputs);
+    let at = zshrc(&changed);
+    assert_eq!(changed.changes[at].action, Action::Conflict);
+    assert_eq!(
+        changed.questions.iter().map(|q| q.row).collect::<Vec<_>>(),
+        vec![at]
+    );
+    assert_eq!(changed.questions[0].asked, Asked::Region);
+    assert!(changed.kept.is_empty());
 }
 
 /// Whether `report`'s only row is left with nothing to ask: no question, and

@@ -60,6 +60,15 @@
 //! tree managed; on a file inside it, it releases nothing and names `exclude`.
 //! `add` likewise refuses to copy a file into a tree's root, where the tree
 //! would declare it beside the `[[target]]` `add` writes.
+//!
+//! # `add` saves an edit of a managed file
+//!
+//! A declared file bx wrote and the user edited since is not refused: `add`
+//! saves the edit into the repo, or merges it with the repo's own change,
+//! once confirmed. [`save`] decides how, and `apply`'s question about an
+//! edited file offers the same save.
+
+pub mod save;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -76,6 +85,7 @@ use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
 use crate::journal;
 use crate::paths::{self, Portable};
+use crate::plan::Absence;
 use crate::recover;
 use crate::restore::{self, Restored};
 use crate::shell::activation::{self, Host as _};
@@ -92,12 +102,6 @@ const FILES_DIR: &str = "files";
 /// Everything that stops `add` or `rm`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// No path was named.
-    #[error(
-        "name the file or directory to {0}, e.g. `bx {0} ~/.gitconfig`; `bx init` is what \
-         offers the config already on this machine"
-    )]
-    NoPath(&'static str),
     /// The path could not be made portable.
     #[error(transparent)]
     Path(#[from] paths::Error),
@@ -110,9 +114,10 @@ pub enum Error {
     /// There is nothing at the path.
     #[error("there is nothing at {0} to add")]
     Missing(String),
-    /// There is no config repo.
-    #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
-    RepoMissing(PathBuf),
+    /// There is no config repo at the path it holds, spelled `~/…` when it is
+    /// under the home, missing in the way the [`Absence`] says.
+    #[error("no bx config repo at {}{}", .0, .1.advice())]
+    RepoMissing(String, Absence),
     /// The configuration could not be loaded, merged or resolved.
     #[error(transparent)]
     Config(config::Error),
@@ -161,12 +166,47 @@ pub enum Error {
     /// The output could not be written.
     #[error("writing the output: {0}")]
     Output(#[source] std::io::Error),
+    /// `rm` had something to change, no `--yes`, and no terminal to ask on.
+    #[error(
+        "bx rm changes only what was confirmed, and there is no terminal to ask on; nothing \
+         listed above was changed. Review it and rerun with --yes"
+    )]
+    NeedsConfirmation,
+    /// The confirmation prompt failed.
+    #[error("asking for confirmation: {0}")]
+    Prompt(#[source] inquire::InquireError),
+    /// The confirmation prompt was abandoned with Esc or Ctrl-C. Not a
+    /// failure: `bx rm` says so in a line and exits
+    /// [`crate::report::Exit::Canceled`], so this never reaches the error
+    /// report.
+    #[error("canceled at the confirmation prompt")]
+    Canceled,
+    /// A layer could not be edited once `rm` had handed files back. `rows`
+    /// is everything it did, each naming only the layers it was undeclared
+    /// from, so the caller can say it before the error.
+    #[error(
+        "the files above were handed back, but {layer} could not be edited to undeclare \
+         them: {source}; fix that and run `bx rm` again to finish"
+    )]
+    Undeclare {
+        /// What `rm` did before the edit failed.
+        rows: Vec<Removal>,
+        /// The layer that could not be edited, `~`-relative.
+        layer: String,
+        /// Why.
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 impl From<config::Error> for Error {
     fn from(error: config::Error) -> Self {
         match error {
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo),
+            // Without the home there is no `~/…` spelling to give it;
+            // [`Context::load`] spells it under the home itself.
+            config::Error::RepoMissing(repo) => {
+                Self::RepoMissing(repo.display().to_string(), Absence::of(&repo))
+            }
             other => Self::Config(other),
         }
     }
@@ -292,7 +332,14 @@ impl Context {
             machine: host.machine(),
             present: &present,
         };
-        let layers = layers::load_gated(&repo, state.root(), &home, &facts)?.layers;
+        let layers = layers::load_gated(&repo, state.root(), &home, &facts)
+            .map_err(|error| match error {
+                config::Error::RepoMissing(repo) => {
+                    Error::RepoMissing(paths::to_portable(&repo, &home), Absence::of(&repo))
+                }
+                other => other.into(),
+            })?
+            .layers;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)
@@ -331,6 +378,18 @@ impl Context {
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
+    }
+
+    /// What saving an edited file into the repo is decided against.
+    fn sides(&self) -> save::Sides<'_> {
+        save::Sides {
+            home: &self.home,
+            repo: &self.repo,
+            state: &self.state,
+            git: &self.git,
+            values: &self.resolved.values,
+            targets: &self.resolved.targets,
+        }
     }
 
     /// Why bx will not adopt anything at `dest`, when it is bx's own.
@@ -574,6 +633,15 @@ pub enum Adoption {
         /// Why.
         note: String,
     },
+    /// Declared, owned, and edited on this machine since bx wrote it: the
+    /// edit is saved into the repo, or merged with the repo's change, as
+    /// [`save`] decides. Carried out only once confirmed.
+    Save {
+        /// The target.
+        target: Portable,
+        /// What saving it does.
+        save: Box<save::Save>,
+    },
     /// Refused, with the reason. Nothing is written for it.
     Refused {
         /// The target.
@@ -592,15 +660,21 @@ impl Adoption {
             Self::Adopt { target, .. }
             | Self::Own { target, .. }
             | Self::Unchanged { target }
+            | Self::Save { target, .. }
             | Self::Refused { target, .. } => target.as_str(),
             Self::Skipped { subject, .. } => subject,
         }
     }
 
-    /// Whether a human has to look: `add` did not do what was asked.
+    /// Whether a human has to look: `add` did not do what was asked, or left
+    /// a conflicted merge to resolve.
     #[must_use]
-    pub const fn needs_attention(&self) -> bool {
-        matches!(self, Self::Refused { .. })
+    pub fn needs_attention(&self) -> bool {
+        match self {
+            Self::Refused { .. } => true,
+            Self::Save { save, .. } => save.how == save::How::Conflicted,
+            _ => false,
+        }
     }
 }
 
@@ -887,7 +961,7 @@ fn decide_file(
     pass: &dyn Fn(String) -> Adoption,
 ) -> Result<Adoption, Error> {
     let observed = fs::observe(dest)?;
-    let (Some(bytes), Some(mode)) = (observed.bytes, observed.mode) else {
+    let (Some(bytes), Some(mode)) = (observed.bytes.clone(), observed.mode) else {
         return Ok(pass("changed while bx was reading it".to_string()));
     };
     let refused = |note: String| Adoption::Refused {
@@ -926,10 +1000,24 @@ fn decide_file(
                 }
             };
             if (&wanted, Mode::resolve(declared.mode, Kind::File)) != (&bytes, mode) {
-                return Ok(refused(format!(
-                    "is already declared at {origin}, and differs from what it declares; \
-                     `bx plan` shows how"
-                )));
+                // A file bx wrote and the user edited since is saved into
+                // the repo, as `git add` stages an edit; one bx never wrote
+                // has no record of whose side moved.
+                let Some(entry) = ledger.get(target) else {
+                    return Ok(refused(format!(
+                        "is already declared at {origin}, and differs from what it declares; \
+                         `bx plan` shows how"
+                    )));
+                };
+                return Ok(
+                    match save::decide(&ctx.sides(), declared, entry, &observed, &wanted) {
+                        save::Decision::Save(save) => Adoption::Save {
+                            target: target.clone(),
+                            save,
+                        },
+                        save::Decision::Refused(note) => refused(note),
+                    },
+                );
             }
             let digest = ContentHash::of(&bytes);
             let owned = ledger.get(target).is_some_and(|entry| {
@@ -1117,14 +1205,69 @@ fn lock(state: &StateDir) -> Result<ExclusiveLock, Error> {
 /// ([`recover::lock_for_writing`]) — refusing when that session cannot be
 /// accounted for.
 ///
+/// This is [`add_asking`] with every save approved, as `bx add --yes` is.
+///
 /// # Errors
 ///
-/// As [`plan_add`], plus whatever the lock, the recovery, the writes, and the
-/// ledger return.
+/// As [`add_asking`].
 pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
+    add_asking(ctx, target, &mut |_| Ok(true))
+}
+
+/// What a save's row says when it was not confirmed.
+pub const NOT_CONFIRMED: &str = "was not saved, since nobody confirmed it; run bx add again at a \
+                                 terminal, or with --yes, to save it";
+
+/// What a save's row says when its file changed after it was shown.
+pub const MOVED: &str = "changed after bx showed what saving it does, so nothing was saved; run \
+                         bx add again";
+
+/// [`add`], asking `approve` about every [`Adoption::Save`] first.
+///
+/// What `approve` is shown is decided as `add` decides it, by the same
+/// function, before the state directory is locked: it is asked only when a
+/// save is among the rows. Under the lock `add` decides again and carries out
+/// only a save identical to the one shown, as `rm` carries out only what its
+/// preview announced; a save declined, or one that changed since it was
+/// shown, is refused with nothing written for it, and the other rows are
+/// carried out as `add` always carries them out.
+///
+/// # Errors
+///
+/// As [`plan_add`], plus whatever `approve`, the lock, the recovery, the
+/// writes, the session a merge writes the machine file through, and the
+/// ledger return.
+pub fn add_asking(
+    ctx: &Context,
+    target: &Portable,
+    approve: &mut dyn FnMut(&[&Adoption]) -> Result<bool, Error>,
+) -> Result<Vec<Adoption>, Error> {
+    let preview = plan_add(ctx, &LedgerView::read(&ctx.state, &ctx.home)?.value, target)?;
+    let saves: Vec<&Adoption> = preview
+        .iter()
+        .filter(|row| matches!(row, Adoption::Save { .. }))
+        .collect();
+    let approved = saves.is_empty() || approve(&saves)?;
+
     let lock = lock(&ctx.state)?;
     let mut ledger = Ledger::open(&ctx.state, &lock, &ctx.home)?.value;
-    let rows = plan_add(ctx, &ledger, target)?;
+    let mut rows = plan_add(ctx, &ledger, target)?;
+    for row in &mut rows {
+        let Adoption::Save { target, .. } = &*row else {
+            continue;
+        };
+        let note = if !approved {
+            NOT_CONFIRMED
+        } else if !preview.contains(row) {
+            MOVED
+        } else {
+            continue;
+        };
+        *row = Adoption::Refused {
+            target: target.clone(),
+            note: note.to_string(),
+        };
+    }
 
     for row in &rows {
         if let Adoption::Adopt {
@@ -1149,9 +1292,30 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
             fs::write_atomically(&path, bytes, *mode)?;
         }
     }
+    let saves: Vec<&save::Save> = rows
+        .iter()
+        .filter_map(|row| match row {
+            Adoption::Save { save, .. } => Some(&**save),
+            _ => None,
+        })
+        .collect();
+    // The repo side first: a run that stops before the machine side finds
+    // the repo holding the edit, which the next `add` sees as one side moved.
+    let mut saved = Vec::new();
+    for save in &saves {
+        for write in &save.repo {
+            write.write()?;
+            saved.push(write.written());
+        }
+    }
+    crate::sync::remember_saved(&ctx.state, &lock, &ctx.repo, &saved);
     declare(ctx, &rows)?;
 
     let mut recorded = false;
+    for save in saves.iter().filter(|save| !save.writes_machine()) {
+        ledger.record(save.record())?;
+        recorded = true;
+    }
     for row in &rows {
         if let Adoption::Adopt {
             target,
@@ -1187,6 +1351,8 @@ pub fn add(ctx: &Context, target: &Portable) -> Result<Vec<Adoption>, Error> {
     if recorded {
         ledger.save()?;
     }
+    drop(ledger);
+    save::write_machines(&ctx.state, &ctx.home, lock, &saves)?;
     Ok(rows)
 }
 
@@ -1328,15 +1494,25 @@ fn declare(ctx: &Context, rows: &[Adoption]) -> Result<(), Error> {
     write_layer(&path, &opened, &text, &ctx.home)
 }
 
-/// What `rm` did to one target.
+/// What `rm` did to one target, or, in the preview [`rm_asking`] shows, what
+/// it will do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Removal {
-    /// What restoring it did.
+    /// What restoring it did, or will do.
     pub restored: Restored,
-    /// The layer files it is no longer declared in.
+    /// The layer files it is no longer declared in, or will not be.
     pub undeclared: Vec<PathBuf>,
     /// The repo-relative bodies it named, left in the repo.
     pub bodies: Vec<PathBuf>,
+}
+
+impl Removal {
+    /// Whether carrying it out writes anything: a file, a ledger entry, or a
+    /// layer it is undeclared from.
+    #[must_use]
+    pub fn changes(&self) -> bool {
+        self.restored.changes() || !self.undeclared.is_empty()
+    }
 }
 
 /// One `[[target]]` table a layer holds for a path `rm` was asked about.
@@ -1471,10 +1647,69 @@ fn undeclare(
 /// it. Nothing to do is an empty result, which is what makes a second `rm` a
 /// no-op.
 ///
+/// This is [`rm_asking`] approved without asking, as `bx rm --yes` is.
+///
 /// # Errors
 ///
-/// Whatever reading the ledger, restoring, or editing a layer returns.
+/// As [`rm_asking`].
 pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
+    rm_asking(ctx, target, &mut |_| Ok(true)).map(Option::unwrap_or_default)
+}
+
+/// [`rm`], asking `approve` first about the rows it is about to carry out.
+///
+/// The rows `approve` is shown are decided as `rm` decides them, by the same
+/// function, writing nothing: what each target's restore will do, and the
+/// layers each will be undeclared from. `approve` is asked only when one of
+/// them changes something; a preview of nothing but conflicts, or of
+/// nothing at all, is the result as it stands. `None` is a preview
+/// `approve` declined, and nothing was written.
+///
+/// # Decision: `rm` carries out only what its preview announced
+///
+/// The preview is decided before the state directory is locked, so a file
+/// can change between the two. `rm` then restores only the targets the
+/// preview said it would change, and undeclares only those it said it would
+/// release: any other target, should it now be one `rm` would change, is a
+/// conflict that says the preview no longer holds, and is left as it is. As
+/// `apply` never does work `plan` did not announce, `rm` never does work its
+/// preview did not.
+///
+/// # Errors
+///
+/// Whatever reading the ledger, restoring, or `approve` returns, and
+/// [`Error::Undeclare`], holding every row carried out, when a layer cannot
+/// be edited once files were handed back.
+pub fn rm_asking(
+    ctx: &Context,
+    target: &Portable,
+    approve: &mut dyn FnMut(&[Removal]) -> Result<bool, Error>,
+) -> Result<Option<Vec<Removal>>, Error> {
+    let preview = decide_rm(ctx, target, None)?;
+    if !preview.rows.iter().any(Removal::changes) {
+        return Ok(Some(preview.rows));
+    }
+    if !approve(&preview.rows)? {
+        return Ok(None);
+    }
+    Ok(Some(decide_rm(ctx, target, Some(&preview))?.rows))
+}
+
+/// What one pass of [`rm_asking`] decided: its rows, and, for the preview,
+/// what carrying it out is held to.
+struct Decided {
+    /// One row per target, in path order.
+    rows: Vec<Removal>,
+    /// The targets the preview said a restore would change.
+    announced: BTreeSet<Portable>,
+    /// The targets the preview said would be released, and undeclared.
+    released: BTreeSet<Portable>,
+}
+
+/// The one decision behind [`rm_asking`]: the preview where `shown` is
+/// `None`, writing nothing, and otherwise the removal itself, held to what
+/// `shown` announced.
+fn decide_rm(ctx: &Context, target: &Portable, shown: Option<&Decided>) -> Result<Decided, Error> {
     let ledger = LedgerView::read(&ctx.state, &ctx.home)?.value;
     let found = declarations(ctx, target)?;
     let mut targets: BTreeSet<Portable> = found
@@ -1503,8 +1738,13 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         )
         .collect();
     let held = hold_trees(ctx, &ledger, target, &mut targets)?;
+    let mut decided = Decided {
+        rows: Vec::new(),
+        announced: BTreeSet::new(),
+        released: BTreeSet::new(),
+    };
     if targets.is_empty() && held.is_empty() {
-        return Ok(Vec::new());
+        return Ok(decided);
     }
     let targets: Vec<Portable> = targets.into_iter().collect();
     // A file nothing declares that was edited since bx wrote it is kept as
@@ -1514,7 +1754,28 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         .filter(|path| ctx.undeclared(path))
         .cloned()
         .collect();
-    let restored = restore_tracking(ctx, &ledger, &targets, &undeclared)?;
+    let announced = &mut decided.announced;
+    let restored = restore_tracking(
+        ctx,
+        &ledger,
+        &targets,
+        &undeclared,
+        &mut |paths, undeclared| match shown {
+            None => {
+                let rows = restore::preview_undeclared_with(
+                    &ledger, &ctx.home, paths, undeclared, &ctx.git,
+                )?;
+                announced.extend(
+                    rows.iter()
+                        .filter(|row| row.changes())
+                        .map(Restored::target)
+                        .cloned(),
+                );
+                Ok(rows)
+            }
+            Some(shown) => carry(ctx, &ledger, paths, undeclared, &shown.announced),
+        },
+    )?;
 
     let conflicts: BTreeSet<&Portable> = restored
         .iter()
@@ -1534,6 +1795,7 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         .filter(|done| !done.is_conflict())
         .map(Restored::target)
         .filter(|path| !kept.contains(path))
+        .filter(|path| shown.is_none_or(|shown| shown.released.contains(*path)))
         .cloned()
         .collect();
     let layers: BTreeSet<&Path> = found
@@ -1541,38 +1803,115 @@ pub fn rm(ctx: &Context, target: &Portable) -> Result<Vec<Removal>, Error> {
         .filter(|declaration| released.contains(&declaration.target))
         .map(|declaration| declaration.layer.as_path())
         .collect();
+    let rows = |edited: &BTreeSet<&Path>| {
+        let mut rows: Vec<Removal> = restored
+            .iter()
+            .chain(&held)
+            .map(|done| {
+                let mine: Vec<&Declaration> = if released.contains(done.target()) {
+                    found
+                        .iter()
+                        .filter(|declaration| declaration.target == *done.target())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Removal {
+                    undeclared: mine
+                        .iter()
+                        .filter(|d| edited.contains(d.layer.as_path()))
+                        .map(|d| d.layer.clone())
+                        .collect(),
+                    bodies: mine.iter().filter_map(|d| d.body.clone()).collect(),
+                    restored: done.clone(),
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| a.restored.target().cmp(b.restored.target()));
+        rows
+    };
+    if shown.is_none() {
+        decided.rows = rows(&layers);
+        decided.released = released;
+        return Ok(decided);
+    }
+    let mut edited = BTreeSet::new();
     if !layers.is_empty() {
         let _lock = lock(&ctx.state)?;
         let named: BTreeSet<&Portable> = released.iter().collect();
         for layer in layers {
-            undeclare(layer, &named, &ctx.resolved.values)?;
+            if let Err(source) = undeclare(layer, &named, &ctx.resolved.values) {
+                return Err(Error::Undeclare {
+                    rows: rows(&edited),
+                    layer: paths::to_portable(layer, &ctx.home),
+                    source: Box::new(source),
+                });
+            }
+            edited.insert(layer);
         }
     }
-
-    let mut removals: Vec<Removal> = restored
-        .into_iter()
-        .chain(held)
-        .map(|done| {
-            let mine: Vec<&Declaration> = if released.contains(done.target()) {
-                found
-                    .iter()
-                    .filter(|declaration| declaration.target == *done.target())
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            Removal {
-                undeclared: mine.iter().map(|d| d.layer.clone()).collect(),
-                bodies: mine.iter().filter_map(|d| d.body.clone()).collect(),
-                restored: done,
-            }
-        })
-        .collect();
-    removals.sort_by(|a, b| a.restored.target().cmp(b.restored.target()));
-    Ok(removals)
+    decided.rows = rows(&edited);
+    Ok(decided)
 }
 
-/// Restore `targets` as [`restore::restore_undeclared_with`] does, one result
+/// Restore `paths` for the removal [`decide_rm`] carries out, touching only
+/// the ones its preview `announced` it would change.
+///
+/// Every other path is decided again as the preview decided it, writing
+/// nothing. One that is still no change — a conflict, or a target bx never
+/// wrote — is said as it is; one that `rm` would now change is a conflict,
+/// since nobody was asked about it. The results are in the order of `paths`.
+fn carry(
+    ctx: &Context,
+    ledger: &LedgerView,
+    paths: &[Portable],
+    undeclared: &BTreeSet<Portable>,
+    announced: &BTreeSet<Portable>,
+) -> Result<Vec<Restored>, Error> {
+    let (go, stay): (Vec<Portable>, Vec<Portable>) = paths
+        .iter()
+        .cloned()
+        .partition(|path| announced.contains(path));
+    let mut done = if go.is_empty() {
+        Vec::new()
+    } else {
+        restore::restore_undeclared_with(&ctx.state, &ctx.home, &go, undeclared, &ctx.git)?
+    }
+    .into_iter();
+    let mut left =
+        restore::preview_undeclared_with(ledger, &ctx.home, &stay, undeclared, &ctx.git)?
+            .into_iter();
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let row = if announced.contains(path) {
+            done.next()
+        } else {
+            left.next().map(|row| {
+                if row.changes() {
+                    Restored::Conflict {
+                        target: path.clone(),
+                        dest: path.render(&ctx.home),
+                        note: "changed since `bx rm` showed what it would do; bx wrote nothing \
+                               and forgets nothing, so run `bx rm` again to see it"
+                            .to_string(),
+                    }
+                } else {
+                    row
+                }
+            })
+        };
+        out.extend(row);
+    }
+    Ok(out)
+}
+
+/// Restores the paths it is given, with the targets nothing declares, in
+/// order: [`restore::restore_undeclared_with`] for a removal, and
+/// [`restore::preview_undeclared_with`] for the preview of one.
+type Restorer<'a> =
+    &'a mut dyn FnMut(&[Portable], &BTreeSet<Portable>) -> Result<Vec<Restored>, Error>;
+
+/// Restore `targets` through `restore`, one result
 /// per target in order, with each tracked target handed back through its repo
 /// copy, and a row after them for each repo copy restored.
 ///
@@ -1602,6 +1941,7 @@ fn restore_tracking(
     ledger: &LedgerView,
     targets: &[Portable],
     undeclared: &BTreeSet<Portable>,
+    restore: Restorer<'_>,
 ) -> Result<Vec<Restored>, Error> {
     let copies: Vec<Option<Portable>> = targets.iter().map(|t| ctx.tracked_copy(t)).collect();
     let mut held: Vec<Option<String>> = Vec::with_capacity(targets.len());
@@ -1634,7 +1974,7 @@ fn restore_tracking(
     let done = if restoring.is_empty() {
         Vec::new()
     } else {
-        restore::restore_undeclared_with(&ctx.state, &ctx.home, &restoring, undeclared, &ctx.git)?
+        restore(&restoring, undeclared)?
     };
     let result = |path: &Portable| {
         restoring
@@ -1662,7 +2002,7 @@ fn restore_tracking(
             (_, Some(Restored::Conflict { note, .. })) => Restored::Conflict {
                 target: target.clone(),
                 dest,
-                note: format!("its repo copy {copy} {note}"),
+                note: format!("its repo copy {copy} {}", restore::without_way_out(note)),
             },
             (Some(own), _) => own,
             (None, _) => Restored::Unmanaged {
@@ -1682,7 +2022,8 @@ fn restore_tracking(
 
 /// Why restoring `file`, and its repo copy `copy` where it is tracked, would
 /// be a conflict, as [`restore::plan_restore_with`] reads each ledger entry
-/// now: the first one's note, a copy's naming the copy. `None` when neither
+/// now: the first one's note, a copy's naming the copy, each without the way
+/// out [`restore::without_way_out`] removes. `None` when neither
 /// would, or when the ledger holds no entry for either.
 fn conflict_before_restore(
     ctx: &Context,
@@ -1698,10 +2039,12 @@ fn conflict_before_restore(
         if let restore::Restoration::Conflict { note, .. } =
             restore::plan_restore_with(entry, &ctx.home, &ctx.git)?
         {
+            // The way out names `bx add`, which takes neither a tracked
+            // file nor one a tree declares, the only files asked about here.
             return Ok(Some(if path == file {
-                note
+                restore::without_way_out(&note).to_string()
             } else {
-                format!("its repo copy {path} {note}")
+                format!("its repo copy {path} {}", restore::without_way_out(&note))
             }));
         }
     }

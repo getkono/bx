@@ -5,7 +5,7 @@ use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use super::entry::{
-    History, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, Withdrawal,
+    History, Kept, LedgerEntry, Mechanism, NewEntry, Prior, PriorBytes, RestoreRef, Withdrawal,
     check_created_dirs, is_ancestor, outside_region, prior_conflict,
 };
 use super::view::LedgerView;
@@ -302,6 +302,8 @@ impl Ledger {
                 created_dirs,
                 superseded: history.superseded,
                 superseded_absent: history.absent,
+                // A write leaves bytes no earlier answer was about.
+                kept: None,
             },
         );
         Ok(&self.view.entries[&key])
@@ -370,6 +372,24 @@ impl Ledger {
     #[must_use = "the entry removed is the only record of what was there; drop it deliberately"]
     pub fn forget(&mut self, path: &crate::paths::Portable) -> Option<LedgerEntry> {
         self.view.entries.remove(path)
+    }
+
+    /// Remember that the question about `path` was answered *keep*, against
+    /// `kept`, what both sides were when it was. Returns whether the entry
+    /// changed: an answer already recorded changes nothing, and neither does
+    /// one about a path bx records no entry for, which no question is about.
+    ///
+    /// Bookkeeping only: no destination is touched, and nothing `bx rm`
+    /// restores changes. The record is a cache of the answer and nothing
+    /// more; see [`LedgerEntry::kept`].
+    pub fn keep(&mut self, path: &crate::paths::Portable, kept: Kept) -> bool {
+        match self.view.entries.get_mut(path) {
+            Some(entry) if entry.kept.as_ref() != Some(&kept) => {
+                entry.kept = Some(kept);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Undo a [`Ledger::record`] whose write never landed, by putting back the

@@ -413,6 +413,30 @@ fn the_check_interval_is_the_shortest_auto_one() {
 }
 
 #[test]
+fn a_snooze_says_what_it_put_off_and_for_how_long() {
+    let week = Interval::parse("7d").unwrap();
+    let day = Interval::parse("1d").unwrap();
+    assert_eq!(
+        snoozed(Some(week), None),
+        "bx will ask about updates again in 7d; run `bx update` any time before."
+    );
+    assert_eq!(
+        snoozed(None, Some(day)),
+        "bx will check for updates on its own again in 1d; run `bx update` any time before."
+    );
+    assert_eq!(
+        snoozed(Some(week), Some(day)),
+        "bx will ask about updates again in 7d, and check on its own again in 1d; run \
+         `bx update` any time before."
+    );
+    assert_eq!(
+        snoozed(None, None),
+        "No external follows a branch, so nothing asks about updates; run `bx update` any \
+         time."
+    );
+}
+
+#[test]
 fn stamps_are_written_whole_read_back_and_removed() {
     let home = guarded_home();
     let state = StateDir::resolve(home.path());

@@ -204,7 +204,7 @@ fn rm_on_everything_applied_restores_the_home() {
         .map(|entry| PathBuf::from(entry.expect("an entry").file_name()))
         .collect();
     for path in top_level {
-        machine.converged(&["rm", path.to_str().expect("a plain name")]);
+        machine.converged(&["rm", "--yes", path.to_str().expect("a plain name")]);
     }
     assert_eq!(before, machine.the_accounts());
 }
@@ -271,6 +271,25 @@ fn an_inputrc_already_there_is_not_overwritten() {
         std::fs::read_to_string(machine.home.child(".inputrc")).expect("~/.inputrc"),
         mine
     );
+}
+
+#[test]
+fn apply_caches_the_prompts_init_and_plan_does_not() {
+    // The example says `bx apply` caches `starship init`'s output; `plan`
+    // may run it to decide, and writes nothing.
+    let bx_toml = std::fs::read_to_string(example().join("bx.toml")).expect("bx.toml");
+    assert!(
+        bx_toml.contains("# `bx apply` runs `starship init` and caches its output"),
+        "{bx_toml}"
+    );
+    let machine = Machine::with_starship();
+    let cache = machine.home.child(".local/share/bx/activation");
+
+    machine.bx(&["plan"]);
+    assert!(!cache.exists(), "plan cached the activation");
+
+    machine.converged(&["apply", "--yes"]);
+    assert!(cache.join("starship.zsh").is_file(), "apply cached nothing");
 }
 
 #[test]

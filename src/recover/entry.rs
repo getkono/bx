@@ -439,6 +439,7 @@ mod tests {
                     ledger_written: None,
                     dir: false,
                     link: false,
+                    keeps_written: false,
                 }),
                 Record::Done(Done { target: portable }),
                 Record::End(End { written: 1 }),

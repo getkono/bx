@@ -1,4 +1,4 @@
-//! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
+//! The binary's surface for `bx`, `bx status`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
 //! `bx update`, `bx add`, `bx rm` and `bx self-upgrade`:
 //! exit codes, what reaches standard output, and what is written.
 //!
@@ -67,6 +67,7 @@ enum Out {
     Is(&'static str),
     StartsWith(&'static str),
     EndsWith(&'static str),
+    Contains(&'static str),
 }
 
 #[test]
@@ -78,6 +79,16 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
     for (layer, args, code, out, said, written) in [
         // No config repo yet.
         (None, &["plan"][..], 1, Out::Is(""), "run `bx init`", false),
+        (None, &["status"], 1, Out::Is(""), "run `bx init`", false),
+        // Bare `bx` is the help, read from nothing: no config repo needed.
+        (
+            None,
+            &[],
+            0,
+            Out::Contains("\nUsage: bx [COMMAND]\n"),
+            "",
+            false,
+        ),
         (
             Some(""),
             &["plan"],
@@ -94,8 +105,28 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
             "",
             false,
         ),
-        // Bare `bx` is the status view, with plan's exit codes.
-        (None, &[], 2, Out::StartsWith("  + ~/.a"), "", false),
+        // `bx status` is `git status`'s form, with plan's exit codes; bare
+        // `bx` is still the help.
+        (
+            None,
+            &["status"],
+            2,
+            Out::Is(
+                "Changes to apply:\n  (use \"bx apply\" to write them, \"bx plan\" to see the \
+                 diffs)\n        create:   ~/.a\n",
+            ),
+            "",
+            false,
+        ),
+        (
+            None,
+            &["status", "--short"],
+            2,
+            Out::Is("+ ~/.a\n"),
+            "",
+            false,
+        ),
+        (None, &[], 0, Out::StartsWith("An idempotent"), "", false),
         // No `--yes` and no terminal: the plan is shown and nothing written.
         (
             None,
@@ -121,7 +152,15 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
             "",
             true,
         ),
-        (None, &[], 0, Out::StartsWith("  = ~/.a"), "", true),
+        (
+            None,
+            &["status"],
+            0,
+            Out::Is("nothing to apply, this machine matches the configuration\n"),
+            "",
+            true,
+        ),
+        (None, &["status", "-s"], 0, Out::Is(""), "", true),
     ] {
         if let Some(layer) = layer {
             seed(home.path(), layer);
@@ -134,6 +173,7 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
             Out::Is(whole) => shown == whole,
             Out::StartsWith(start) => shown.starts_with(start),
             Out::EndsWith(end) => shown.ends_with(end),
+            Out::Contains(part) => shown.contains(part),
         };
         assert!(matched, "{args:?}: {shown}");
         assert!(!shown.contains('\x1b'), "{args:?}: coloured into a pipe");
@@ -733,7 +773,7 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
     let planned = bx(home.path(), &["plan"]);
     assert_eq!(planned.status.code(), Some(0), "{}", stdout(&planned));
 
-    let removed = bx(home.path(), &["rm", "~/.tool.rc"]);
+    let removed = bx(home.path(), &["rm", "--yes", "~/.tool.rc"]);
     assert_eq!(removed.status.code(), Some(0), "{}", stderr(&removed));
     assert_eq!(
         std::fs::read(home.child(".tool.rc")).expect("still there"),
@@ -744,9 +784,20 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
         "# mine\n"
     );
 
-    let unnamed = bx(home.path(), &["add"]);
-    assert_eq!(unnamed.status.code(), Some(1));
-    assert!(stderr(&unnamed).contains("name the file or directory to add"));
+    // The path is required, as the README spells it: `bx add PATH`, and a
+    // command line without one is a usage error, not a run.
+    for command in ["add", "rm"] {
+        let unnamed = bx(home.path(), &[command]);
+        assert_eq!(unnamed.status.code(), Some(64), "{}", stderr(&unnamed));
+        assert!(stderr(&unnamed).contains("<PATH>"), "{}", stderr(&unnamed));
+
+        let help = bx(home.path(), &[command, "--help"]);
+        assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+        // Both take `--yes`, so each usage line reads `[OPTIONS] <PATH>`.
+        let usage = format!("Usage: bx {command} [OPTIONS] <PATH>\n");
+        assert!(stdout(&help).contains(&usage), "{}", stdout(&help));
+        assert!(!stdout(&help).contains("TARGET"), "{}", stdout(&help));
+    }
 }
 
 #[test]
@@ -1104,6 +1155,8 @@ fn a_command_with_no_body_exits_one_saying_so_and_does_not_panic() {
 
     for (args, named) in [
         (&["shell-init", "zsh"][..], "bx shell-init"),
+        // With no shell named, still not built rather than a usage error.
+        (&["shell-init"][..], "bx shell-init"),
         (&["__complete", "x"][..], "bx __complete"),
     ] {
         let output = bx(home.path(), args);
@@ -1114,6 +1167,52 @@ fn a_command_with_no_body_exits_one_saying_so_and_does_not_panic() {
             format!("{named} is not built yet in this release of bx.\n")
         );
         assert_eq!(stdout(&output), "");
+    }
+}
+
+#[test]
+fn a_command_line_bx_cannot_parse_exits_64_and_writes_nothing() {
+    let home = guarded_home();
+    seed(home.path(), A_TARGET);
+
+    for args in [
+        &["--no-such-flag"][..],
+        &["no-such-command"],
+        &["apply", "--no-such-flag"],
+        &["update", "--yes", "--check"],
+        // A missing subcommand prints its help, to standard error, as the
+        // usage error it is.
+        &["secret"],
+    ] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "", "{args:?}");
+        assert!(!stderr(&output).is_empty(), "{args:?}");
+        assert!(!home.child(".a").exists(), "{args:?}");
+    }
+
+    // Asked for, help and the version are answers, not usage errors.
+    for args in [
+        &["--help"][..],
+        &["-h"],
+        &["apply", "--help"],
+        &["--version"],
+    ] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(!stdout(&output).is_empty(), "{args:?}");
     }
 }
 
@@ -1383,8 +1482,10 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     let (path, requests) = served(home.path(), "v999.0.0");
     publish(home.path(), "v999.0.0", false);
     let (exe, _) = installed_copy(home.path());
-    // Where the kernel says the copy is, which is the directory bx names.
+    // Where the kernel says the copy is, which is the directory bx names, as
+    // `~/install` wherever no link lies on the way to the home.
     let dir = std::fs::canonicalize(home.path().join("install")).expect("the install directory");
+    let shown = bx::paths::to_portable(&dir, home.path());
 
     let output = self_upgrade_copy(&exe, home.path(), &path);
 
@@ -1392,9 +1493,8 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     assert_eq!(
         stdout(&output),
         format!(
-            "Installing bx v999.0.0 over v{} in {}...\nInstalled bx v999.0.0.\n",
+            "Installing bx v999.0.0 over v{} in {shown}...\nInstalled bx v999.0.0.\n",
             bx::VERSION,
-            dir.display()
         )
     );
     assert_eq!(
@@ -1446,7 +1546,7 @@ fn self_upgrade_refuses_a_release_whose_checksum_does_not_match() {
 fn self_upgrade_check_and_force_are_exclusive() {
     let home = guarded_home();
     let output = bx(home.path(), &["self-upgrade", "--check", "--force"]);
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(64), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("cannot be used with"),
         "{}",
@@ -1458,7 +1558,7 @@ fn self_upgrade_check_and_force_are_exclusive() {
 fn upgrade_check_and_yes_are_exclusive() {
     let home = guarded_home();
     let output = bx(home.path(), &["upgrade", "--check", "--yes"]);
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(64), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("the argument '--check' cannot be used with '--yes'"),
         "{}",

@@ -100,14 +100,14 @@ start with.
 
 ## Commands
 
-There are fourteen. You should not need a manual.
+There are fourteen. You should not need a manual: bare `bx` prints the help.
 
 | | |
 |---|---|
-| `bx` | status: every managed target, and what is pending, in conflict or blocked |
+| `bx status` | where this machine stands, as `git status` says it: the config repo's branch against its upstream, what `apply` would write, files edited here since bx wrote them, tracked files for `bx sync` to carry, what is no longer declared, and what needs attention; `--short` is one line per row that is not unchanged |
 | `bx init` | guided setup |
-| `bx add PATH` | begin managing a config file, or a directory of them |
-| `bx rm PATH` | stop managing it, and restore the original |
+| `bx add PATH` | begin managing a config file, or a directory of them; for a file bx manages that you edited, save your edit into the repo, merging it with the repo's change when both moved, once you confirm the diff (`--yes` asks nothing) |
+| `bx rm PATH` | stop managing it, and restore the original, once you confirm what it shows (`--yes` asks nothing) |
 | `bx plan` | the diff `apply` would make |
 | `bx apply` | converge this machine to the repo |
 | `bx sync` | pull, apply, carry this machine's copies of tracked files into the repo and commit them, push — no git knowledge required |
@@ -145,7 +145,8 @@ module, edited by hand, and a secret is encrypted or re-encrypted to them with
 `local.toml`, `~/.ssh/id_ed25519` when it names none: an age identity file, as
 `age-keygen` or `age -p` writes it, or any ssh private key age reads. A
 passphrase-protected one is never asked for by `plan` or `apply`; only
-`bx secret list` asks, and only at a terminal.
+`bx secret list` asks, and only at a terminal, once per secret; Esc at the
+prompt lists the rest as locked without asking again.
 
 ### Reading a plan
 
@@ -213,7 +214,10 @@ it yours.
                 link bx made that you deleted while the configuration still
                 wants exactly what bx made: your deletion stands, as in git.
                 Shown like `git status`'s `deleted:`, never pending, and
-                `apply` asks at a terminal whether to restore it.
+                `apply` asks at a terminal whether to restore it. Also, and
+                shown too, a target whose question you answered by keeping
+                your edit, mode, target or deletion, until either side
+                changes.
 ```
 
 `plan` and `apply` compute this with the same code, so `apply` can never do work
@@ -251,13 +255,19 @@ or a login banner without anyone parsing its output:
 | `0` | converged — nothing to do; for `plan` and `apply`, also when the only rows are `<`, which are `bx sync`'s to carry |
 | `1` | error |
 | `2` | changes pending, or a conflict or blocked target needs a decision |
+| `64` | the command line could not be parsed — an unknown command or flag, a missing argument, or flags that conflict; nothing was run |
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
-The other commands use the same codes. `bx add` exits `2` when it refused a
-path, `bx rm` when a conflict left something as it was, and
+`bx status` exits as `plan` does. The other commands use the same codes. `bx add` exits `2` when it refused a
+path or a merge it wrote conflicts, `bx rm` when a conflict left something as
+it was, `bx doctor` when it has a finding, no config repo at all among them, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
-when it did not carry the `<` rows it announced — declined, or refused for
-want of a terminal.
+when it was declined and did not carry the `<` rows it announced, and
+`bx update` and `bx upgrade` when declined, even when all they offered was a
+change to `bx.lock`. Without `--yes` and with no terminal to ask on, `apply`,
+`sync`, `update` and `upgrade` show what they would do and, where there is
+something to confirm, refuse it and exit `1`; with nothing to confirm they run
+to the end.
 
 ## Does it replace your dotfiles manager?
 
@@ -370,16 +380,41 @@ says what the budget covers.
   markers, and about a symlink bx made that you pointed elsewhere, each in its
   own words; showing one of these shows its row's diff again. Taking bx's
   keeps your mode, your whole file, or your link's target, and `bx rm` puts
-  that back exactly. With `--yes`, or
-  with no terminal, nothing is asked and every edit is kept. Any other
+  that back exactly. Keeping yours is remembered: the row says you kept it,
+  nothing is pending, `bx sync` pushes, and nothing is asked again until the
+  file or what bx wants there changes. With `--yes`, or
+  with no terminal, nothing is asked and every edit is kept for that run
+  only: nothing was answered, so nothing is remembered, the row stays a
+  conflict, `bx sync` does not push, and the next run at a terminal asks.
+  Any other
   conflict you settle by hand, in the file or in your configuration, and the
   next `plan` reads what you decided.
+- An edit you want everywhere goes into the repo the way `git add` stages
+  one: `bx add PATH` on a file bx manages writes your bytes into its declared
+  body — the repo file a `file` body names, or the `content` of an inline one,
+  edited in place in the layer that declares it — and a mode you set into
+  its `mode`, then records them as what bx wrote, so the next `plan` is
+  empty and `bx sync` commits and pushes the save. Where the repo changed
+  too, bx merges the two with your `git merge-file`, from the copy it kept of
+  what it last wrote: a clean merge is written to the repo and to your file,
+  whose bytes `bx rm` puts back; a conflicting one changes nothing in the
+  repo, and once you confirm writes the conflict markers into your file, for
+  you to resolve and `bx add` again. It shows the diffs first and asks
+  (`--yes` asks nothing; with no terminal it saves nothing). It refuses a
+  secret, a generated file, a region or include line, a tracked file (which
+  `bx sync` carries already), an inline content with a `{{name}}` in it, a
+  repo file another target also delivers, naming that target, and a repo
+  file holding changes you have not committed, so the commit `bx sync`
+  makes holds only the save. At a
+  terminal, `apply`'s question about an edited file offers the same save, or
+  the merge where it is clean.
 - A file or link bx made that you deleted is never silently re-created. While
   the configuration still wants what bx made there, the deletion stands; once
   it wants something else, it is a modify/delete conflict. Either way, at a
   terminal, `apply` and `sync` ask whether to keep it deleted (the default) or
-  restore bx's, and can show what restoring writes; `--yes` or no terminal
-  keeps it deleted. A file bx
+  restore bx's, and can show what restoring writes; keeping it deleted is
+  remembered the same way, and `--yes` or no terminal
+  keeps it deleted for that run, remembering nothing. A file bx
   generates for itself under `~/.local/share/bx` — a shell fragment, or a zsh
   activation's file and its `.zwc` — holds nothing of yours, and a deleted one
   is re-created.

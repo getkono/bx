@@ -126,15 +126,10 @@ fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
         home.path(),
     );
     assert!(!quiet.contains("activation"), "{quiet}");
-    let status = render(
-        &again,
-        View::Status,
-        Palette::resolve(true, false),
-        home.path(),
-    );
-    assert!(
-        status.contains("  = activation `stub`: cached output reused, nothing run\n"),
-        "{status}"
+    assert_eq!(
+        crate::status::short(&again),
+        "",
+        "an unchanged activation is no line of `bx status --short`"
     );
     let second =
         run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve")).expect("the second apply");
@@ -214,6 +209,14 @@ fn each_shell_s_command_is_cached_and_rendered_in_its_own_file_and_reversed() {
             && shown.contains("  + activation `zonly`: run twice, output agreed; cached\n")
             && !shown.contains("`zonly` for bash"),
         "{shown}"
+    );
+    // `bx status` names each capture by its activation and shell.
+    let short = crate::status::short(&planned);
+    assert!(
+        short.contains("+ activation `stub`\n")
+            && short.contains("+ activation `stub` for bash\n")
+            && short.contains("+ activation `zonly`\n"),
+        "{short}"
     );
     // bash's row says why `zonly` is not in its file.
     let bash_row = planned
@@ -474,6 +477,24 @@ fn an_absent_tool_is_blocked_and_everything_else_is_still_written() {
         shown.contains("  ? activation `gone`: omitted: `gone` is not on PATH\n"),
         "{shown}"
     );
+    // `bx status` lists the captures to apply, and the omitted one as
+    // needing attention, saying why once.
+    let facts = crate::status::Facts {
+        repo: "~/.config/bx".to_string(),
+        branch: crate::status::Branch::NotGit,
+        uncommitted: Vec::new(),
+        unasked: None,
+        due: false,
+    };
+    let status = crate::status::long(&planned, &facts, home.path());
+    assert!(
+        status.contains("        create:   activation `stub`\n")
+            && status.contains(
+                "Needs attention:\n        blocked:  activation `gone`  (omitted: `gone` is \
+                 not on PATH)\n"
+            ),
+        "{status}"
+    );
 
     let applied = apply(&inputs);
     assert!(applied.executed);
@@ -695,6 +716,8 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            saved: Default::default(),
+            kept: std::collections::BTreeSet::new(),
         })
     })
     .expect("apply runs")
@@ -745,6 +768,38 @@ fn a_kept_edit_of_an_activation_file_keeps_its_wordcode_from_overriding_it() {
         String::from_utf8_lossy(&out.stdout),
         "edited_hook: function\nstub_hook: none\n"
     );
+
+    // Kept and remembered: the wordcode waits with its file, and neither is
+    // asked about or left in conflict again.
+    let remembered = answered(&inputs, Mode::Apply, &mut |_| {
+        Ok(Approval {
+            approved: false,
+            taken: std::collections::BTreeSet::new(),
+            saved: Default::default(),
+            kept: std::collections::BTreeSet::from([output]),
+        })
+    })
+    .expect("apply runs");
+    assert!(remembered.kept.contains(&output) && remembered.kept.contains(&wordcode));
+    assert_eq!(remembered.changes[wordcode].action, Action::Unchanged);
+    assert!(
+        remembered.changes[wordcode]
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains(crate::plan::decide::WAITS)),
+        "{:?}",
+        remembered.changes[wordcode].note
+    );
+    let again = plan(&inputs);
+    assert!(again.questions.is_empty());
+    assert_eq!(again.changes[wordcode].action, Action::Unchanged);
+    assert_eq!(exit(&again, Mode::Plan), Exit::Converged);
+    assert_eq!(
+        std::fs::read(home.child(WORDCODE)).expect("the wordcode"),
+        before
+    );
+    // Edited again, so its question is put again for the take below.
+    std::fs::write(home.child(OUTPUT), "edited_hook() { true; }\n").expect("a second edit");
 
     // Taken: both are written, the wordcode after, and the plan converges.
     let taken = answer(&inputs, &[output]);

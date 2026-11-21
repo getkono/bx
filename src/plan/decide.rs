@@ -58,7 +58,7 @@ use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
 use crate::shell::activation::{self, Host as _};
-use crate::state::{LedgerEntry, LedgerView, Mechanism, removed_written};
+use crate::state::{Kept, LedgerEntry, LedgerView, Mechanism, removed_written};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +121,11 @@ pub(super) struct Decided {
     /// [`Decided::held`], with the write `apply` makes right after the
     /// file's, and only once it does: see [`wordcode`].
     pub tied: Vec<Tied>,
+    /// Each row whose question an earlier run was answered *keep* about,
+    /// while both sides are still what they were then, by index into
+    /// [`Decided::changes`], ascending: see [`keep_rows`]. None of them is in
+    /// [`Decided::held`].
+    pub kept: Vec<usize>,
 }
 
 /// Decide every target of a configuration.
@@ -214,7 +219,19 @@ pub(super) fn decide_all(
     }
     // Every target has its row, so a row's index is its target's.
     let mut changes: Vec<Change> = rows.into_iter().flatten().collect();
-    let tied = wordcode::tie(resolutions, &mut changes, &mut ops, &mut held, ctx.home)?;
+    let mut tied = wordcode::tie(resolutions, &mut changes, &mut ops, &mut held, ctx.home)?;
+    // A question already answered *keep*, about exactly what is there now,
+    // is not put again: its row says it was kept.
+    let mut answered = Vec::new();
+    held.retain(|(row, op)| {
+        let entry = ctx.ledger.get(op.target());
+        let standing = entry.and_then(|entry| entry.kept.as_ref()) == Some(&op.kept());
+        if standing {
+            answered.push((*row, op.asked(entry)));
+        }
+        !standing
+    });
+    let kept = keep_rows(&mut changes, &mut tied, &answered);
     Ok(Decided {
         changes,
         ops,
@@ -223,7 +240,48 @@ pub(super) fn decide_all(
         declared,
         held,
         tied,
+        kept,
     })
+}
+
+/// Turn each row in `answered`, a question answered *keep*, into the row a
+/// kept answer is, and return every row that became one, ascending.
+///
+/// A kept row is unchanged and needs nothing: no write is pending there, and
+/// nothing waits on an answer. It says it was kept, in place of what `apply`
+/// would ask, and shows no diff. A zsh activation's wordcode whose write was
+/// tied to a kept file waits with it, as one whose file is not written does,
+/// and is kept too: zsh would read bx's compiled form in place of the edit.
+/// One that is a question of its own stays one, and stays tied, so *take
+/// bx's* for it is still never made without its file's.
+pub(super) fn keep_rows(
+    changes: &mut [Change],
+    tied: &mut Vec<Tied>,
+    answered: &[(usize, super::Asked)],
+) -> Vec<usize> {
+    let mut kept = Vec::new();
+    for &(row, asked) in answered {
+        let change = &mut changes[row];
+        change.action = Action::Unchanged;
+        change.diff = None;
+        change.note = Some(asked.kept(change.note.as_deref()));
+        kept.push(row);
+    }
+    tied.retain(|tied| {
+        if tied.asked() || !answered.iter().any(|(row, _)| *row == tied.source) {
+            return true;
+        }
+        let change = &mut changes[tied.row];
+        change.action = Action::Unchanged;
+        change.note = change
+            .note
+            .as_deref()
+            .map(|note| note.replace(wordcode::TIED, wordcode::WAITS));
+        kept.push(tied.row);
+        false
+    });
+    kept.sort_unstable();
+    kept
 }
 
 /// One write a decision produced.
@@ -278,6 +336,33 @@ impl Op {
     /// The target the write is for.
     pub(super) const fn target(&self) -> &Portable {
         &self.target
+    }
+
+    /// What plan observed at the destination when it decided this write.
+    pub(super) const fn planned(&self) -> &Observed {
+        &self.planned
+    }
+
+    /// The whole file this write leaves, for a file bx owns whole on this
+    /// machine: what an edit of it is saved against.
+    pub(super) fn whole(&self) -> Option<&[u8]> {
+        match &self.made {
+            Made::Bytes(bytes) if self.claimed && !self.carry => Some(bytes),
+            _ => None,
+        }
+    }
+
+    /// The write a held file's question answered *merge* makes in place of
+    /// this one: the merge's `bytes` at `mode`, over the same observation, so
+    /// a file changed while the question was open is refused as any held
+    /// write is.
+    pub(super) fn merged(&self, bytes: Vec<u8>, mode: Mode) -> Self {
+        Self {
+            base: self.base && bytes.len() <= Base::KEPT_WHOLE,
+            made: Made::Bytes(bytes),
+            mode,
+            ..self.clone()
+        }
     }
 
     /// The bytes this write leaves, when `apply` keeps them in `restore/`
@@ -351,6 +436,11 @@ impl Op {
         let target = self.target.as_str();
         match &self.made {
             Made::Link(text) => Some(Diff::link(None, Some(text))),
+            // Only a generated body is ever a region, so it is never a
+            // secret: restoring it writes the region alone, shown whole.
+            Made::Region(bytes, _) => {
+                Diff::labelled(target, ("deleted", "bx's"), None, bytes, None)
+            }
             Made::Bytes(bytes) => match self.base() {
                 Some(wanted) => Diff::labelled(target, ("deleted", "bx's"), None, wanted, None),
                 None => Some(Diff {
@@ -366,6 +456,30 @@ impl Op {
                 }),
             },
             _ => None,
+        }
+    }
+
+    /// What both sides of this held write's question are: what plan found on
+    /// disk, and what the write would leave there. An answer *keep* is
+    /// remembered against it, and stands while it is still the same.
+    pub(super) fn kept(&self) -> Kept {
+        let wanted = match &self.made {
+            Made::Bytes(bytes) | Made::Region(bytes, _) => ContentHash::of(bytes),
+            Made::Link(text) => fs::link::digest(text),
+            // Never held: nothing is asked about a directory or a removal.
+            Made::Dir | Made::Absent(_) | Made::DirAbsent(_) | Made::LinkAbsent(_) => {
+                ContentHash::ZERO
+            }
+        };
+        Kept {
+            found: self
+                .planned
+                .digest()
+                .or_else(|| self.planned.link_digest())
+                .unwrap_or(ContentHash::ZERO),
+            found_mode: self.planned.mode,
+            wanted,
+            mode: self.mode,
         }
     }
 
@@ -547,20 +661,42 @@ pub(super) fn decide(
         _ => ownership(found, &observed, entry, note),
     };
     let claim = found == Action::Unchanged && action == Action::Modify;
-    // A file bx owns whole that was deleted since bx wrote it, settled as git
-    // settles a deletion: see [`deleted`]. A file bx generates for itself in
-    // its own data directory is not the user's to delete: see [`own_data`].
-    // Nor is one bx itself removed, as it carries a tracked target's deletion
-    // across: nothing there is what bx last left, and writing it is a create.
-    let gone = matches!(target.attach, Attach::Own)
-        && action == Action::Create
+    // A file bx owns whole that was deleted since bx wrote it, or a file that
+    // held a region of bx's, settled as git settles a deletion: see
+    // [`deleted`]. A file bx generates for itself in its own data directory
+    // is not the user's to delete: see [`own_data`]. Nor is one bx itself
+    // removed, as it carries a tracked target's deletion across: nothing
+    // there is what bx last left, and writing it is a create.
+    let gone = action == Action::Create
         && observed.kind == Kind::Absent
-        && !own_data(target)
         && entry.is_some_and(|entry| {
-            entry.mechanism == Mechanism::Own && entry.written != removed_written()
+            entry.written != removed_written()
+                && match target.attach {
+                    Attach::Own => entry.mechanism == Mechanism::Own && !own_data(target),
+                    Attach::Region { comment } => entry.mechanism == Mechanism::Region { comment },
+                    Attach::Include { .. } => false,
+                }
         });
-    let (action, note) = match entry {
-        Some(entry) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
+    // A region's file restored is put back at the mode bx last left it at,
+    // unless the target declares one: the mode was the user's file's, and
+    // restoring bx's region never widens it.
+    let mode = match (&target.attach, entry) {
+        (Attach::Region { .. }, Some(entry)) if gone && target.mode.is_none() => entry.mode,
+        _ => mode,
+    };
+    let (action, note) = match (&target.attach, entry) {
+        // The region is measured by its own digest, which the ledger keeps
+        // beside the whole file's: the user's lines around it went with the
+        // file, and are not bx's to want back. An entry recorded before bx
+        // kept a region digest is measured by the whole file.
+        (Attach::Region { comment }, Some(entry)) if gone => {
+            let made = match entry.region {
+                Some(region) => region::digest(&bytes, *comment) == Some(region),
+                None => ContentHash::of(&bytes) == entry.written,
+            };
+            settle_deleted(entry, made, mode, note)
+        }
+        (_, Some(entry)) if gone => deleted(entry, ContentHash::of(&bytes), mode, note),
         _ => (action, note),
     };
     // A file bx owns whole whose bytes or mode someone else changed since, or
@@ -1331,8 +1467,9 @@ fn own_data(target: &Target) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Settle a target bx made — a file it owns whole, or a symlink — that was
-/// deleted since bx made it, as git settles a deletion against its base.
+/// Settle a target bx made — a file it owns whole, a file holding a region of
+/// bx's, or a symlink — that was deleted since bx made it, as git settles a
+/// deletion against its base.
 ///
 /// `entry` is what bx last left there, and `wanted` and `mode` what the
 /// target wants there now:
@@ -1355,7 +1492,19 @@ fn deleted(
     mode: Mode,
     note: Option<String>,
 ) -> (Action, Option<String>) {
-    if wanted == entry.written && mode == entry.mode {
+    settle_deleted(entry, wanted == entry.written, mode, note)
+}
+
+/// [`deleted`], told whether the target still wants what bx made there,
+/// `made`, rather than measuring it: a region is measured by its own digest,
+/// not the whole file's.
+fn settle_deleted(
+    entry: &LedgerEntry,
+    made: bool,
+    mode: Mode,
+    note: Option<String>,
+) -> (Action, Option<String>) {
+    if made && mode == entry.mode {
         (Action::Unchanged, join([Some(DELETED.to_string()), note]))
     } else {
         let moded = (mode != entry.mode).then(|| format!("mode {} -> {mode}", entry.mode));

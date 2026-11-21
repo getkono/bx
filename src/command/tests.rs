@@ -35,9 +35,16 @@ fn prompts_child() {
     // write bx's bytes over the edit.
     let settled = ask_edited("~/.a was edited", &CHOICES);
     assert!(matches!(settled, Err(Error::Prompt(NotTTY))), "{settled:?}");
+    // Nor is there one to `rm`'s question: inventing one would hand back
+    // what nobody confirmed.
+    let removing = confirm_rm();
     assert!(
-        ask_passphrase("~/.ssh/id_ed25519").is_none(),
-        "a prompt with no terminal is no passphrase"
+        matches!(removing, Err(adopt::Error::Prompt(NotTTY))),
+        "{removing:?}"
+    );
+    assert!(
+        matches!(ask_passphrase("~/.ssh/id_ed25519"), Asked::Nothing),
+        "a prompt with no terminal is no passphrase, and not one left with Esc"
     );
     // `init`'s questions: a value, asked afresh or again after a
     // problem, and the files to adopt.
@@ -122,20 +129,103 @@ fn plan_exits_zero_when_converged_and_two_when_pending() {
 }
 
 #[test]
-fn status_shows_what_plan_hides() {
+fn status_says_what_is_left_to_apply_and_exits_as_plan_does() {
     let home = guarded_home();
     own(home.path(), ".a", b"a\n", Mechanism::Own);
-    seed(home.path(), &inline("~/.a", "a\\n"));
+    seed(
+        home.path(),
+        &format!("{}{}", inline("~/.a", "a\\n"), inline("~/.b", "b\\n")),
+    );
 
     let mut shown = Vec::new();
-    let exit = status(&env(home.path()), &mut shown).expect("status");
-    assert_eq!(exit, Exit::Converged);
-    assert!(text(&shown).contains("  = ~/.a  ("), "{}", text(&shown));
+    let exit = status(&env(home.path()), false, &mut shown).expect("status");
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&shown),
+        "Changes to apply:\n  (use \"bx apply\" to write them, \"bx plan\" to see the \
+         diffs)\n        create:   ~/.b\n",
+        "the repo is no git repository, so no branch is said"
+    );
+    let mut short = Vec::new();
+    let exit = status(&env(home.path()), true, &mut short).expect("status --short");
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(text(&short), "+ ~/.b\n");
+    assert!(!home.child(".b").exists(), "status writes nothing");
 
-    let mut hidden = Vec::new();
-    let exit = plan(&env(home.path()), &mut hidden).expect("plan");
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("apply");
+    let mut shown = Vec::new();
+    let exit = status(&env(home.path()), false, &mut shown).expect("status");
     assert_eq!(exit, Exit::Converged);
-    assert!(!text(&hidden).contains("~/.a"), "{}", text(&hidden));
+    assert_eq!(
+        text(&shown),
+        "nothing to apply, this machine matches the configuration\n"
+    );
+}
+
+#[test]
+fn status_says_where_the_config_repo_s_branch_stands_and_what_bx_left_uncommitted() {
+    use crate::testing::git::{cloned, commit_all, run};
+
+    let home = guarded_home();
+    let repo = cloned(&home, "[[target]]\npath = \"~/.rc\"\nfile = \"files/rc\"\n");
+    std::fs::create_dir_all(repo.join("files")).expect("files");
+    std::fs::write(repo.join("files/rc"), "a\n").expect("the body");
+    commit_all(home.path(), &repo, "rc");
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("apply");
+    // An edit saved into the repo by `bx add`, which no sync has committed.
+    home.write(".rc", "mine\n");
+    let ctx = adopt::Context::load(&env(home.path())).expect("context");
+    let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+    adopt::add(&ctx, &rc).expect("add");
+    let index = std::fs::read(repo.join(".git/index")).expect("the index");
+
+    let mut shown = Vec::new();
+    let exit = status(&env(home.path()), false, &mut shown).expect("status");
+
+    assert_eq!(exit, Exit::Converged);
+    assert_eq!(
+        text(&shown),
+        "On branch master\nYour branch is ahead of 'origin/master' by 1 commit.\n  (use \
+         \"bx sync\" to publish them)\n\nTracked files to carry:\n  (use \"bx sync\" to \
+         commit and push them)\n        saved:    ~/.config/bx/files/rc\n\nnothing to apply, \
+         this machine matches the configuration\n"
+    );
+    assert_eq!(
+        std::fs::read(repo.join(".git/index")).expect("the index"),
+        index,
+        "asking git rewrote no index"
+    );
+    assert_eq!(
+        run(home.path(), &repo, &["status", "--porcelain"]),
+        "M files/rc",
+        "nothing staged"
+    );
+
+    // A git that cannot be started says why once, and nothing more is asked.
+    let inputs = Inputs::load(&env(home.path())).expect("inputs");
+    let missing = Git::new(&env(home.path())).with_program("/nonexistent/git");
+    let facts = status::Facts::gather(&inputs, &missing);
+    assert!(
+        matches!(&facts.branch, status::Branch::Unknown(why)
+            if why.starts_with("The config repo ~/.config/bx is not a git checkout bx can read: \
+                                git could not be started")),
+        "{facts:?}"
+    );
+    assert_eq!((facts.uncommitted, facts.unasked), (Vec::new(), None));
+    assert!(!facts.due, "no stamp, so nothing is due");
+
+    // An update stamp that has fallen due, now or before, is a check due;
+    // one still ahead is not.
+    let stamps = crate::update::Stamps::of(inputs.state());
+    inputs
+        .state()
+        .ensure_update()
+        .expect("the update directory");
+    let now = crate::update::now();
+    for (at, due) in [(now, true), (now + 3600, false)] {
+        std::fs::write(stamps.check_due(), format!("{at}\n")).expect("a stamp");
+        assert_eq!(status::Facts::gather(&inputs, &missing).due, due, "{at}");
+    }
 }
 
 #[test]
@@ -551,21 +641,52 @@ fn init_ends_by_saying_where_the_machine_stands() {
     const NEXT: &str =
         "Manage a file with `bx add PATH`; change an answer with `bx init --set NAME=VALUE`.\n";
     assert_eq!(
-        init_closing(Exit::Converged, false),
+        init_closing(Exit::Converged, false, None),
         format!("Already set up: nothing to apply. {NEXT}")
     );
     assert_eq!(
-        init_closing(Exit::Converged, true),
+        init_closing(Exit::Converged, true, None),
         format!("Set up. {NEXT}")
     );
     for did in [false, true] {
         assert_eq!(
-            init_closing(Exit::Pending, did),
+            init_closing(Exit::Pending, did, None),
             "Not finished: see the plan above, then run `bx init` or `bx apply` again.\n"
         );
-        assert_eq!(init_closing(Exit::Error, did), "");
-        assert_eq!(init_closing(Exit::Canceled, did), "");
+        assert_eq!(
+            init_closing(Exit::Pending, did, Some("~/.a (unanswered)")),
+            "Not finished: ~/.a (unanswered) left undone; see the plan above, settle them, \
+             then run `bx apply` again.\n"
+        );
+        assert_eq!(init_closing(Exit::Error, did, None), "");
+        assert_eq!(init_closing(Exit::Canceled, did, None), "");
     }
+}
+
+#[test]
+fn an_init_that_leaves_a_conflict_names_it_in_its_last_line() {
+    use crate::init::tests::Silent;
+
+    let home = guarded_home();
+    home.write(".mine", "mine\n");
+    seed(home.path(), &inline("~/.mine", "bx\\n"));
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let mut out = Vec::new();
+
+    let exit = init_with(&tty, &[], false, &mut out, &mut Silent, &mut never).expect("init");
+
+    assert_eq!(exit, Exit::Pending);
+    assert!(
+        text(&out).ends_with(
+            "Not finished: ~/.mine (conflict) left undone; see the plan above, settle them, \
+             then run `bx apply` again.\n"
+        ),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -780,7 +901,43 @@ fn a_run_that_only_adopted_is_set_up_and_not_already_set_up() {
     assert_eq!(exit, Exit::Converged);
     assert!(text(&out).contains("  + ~/.zshrc  (copied to files/.zshrc)\n"));
     assert!(
-        text(&out).ends_with(init_closing(Exit::Converged, true)),
+        text(&out).ends_with(&init_closing(Exit::Converged, true, None)),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_pick_that_adopted_nothing_is_already_set_up() {
+    use crate::init::tests::Script;
+
+    // The pick is a directory holding only a link, which `add` passes over:
+    // the row is said, and nothing was adopted, so nothing was set up.
+    let home = guarded_home();
+    seed(home.path(), "");
+    std::fs::create_dir_all(home.child(".config/app")).expect("the directory");
+    std::os::unix::fs::symlink("elsewhere", home.child(".config/app/link")).expect("the link");
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let mut script = Script {
+        pick: vec!["~/.config/app"],
+        ..Script::default()
+    };
+    let mut out = Vec::new();
+
+    let exit = init_with(&tty, &[], false, &mut out, &mut script, &mut never).expect("init");
+
+    assert_eq!(script.offered, [vec!["~/.config/app".to_string()]]);
+    assert_eq!(exit, Exit::Converged);
+    assert!(
+        text(&out).contains("  - ~/.config/app/link  skipped: "),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).ends_with(&init_closing(Exit::Converged, false, None)),
         "{}",
         text(&out)
     );
@@ -979,16 +1136,16 @@ fn a_missing_repo_is_an_error_for_every_command() {
     let env = env(home.path());
 
     assert!(matches!(
-        status(&env, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        status(&env, false, &mut Vec::new()),
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(
         plan(&env, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(
         apply(&env, true, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
 }
 
@@ -1005,7 +1162,7 @@ fn seal(home: &crate::testing::GuardedHome, name: &str, recipient: &str) {
         .expect("the ciphertext");
 }
 
-fn no_passphrase(_: &str) -> Option<Passphrase> {
+fn no_passphrase(_: &str) -> Asked {
     panic!("nothing should have asked for a passphrase")
 }
 
@@ -1094,7 +1251,7 @@ fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret()
     let mut out = Vec::new();
     let exit = secret_list_with(&tty, &mut out, &mut |shown| {
         asked.push(shown.to_string());
-        Some(Passphrase::from(LOCKED_PASSPHRASE))
+        Asked::Given(Passphrase::from(LOCKED_PASSPHRASE))
     })
     .expect("listed");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
@@ -1107,6 +1264,65 @@ fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret()
         ["~/.ssh/id_ed25519", "~/.ssh/id_ed25519"],
         "asked once per secret: nothing keeps a passphrase"
     );
+
+    // A prompt that failed asks again for the next secret.
+    let mut asked = 0;
+    let mut out = Vec::new();
+    secret_list_with(&tty, &mut out, &mut |_| {
+        asked += 1;
+        Asked::Nothing
+    })
+    .expect("listed");
+    assert_eq!(asked, 2, "{}", text(&out));
+}
+
+#[test]
+fn d1_secret_list_left_at_a_passphrase_prompt_asks_for_that_identity_no_more() {
+    use crate::secret::tests::{LOCKED_SSH_KEY, LOCKED_SSH_PUB};
+
+    let home = guarded_home();
+    home.write(".ssh/id_ed25519", LOCKED_SSH_KEY);
+    for name in ["one", "two", "three"] {
+        seal(&home, name, LOCKED_SSH_PUB);
+    }
+    seed(
+        home.path(),
+        &[
+            secret_target("one"),
+            secret_target("two"),
+            secret_target("three"),
+        ]
+        .concat(),
+    );
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+
+    let mut asked = 0;
+    let mut out = Vec::new();
+    let exit = secret_list_with(&tty, &mut out, &mut |_| {
+        asked += 1;
+        Asked::Left
+    })
+    .expect("listed");
+
+    assert_eq!(asked, 1, "Esc on the first prompt skips the other two");
+    assert_eq!(exit, Exit::Pending);
+    let locked = "not decryptable: the identity ~/.ssh/id_ed25519 is locked by a passphrase";
+    let lines: Vec<&str> = text(&out).lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "every secret is still listed: {}",
+        text(&out)
+    );
+    for (line, name) in lines.iter().zip(["one", "two", "three"]) {
+        assert!(
+            line.starts_with(&format!("  ~/{name}  secrets/{name}.age  {locked}")),
+            "{line}"
+        );
+    }
 }
 
 #[test]
@@ -1243,13 +1459,68 @@ fn doctor_with_nothing_to_check_is_converged_and_needs_no_systemd() {
 }
 
 #[test]
-fn doctor_without_a_repo_or_an_output_is_an_error() {
+fn doctor_without_a_repo_is_a_finding_and_writes_nothing() {
     let home = guarded_home();
-    assert!(matches!(
-        doctor(&env(home.path()), &mut Vec::new()),
-        Err(Error::RepoMissing(_))
-    ));
+    let before = crate::plan::tests::snapshot(home.path(), &[]);
 
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx does not exist, so there is no configuration to check; `bx init` \
+         creates the config repo\n\
+         Doctor: 1 finding(s).\n"
+    );
+    assert_eq!(crate::plan::tests::snapshot(home.path(), &[]), before);
+    assert!(matches!(
+        doctor(&env(home.path()), &mut Refusing),
+        Err(Error::Output(_))
+    ));
+}
+
+#[test]
+fn doctor_with_a_non_directory_for_a_repo_says_so_and_writes_nothing() {
+    let home = guarded_home();
+    std::fs::create_dir_all(home.path().join(".config")).expect("the config home");
+    std::fs::write(home.path().join(".config/bx"), "x").expect("a file where the repo goes");
+    let before = crate::plan::tests::snapshot(home.path(), &[]);
+
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx is not a directory, so there is no configuration to check; move it \
+         aside, and `bx init` creates the config repo\n\
+         Doctor: 1 finding(s).\n"
+    );
+    assert_eq!(crate::plan::tests::snapshot(home.path(), &[]), before);
+}
+
+#[test]
+fn doctor_with_a_repo_beneath_a_non_directory_says_so() {
+    let home = guarded_home();
+    std::fs::write(home.path().join(".config"), "x").expect("a file where the config home goes");
+
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx lies beneath a path that is not a directory, so there is no \
+         configuration to check; `bx init` creates the config repo once that path is a \
+         directory\n\
+         Doctor: 1 finding(s).\n"
+    );
+}
+
+#[test]
+fn doctor_without_an_output_is_an_error() {
+    let home = guarded_home();
     seed(home.path(), "");
     assert!(matches!(
         doctor(&env(home.path()), &mut Refusing),
@@ -1360,6 +1631,8 @@ fn every_question_is_put_once_what_was_typed_ahead_is_gone() {
 
 mod doctor_command;
 mod edited_command;
+mod rm_command;
+mod save_command;
 mod sync_command;
 mod update_check_command;
 mod update_command;

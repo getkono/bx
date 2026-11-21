@@ -1177,15 +1177,8 @@ pub fn not_built(command: &str, err: &mut dyn Write) -> Result<Exit, Error> {
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
-/// or adopting returns.
-pub fn add(
-    env: &Env,
-    cwd: &Path,
-    path: Option<&str>,
-    out: &mut dyn Write,
-) -> Result<Exit, adopt::Error> {
-    let path = path.ok_or(adopt::Error::NoPath("add"))?;
+/// Whatever locating, loading or adopting returns.
+pub fn add(env: &Env, cwd: &Path, path: &str, out: &mut dyn Write) -> Result<Exit, adopt::Error> {
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
     let rows = adopt::add(&ctx, &target)?;
@@ -1247,15 +1240,8 @@ fn adoption_row(row: &Adoption) -> String {
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading
-/// or restoring returns.
-pub fn rm(
-    env: &Env,
-    cwd: &Path,
-    path: Option<&str>,
-    out: &mut dyn Write,
-) -> Result<Exit, adopt::Error> {
-    let path = path.ok_or(adopt::Error::NoPath("rm"))?;
+/// Whatever locating, loading or restoring returns.
+pub fn rm(env: &Env, cwd: &Path, path: &str, out: &mut dyn Write) -> Result<Exit, adopt::Error> {
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
     let removals = adopt::rm(&ctx, &target)?;

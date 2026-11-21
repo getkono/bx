@@ -92,12 +92,6 @@ const FILES_DIR: &str = "files";
 /// Everything that stops `add` or `rm`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// No path was named.
-    #[error(
-        "name the file or directory to {0}, e.g. `bx {0} ~/.gitconfig`; `bx init` is what \
-         offers the config already on this machine"
-    )]
-    NoPath(&'static str),
     /// The path could not be made portable.
     #[error(transparent)]
     Path(#[from] paths::Error),

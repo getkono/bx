@@ -193,8 +193,7 @@ fn a_symlink_is_refused_rather_than_adopted_as_what_it_points_at() {
     assert!(ledger(&home).is_empty(), "nothing owned");
 
     let mut out = Vec::new();
-    let exit =
-        crate::command::add(&env(home.path()), home.path(), Some(".link"), &mut out).expect("add");
+    let exit = crate::command::add(&env(home.path()), home.path(), ".link", &mut out).expect("add");
     assert_eq!(exit, Exit::Pending, "a refusal needs a human");
     assert!(
         String::from_utf8(out)
@@ -360,13 +359,8 @@ fn a_line_that_relocates_a_tool_is_a_warning_naming_it_and_the_file_is_still_ado
 
     let mut out = Vec::new();
     plant(&home, ".other.sh", b"export CARGO_HOME=/x\n", 0o644);
-    let exit = crate::command::add(
-        &env(home.path()),
-        home.path(),
-        Some("~/.other.sh"),
-        &mut out,
-    )
-    .expect("add");
+    let exit =
+        crate::command::add(&env(home.path()), home.path(), "~/.other.sh", &mut out).expect("add");
     let text = String::from_utf8(out).expect("UTF-8");
     assert_eq!(exit, Exit::Converged, "a warning is not a refusal");
     assert!(text.contains("    warning: line 1: CARGO_HOME "), "{text}");
@@ -419,7 +413,7 @@ fn a_child_whose_name_is_not_utf8_is_skipped_under_its_own_name() {
     assert_eq!(skipped, ["~/d/\u{fffd}"], "{rows:?}");
 
     let mut out = Vec::new();
-    crate::command::add(&env(home.path()), home.path(), Some("d"), &mut out).expect("add");
+    crate::command::add(&env(home.path()), home.path(), "d", &mut out).expect("add");
     let out = String::from_utf8(out).expect("UTF-8");
     assert!(out.contains("  - ~/d/\u{fffd}  skipped: "), "{out}");
     assert!(!out.contains("  - ~/d  skipped"), "{out}");
@@ -890,8 +884,8 @@ fn rm_of_a_file_bx_replaced_reports_putting_it_back_and_undeclares_it() {
     assert_eq!(plan_exit(&home).0, Exit::Converged);
 
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some(".replaced"), &mut out)
-        .expect("rm");
+    let exit =
+        crate::command::rm(&env(home.path()), home.path(), ".replaced", &mut out).expect("rm");
     assert_eq!(exit, Exit::Converged);
     let text = String::from_utf8(out).expect("UTF-8");
     assert!(
@@ -909,8 +903,8 @@ fn rm_over_an_edit_is_a_conflict_that_changes_nothing() {
     std::fs::write(home.child(".edited"), b"hand edit\n").expect("edit");
 
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some("~/.edited"), &mut out)
-        .expect("rm");
+    let exit =
+        crate::command::rm(&env(home.path()), home.path(), "~/.edited", &mut out).expect("rm");
     assert_eq!(exit, Exit::Pending);
     let text = String::from_utf8(out).expect("UTF-8");
     assert!(text.starts_with("  ! ~/.edited  "), "{text}");
@@ -1027,8 +1021,8 @@ fn rm_of_something_bx_does_not_manage_is_a_no_op() {
     let home = repo(MINE);
     plant(&home, ".untouched", b"u\n", 0o644);
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some(".untouched"), &mut out)
-        .expect("rm");
+    let exit =
+        crate::command::rm(&env(home.path()), home.path(), ".untouched", &mut out).expect("rm");
     assert_eq!(exit, Exit::Converged);
     assert_eq!(
         String::from_utf8(out).expect("UTF-8"),
@@ -1152,27 +1146,19 @@ fn locate_takes_a_shell_spelling_and_refuses_what_is_not_inside_the_home() {
 }
 
 #[test]
-fn a_missing_path_no_path_and_no_repo_are_errors() {
+fn a_missing_path_and_no_repo_are_errors() {
     let home = repo(MINE);
     let mut out = Vec::new();
     let e = env(home.path());
     assert!(matches!(
-        crate::command::add(&e, home.path(), None, &mut out),
-        Err(Error::NoPath("add"))
-    ));
-    assert!(matches!(
-        crate::command::rm(&e, home.path(), None, &mut out),
-        Err(Error::NoPath("rm"))
-    ));
-    assert!(matches!(
-        crate::command::add(&e, home.path(), Some(".nothing"), &mut out),
+        crate::command::add(&e, home.path(), ".nothing", &mut out),
         Err(Error::Missing(missing)) if missing == "~/.nothing"
     ));
 
     let bare = guarded_home();
     plant(&bare, ".x", b"x\n", 0o644);
-    let err = crate::command::add(&env(bare.path()), bare.path(), Some(".x"), &mut out)
-        .expect_err("no repo");
+    let err =
+        crate::command::add(&env(bare.path()), bare.path(), ".x", &mut out).expect_err("no repo");
     assert!(matches!(err, Error::RepoMissing(_)), "{err}");
     assert!(err.to_string().contains("bx init"), "{err}");
     assert!(out.is_empty());
@@ -1191,7 +1177,7 @@ fn tree_repo() -> GuardedHome {
 
 fn rm_text(home: &GuardedHome, arg: &str) -> (Exit, String) {
     let mut out = Vec::new();
-    let exit = crate::command::rm(&env(home.path()), home.path(), Some(arg), &mut out).expect("rm");
+    let exit = crate::command::rm(&env(home.path()), home.path(), arg, &mut out).expect("rm");
     (exit, String::from_utf8(out).expect("UTF-8"))
 }
 

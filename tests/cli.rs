@@ -744,9 +744,22 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
         "# mine\n"
     );
 
-    let unnamed = bx(home.path(), &["add"]);
-    assert_eq!(unnamed.status.code(), Some(1));
-    assert!(stderr(&unnamed).contains("name the file or directory to add"));
+    // The path is required, as the README spells it: `bx add PATH`, and a
+    // command line without one is a usage error, not a run.
+    for command in ["add", "rm"] {
+        let unnamed = bx(home.path(), &[command]);
+        assert_eq!(unnamed.status.code(), Some(64), "{}", stderr(&unnamed));
+        assert!(stderr(&unnamed).contains("<PATH>"), "{}", stderr(&unnamed));
+
+        let help = bx(home.path(), &[command, "--help"]);
+        assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+        assert!(
+            stdout(&help).contains(&format!("Usage: bx {command} <PATH>\n")),
+            "{}",
+            stdout(&help)
+        );
+        assert!(!stdout(&help).contains("TARGET"), "{}", stdout(&help));
+    }
 }
 
 #[test]

@@ -251,6 +251,7 @@ or a login banner without anyone parsing its output:
 | `0` | converged — nothing to do; for `plan` and `apply`, also when the only rows are `<`, which are `bx sync`'s to carry |
 | `1` | error |
 | `2` | changes pending, or a conflict or blocked target needs a decision |
+| `64` | the command line could not be parsed — an unknown command or flag, a missing argument, or flags that conflict; nothing was run |
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 The other commands use the same codes. `bx add` exits `2` when it refused a

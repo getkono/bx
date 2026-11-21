@@ -99,7 +99,9 @@ enum Command {
     /// no other file
     Abandon,
     /// Print the one line for your shell rc (not built yet)
-    ShellInit { shell: String },
+    // Optional, so that with no shell named it is refused as not built, not
+    // as a usage error: there is no shell it would accept yet either.
+    ShellInit { shell: Option<String> },
     /// Install the latest release over this one, as a fresh install would
     #[command(visible_alias = "self-update")]
     SelfUpgrade {
@@ -122,6 +124,10 @@ enum SecretAction {
     List,
 }
 
+/// The status of a command line bx could not parse: `sysexits.h`'s
+/// `EX_USAGE`, apart from every status a command that ran exits with.
+const EX_USAGE: i32 = 64;
+
 fn main() -> Result<()> {
     // An error is something to read, not to debug: where in bx it was
     // propagated from and how to ask for a backtrace say nothing to the person
@@ -135,7 +141,18 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let command = Cli::parse().command;
+    let command = match Cli::try_parse() {
+        Ok(cli) => cli.command,
+        // `--help` and `--version` are answers, printed to standard output
+        // with status 0. Every other parse failure is a usage error, and
+        // exits EX_USAGE: clap's own 2 is what `plan` says for changes
+        // pending, and a script must be able to tell the two apart.
+        Err(error) if error.use_stderr() => {
+            error.print()?;
+            std::process::exit(EX_USAGE);
+        }
+        Err(error) => error.exit(),
+    };
     let mut out = std::io::stdout().lock();
     // Upgrading reads no configuration, so it does not need a usable home.
     if let Some(Command::SelfUpgrade { check, force }) = command {

@@ -1104,6 +1104,8 @@ fn a_command_with_no_body_exits_one_saying_so_and_does_not_panic() {
 
     for (args, named) in [
         (&["shell-init", "zsh"][..], "bx shell-init"),
+        // With no shell named, still not built rather than a usage error.
+        (&["shell-init"][..], "bx shell-init"),
         (&["__complete", "x"][..], "bx __complete"),
     ] {
         let output = bx(home.path(), args);
@@ -1114,6 +1116,52 @@ fn a_command_with_no_body_exits_one_saying_so_and_does_not_panic() {
             format!("{named} is not built yet in this release of bx.\n")
         );
         assert_eq!(stdout(&output), "");
+    }
+}
+
+#[test]
+fn a_command_line_bx_cannot_parse_exits_64_and_writes_nothing() {
+    let home = guarded_home();
+    seed(home.path(), A_TARGET);
+
+    for args in [
+        &["--no-such-flag"][..],
+        &["no-such-command"],
+        &["apply", "--no-such-flag"],
+        &["update", "--yes", "--check"],
+        // A missing subcommand prints its help, to standard error, as the
+        // usage error it is.
+        &["secret"],
+    ] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(
+            output.status.code(),
+            Some(64),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(stdout(&output), "", "{args:?}");
+        assert!(!stderr(&output).is_empty(), "{args:?}");
+        assert!(!home.child(".a").exists(), "{args:?}");
+    }
+
+    // Asked for, help and the version are answers, not usage errors.
+    for args in [
+        &["--help"][..],
+        &["-h"],
+        &["apply", "--help"],
+        &["--version"],
+    ] {
+        let output = bx(home.path(), args);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(!stdout(&output).is_empty(), "{args:?}");
     }
 }
 
@@ -1446,7 +1494,7 @@ fn self_upgrade_refuses_a_release_whose_checksum_does_not_match() {
 fn self_upgrade_check_and_force_are_exclusive() {
     let home = guarded_home();
     let output = bx(home.path(), &["self-upgrade", "--check", "--force"]);
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(64), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("cannot be used with"),
         "{}",
@@ -1458,7 +1506,7 @@ fn self_upgrade_check_and_force_are_exclusive() {
 fn upgrade_check_and_yes_are_exclusive() {
     let home = guarded_home();
     let output = bx(home.path(), &["upgrade", "--check", "--yes"]);
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(64), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("the argument '--check' cannot be used with '--yes'"),
         "{}",

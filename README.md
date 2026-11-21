@@ -255,7 +255,8 @@ or a login banner without anyone parsing its output:
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 The other commands use the same codes. `bx add` exits `2` when it refused a
-path, `bx rm` when a conflict left something as it was, and
+path, `bx rm` when a conflict left something as it was, `bx doctor` when it
+has a finding, no config repo at all among them, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
 when it was declined and did not carry the `<` rows it announced, and
 `bx update` and `bx upgrade` when declined, even when all they offered was a

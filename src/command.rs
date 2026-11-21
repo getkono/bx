@@ -63,9 +63,10 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
 ///
 /// # Errors
 ///
-/// Whatever loading the configuration returns, and [`Error::Output`] when
-/// `out` cannot be written. A check that cannot ask what it needs — systemd's
-/// user session unreachable — is a finding, not an error.
+/// Whatever loading the configuration returns, but for a missing config
+/// repo, and [`Error::Output`] when `out` cannot be written. No config repo,
+/// like a check that cannot ask what it needs — systemd's user session
+/// unreachable — is a finding, not an error.
 pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     doctor_with(
         env,
@@ -85,7 +86,28 @@ fn doctor_with(
     systemd: &dyn systemd::Query,
     git: &Git,
 ) -> Result<Exit, Error> {
-    let inputs = Inputs::load(env)?;
+    let inputs = match Inputs::load(env) {
+        Ok(inputs) => inputs,
+        // No config repo is the first thing a human should look at, not a
+        // failure to look: said as a finding, and nothing else is checked,
+        // as every other check reads the configuration.
+        Err(Error::RepoMissing(repo)) => {
+            let report = doctor::Report {
+                findings: vec![doctor::Finding {
+                    subject: repo,
+                    origin: None,
+                    note: "does not exist, so there is no configuration to check; `bx init` \
+                           creates the config repo"
+                        .to_string(),
+                }],
+                notes: Vec::new(),
+            };
+            out.write_all(doctor::render(&report, &env.home).as_bytes())
+                .map_err(Error::Output)?;
+            return Ok(doctor::exit(&report));
+        }
+        Err(other) => return Err(other),
+    };
     let unit_dir = paths::systemd_user_dir_in(&env.home, env.xdg_config_home.as_deref());
     let report = doctor::run(
         &inputs,

@@ -1243,13 +1243,30 @@ fn doctor_with_nothing_to_check_is_converged_and_needs_no_systemd() {
 }
 
 #[test]
-fn doctor_without_a_repo_or_an_output_is_an_error() {
+fn doctor_without_a_repo_is_a_finding_and_writes_nothing() {
     let home = guarded_home();
-    assert!(matches!(
-        doctor(&env(home.path()), &mut Vec::new()),
-        Err(Error::RepoMissing(_))
-    ));
+    let before = crate::plan::tests::snapshot(home.path(), &[]);
 
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx does not exist, so there is no configuration to check; `bx init` \
+         creates the config repo\n\
+         Doctor: 1 finding(s).\n"
+    );
+    assert_eq!(crate::plan::tests::snapshot(home.path(), &[]), before);
+    assert!(matches!(
+        doctor(&env(home.path()), &mut Refusing),
+        Err(Error::Output(_))
+    ));
+}
+
+#[test]
+fn doctor_without_an_output_is_an_error() {
+    let home = guarded_home();
     seed(home.path(), "");
     assert!(matches!(
         doctor(&env(home.path()), &mut Refusing),

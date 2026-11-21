@@ -977,7 +977,11 @@ fn init_with(
     let mut adopted = 0_usize;
     if interactive {
         let deferred = init::adopt_offered(env, ask, &mut |row| {
-            adopted += 1;
+            // Only a row that changed what bx manages is something this run
+            // did: one passed over, refused or already managed is not.
+            if matches!(row, Adoption::Adopt { .. } | Adoption::Own { .. }) {
+                adopted += 1;
+            }
             say(out, &adoption_row(row))
         });
         match deferred {

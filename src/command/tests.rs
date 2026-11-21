@@ -787,6 +787,42 @@ fn a_run_that_only_adopted_is_set_up_and_not_already_set_up() {
 }
 
 #[test]
+fn a_pick_that_adopted_nothing_is_already_set_up() {
+    use crate::init::tests::Script;
+
+    // The pick is a directory holding only a link, which `add` passes over:
+    // the row is said, and nothing was adopted, so nothing was set up.
+    let home = guarded_home();
+    seed(home.path(), "");
+    std::fs::create_dir_all(home.child(".config/app")).expect("the directory");
+    std::os::unix::fs::symlink("elsewhere", home.child(".config/app/link")).expect("the link");
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let mut script = Script {
+        pick: vec!["~/.config/app"],
+        ..Script::default()
+    };
+    let mut out = Vec::new();
+
+    let exit = init_with(&tty, &[], false, &mut out, &mut script, &mut never).expect("init");
+
+    assert_eq!(script.offered, [vec!["~/.config/app".to_string()]]);
+    assert_eq!(exit, Exit::Converged);
+    assert!(
+        text(&out).contains("  - ~/.config/app/link  skipped: "),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).ends_with(init_closing(Exit::Converged, false)),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
 fn init_says_what_was_left_when_a_session_is_interrupted_after_the_pick() {
     use crate::init::tests::InterruptedWhileAsking;
 

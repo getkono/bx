@@ -152,6 +152,23 @@ fn yes_and_no_terminal_ask_nothing_and_keep_the_edit() {
         text(&out)
     );
     assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+
+    // Nothing was answered, so nothing was remembered: the next run at a
+    // terminal asks.
+    let mut asked = 0;
+    let exit = apply_answering(
+        &tty(home.path()),
+        false,
+        &mut Vec::new(),
+        &mut never,
+        Some(&mut |_, _| {
+            asked += 1;
+            Ok(Answer::Keep)
+        }),
+    )
+    .expect("apply at a terminal");
+    assert_eq!(asked, 1, "asked once more");
+    assert_eq!(exit, Exit::Converged);
 }
 
 #[test]

@@ -126,15 +126,10 @@ fn a_declared_activation_is_run_once_cached_rendered_and_reversed() {
         home.path(),
     );
     assert!(!quiet.contains("activation"), "{quiet}");
-    let status = render(
-        &again,
-        View::Status,
-        Palette::resolve(true, false),
-        home.path(),
-    );
-    assert!(
-        status.contains("  = activation `stub`: cached output reused, nothing run\n"),
-        "{status}"
+    assert_eq!(
+        crate::status::short(&again),
+        "",
+        "an unchanged activation is no line of `bx status --short`"
     );
     let second =
         run(&inputs, Mode::Apply, &mut |_| panic!("nothing to approve")).expect("the second apply");
@@ -214,6 +209,14 @@ fn each_shell_s_command_is_cached_and_rendered_in_its_own_file_and_reversed() {
             && shown.contains("  + activation `zonly`: run twice, output agreed; cached\n")
             && !shown.contains("`zonly` for bash"),
         "{shown}"
+    );
+    // `bx status` names each capture by its activation and shell.
+    let short = crate::status::short(&planned);
+    assert!(
+        short.contains("+ activation `stub`\n")
+            && short.contains("+ activation `stub` for bash\n")
+            && short.contains("+ activation `zonly`\n"),
+        "{short}"
     );
     // bash's row says why `zonly` is not in its file.
     let bash_row = planned
@@ -473,6 +476,24 @@ fn an_absent_tool_is_blocked_and_everything_else_is_still_written() {
     assert!(
         shown.contains("  ? activation `gone`: omitted: `gone` is not on PATH\n"),
         "{shown}"
+    );
+    // `bx status` lists the captures to apply, and the omitted one as
+    // needing attention, saying why once.
+    let facts = crate::status::Facts {
+        repo: "~/.config/bx".to_string(),
+        branch: crate::status::Branch::NotGit,
+        uncommitted: Vec::new(),
+        unasked: None,
+        due: false,
+    };
+    let status = crate::status::long(&planned, &facts, home.path());
+    assert!(
+        status.contains("        create:   activation `stub`\n")
+            && status.contains(
+                "Needs attention:\n        blocked:  activation `gone`  (omitted: `gone` is \
+                 not on PATH)\n"
+            ),
+        "{status}"
     );
 
     let applied = apply(&inputs);

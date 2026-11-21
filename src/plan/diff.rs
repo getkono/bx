@@ -277,12 +277,14 @@ pub(crate) fn unified(target: &str, (from, to): (&str, &str), old: &str, new: &s
 }
 
 /// Which rows a rendering shows.
+///
+/// There is one view since bare `bx` stopped listing every row, unchanged
+/// ones included: `bx status` lays the same report out as `git status`
+/// would, in [`crate::status`], and draws no diff.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     /// `bx plan` and `bx apply`: only what is not already converged.
     Plan,
-    /// Bare `bx`: every row, unchanged ones included.
-    Status,
 }
 
 /// Whether a rendering is coloured, and how wide it is drawn.
@@ -1420,17 +1422,22 @@ mod tests {
         assert!(Palette::resolve(false, true).is_colored());
         assert!(!Palette::PLAIN.is_colored());
 
+        // `~/.b` stands answered *keep*, so its unchanged row is shown.
+        let report = Report {
+            kept: vec![1],
+            ..a_report()
+        };
         let plain = render(
-            &a_report(),
-            View::Status,
+            &report,
+            View::Plan,
             Palette::resolve(true, true),
             Path::new(HOME),
         );
         assert!(!plain.contains('\x1b'), "{plain:?}");
 
         let coloured = render(
-            &a_report(),
-            View::Status,
+            &report,
+            View::Plan,
             Palette::resolve(false, true),
             Path::new(HOME),
         );
@@ -1483,24 +1490,17 @@ mod tests {
     }
 
     #[test]
-    fn t19_unchanged_rows_are_hidden_in_plan_and_shown_in_status() {
+    fn t19_unchanged_rows_are_hidden_in_plan_and_counted() {
         let plan = render(&a_report(), View::Plan, Palette::PLAIN, Path::new(HOME));
-        let status = render(&a_report(), View::Status, Palette::PLAIN, Path::new(HOME));
 
         assert!(!plan.contains("~/.b"), "{plan}");
-        assert!(
-            status.contains("  = ~/.b  (~/.config/bx/bx.toml:8)\n"),
-            "{status}"
+        assert_eq!(
+            plan.lines().last(),
+            Some("Plan: 0 to create, 1 to modify, 0 conflict, 1 blocked, 1 unchanged.")
         );
-        for rendered in [&plan, &status] {
-            assert_eq!(
-                rendered.lines().last(),
-                Some("Plan: 0 to create, 1 to modify, 0 conflict, 1 blocked, 1 unchanged.")
-            );
-        }
         let empty = render(
             &Report::default(),
-            View::Status,
+            View::Plan,
             Palette::PLAIN,
             Path::new(HOME),
         );

@@ -1,4 +1,4 @@
-//! The bodies of `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
+//! The bodies of `bx status`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
 //! `bx update`, `bx upgrade`, `bx doctor`, `bx add`, `bx rm`,
 //! `bx secret list`, `bx abandon` and `bx self-upgrade`, and the refusal of
 //! `bx shell-init` and `bx __complete`, which have none yet.
@@ -32,6 +32,7 @@ use crate::plan::{self, Error, Inputs, Mode, Palette, Report, View};
 use crate::report::{self, Action, Exit};
 use crate::restore::Restored;
 use crate::secret::{Passphrase, Unlock};
+use crate::status;
 use crate::sync;
 use crate::update::{self, run, run::Scope};
 use crate::upgrade;
@@ -144,28 +145,45 @@ fn doctor_with(
     Ok(doctor::exit(&report))
 }
 
-/// Bare `bx`: every target, unchanged ones included.
+/// `bx status`: where this machine stands, as `git status` says it —
+/// [`status::long`], or with `short` [`status::short`] — exiting as `plan`
+/// does.
 ///
-/// Writes nothing, but it is not free of processes: deciding the plan runs
-/// each declared activation's command whose output is not cached yet, and asks
-/// the user's `git` about each declared external's checkout.
+/// Writes nothing, but it is not free of processes: it runs the one
+/// traversal `plan` runs, which runs each declared activation's command
+/// whose output is not cached yet and asks the user's `git` about each
+/// declared external's checkout; and the long form asks the config repo's
+/// `git` where its branch stands and what bx carried into it uncommitted,
+/// fetching nothing ([`status::Facts::gather`]).
 ///
 /// # Errors
 ///
 /// Whatever loading or deciding returns, and [`Error::Output`] when `out`
 /// cannot be written.
-pub fn status(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
-    show(env, View::Status, out)
+pub fn status(env: &Env, short: bool, out: &mut dyn Write) -> Result<Exit, Error> {
+    let inputs = Inputs::load(env)?;
+    let report = plan::run(&inputs, Mode::Plan, &mut |_| Ok(false))?;
+    let text = if short {
+        status::short(&report)
+    } else {
+        status::long(
+            &report,
+            &status::Facts::gather(&inputs, &Git::new(env)),
+            &env.home,
+        )
+    };
+    out.write_all(text.as_bytes()).map_err(Error::Output)?;
+    Ok(plan::exit(&report, Mode::Plan))
 }
 
 /// `bx plan`: what `apply` would do, writing nothing.
 ///
-/// Spawns what [`status`] spawns: uncached activation commands, and `git` for
-/// declared externals.
+/// Spawns what [`status()`] spawns but the config repo's `git`: uncached
+/// activation commands, and `git` for declared externals.
 ///
 /// # Errors
 ///
-/// As [`status`].
+/// As [`status()`].
 pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     show(env, View::Plan, out)
 }
@@ -180,7 +198,7 @@ pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 ///
 /// [`Error::NeedsConfirmation`] when there is something to write, no `yes`,
 /// and no terminal to ask on; [`Error::Prompt`] when the prompt fails; and
-/// otherwise as [`status`], plus whatever recovery and the session return. A
+/// otherwise as [`status()`], plus whatever recovery and the session return. A
 /// prompt abandoned with Esc or Ctrl-C, or a pager ended with Ctrl-C before
 /// it, is not an error: it is said in a line and exits [`Exit::Canceled`].
 pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {

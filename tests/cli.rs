@@ -1,4 +1,4 @@
-//! The binary's surface for `bx`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
+//! The binary's surface for `bx`, `bx status`, `bx init`, `bx plan`, `bx apply`, `bx sync`,
 //! `bx update`, `bx add`, `bx rm` and `bx self-upgrade`:
 //! exit codes, what reaches standard output, and what is written.
 //!
@@ -67,6 +67,7 @@ enum Out {
     Is(&'static str),
     StartsWith(&'static str),
     EndsWith(&'static str),
+    Contains(&'static str),
 }
 
 #[test]
@@ -78,6 +79,16 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
     for (layer, args, code, out, said, written) in [
         // No config repo yet.
         (None, &["plan"][..], 1, Out::Is(""), "run `bx init`", false),
+        (None, &["status"], 1, Out::Is(""), "run `bx init`", false),
+        // Bare `bx` is the help, read from nothing: no config repo needed.
+        (
+            None,
+            &[],
+            0,
+            Out::Contains("\nUsage: bx [COMMAND]\n"),
+            "",
+            false,
+        ),
         (
             Some(""),
             &["plan"],
@@ -94,8 +105,28 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
             "",
             false,
         ),
-        // Bare `bx` is the status view, with plan's exit codes.
-        (None, &[], 2, Out::StartsWith("  + ~/.a"), "", false),
+        // `bx status` is `git status`'s form, with plan's exit codes; bare
+        // `bx` is still the help.
+        (
+            None,
+            &["status"],
+            2,
+            Out::Is(
+                "Changes to apply:\n  (use \"bx apply\" to write them, \"bx plan\" to see the \
+                 diffs)\n        create:   ~/.a\n",
+            ),
+            "",
+            false,
+        ),
+        (
+            None,
+            &["status", "--short"],
+            2,
+            Out::Is("+ ~/.a\n"),
+            "",
+            false,
+        ),
+        (None, &[], 0, Out::StartsWith("An idempotent"), "", false),
         // No `--yes` and no terminal: the plan is shown and nothing written.
         (
             None,
@@ -121,7 +152,15 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
             "",
             true,
         ),
-        (None, &[], 0, Out::StartsWith("  = ~/.a"), "", true),
+        (
+            None,
+            &["status"],
+            0,
+            Out::Is("nothing to apply, this machine matches the configuration\n"),
+            "",
+            true,
+        ),
+        (None, &["status", "-s"], 0, Out::Is(""), "", true),
     ] {
         if let Some(layer) = layer {
             seed(home.path(), layer);
@@ -134,6 +173,7 @@ fn every_outcome_reaches_the_process_as_its_exit_code() {
             Out::Is(whole) => shown == whole,
             Out::StartsWith(start) => shown.starts_with(start),
             Out::EndsWith(end) => shown.ends_with(end),
+            Out::Contains(part) => shown.contains(part),
         };
         assert!(matched, "{args:?}: {shown}");
         assert!(!shown.contains('\x1b'), "{args:?}: coloured into a pipe");

@@ -100,11 +100,11 @@ start with.
 
 ## Commands
 
-There are fourteen. You should not need a manual.
+There are fourteen. You should not need a manual: bare `bx` prints the help.
 
 | | |
 |---|---|
-| `bx` | status: every managed target, and what is pending, in conflict or blocked |
+| `bx status` | where this machine stands, as `git status` says it: the config repo's branch against its upstream, what `apply` would write, files edited here since bx wrote them, tracked files for `bx sync` to carry, what is no longer declared, and what needs attention; `--short` is one line per row that is not unchanged |
 | `bx init` | guided setup |
 | `bx add PATH` | begin managing a config file, or a directory of them; for a file bx manages that you edited, save your edit into the repo, merging it with the repo's change when both moved, once you confirm the diff (`--yes` asks nothing) |
 | `bx rm PATH` | stop managing it, and restore the original, once you confirm what it shows (`--yes` asks nothing) |
@@ -258,7 +258,7 @@ or a login banner without anyone parsing its output:
 | `64` | the command line could not be parsed — an unknown command or flag, a missing argument, or flags that conflict; nothing was run |
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
-The other commands use the same codes. `bx add` exits `2` when it refused a
+`bx status` exits as `plan` does. The other commands use the same codes. `bx add` exits `2` when it refused a
 path or a merge it wrote conflicts, `bx rm` when a conflict left something as
 it was, `bx doctor` when it has a finding, no config repo at all among them, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`

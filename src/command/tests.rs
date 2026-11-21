@@ -129,20 +129,103 @@ fn plan_exits_zero_when_converged_and_two_when_pending() {
 }
 
 #[test]
-fn status_shows_what_plan_hides() {
+fn status_says_what_is_left_to_apply_and_exits_as_plan_does() {
     let home = guarded_home();
     own(home.path(), ".a", b"a\n", Mechanism::Own);
-    seed(home.path(), &inline("~/.a", "a\\n"));
+    seed(
+        home.path(),
+        &format!("{}{}", inline("~/.a", "a\\n"), inline("~/.b", "b\\n")),
+    );
 
     let mut shown = Vec::new();
-    let exit = status(&env(home.path()), &mut shown).expect("status");
-    assert_eq!(exit, Exit::Converged);
-    assert!(text(&shown).contains("  = ~/.a  ("), "{}", text(&shown));
+    let exit = status(&env(home.path()), false, &mut shown).expect("status");
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&shown),
+        "Changes to apply:\n  (use \"bx apply\" to write them, \"bx plan\" to see the \
+         diffs)\n        create:   ~/.b\n",
+        "the repo is no git repository, so no branch is said"
+    );
+    let mut short = Vec::new();
+    let exit = status(&env(home.path()), true, &mut short).expect("status --short");
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(text(&short), "+ ~/.b\n");
+    assert!(!home.child(".b").exists(), "status writes nothing");
 
-    let mut hidden = Vec::new();
-    let exit = plan(&env(home.path()), &mut hidden).expect("plan");
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("apply");
+    let mut shown = Vec::new();
+    let exit = status(&env(home.path()), false, &mut shown).expect("status");
     assert_eq!(exit, Exit::Converged);
-    assert!(!text(&hidden).contains("~/.a"), "{}", text(&hidden));
+    assert_eq!(
+        text(&shown),
+        "nothing to apply, this machine matches the configuration\n"
+    );
+}
+
+#[test]
+fn status_says_where_the_config_repo_s_branch_stands_and_what_bx_left_uncommitted() {
+    use crate::testing::git::{cloned, commit_all, run};
+
+    let home = guarded_home();
+    let repo = cloned(&home, "[[target]]\npath = \"~/.rc\"\nfile = \"files/rc\"\n");
+    std::fs::create_dir_all(repo.join("files")).expect("files");
+    std::fs::write(repo.join("files/rc"), "a\n").expect("the body");
+    commit_all(home.path(), &repo, "rc");
+    apply_with(&env(home.path()), true, &mut Vec::new(), &mut never).expect("apply");
+    // An edit saved into the repo by `bx add`, which no sync has committed.
+    home.write(".rc", "mine\n");
+    let ctx = adopt::Context::load(&env(home.path())).expect("context");
+    let rc = crate::paths::Portable::parse_in("~/.rc", home.path()).expect("a target");
+    adopt::add(&ctx, &rc).expect("add");
+    let index = std::fs::read(repo.join(".git/index")).expect("the index");
+
+    let mut shown = Vec::new();
+    let exit = status(&env(home.path()), false, &mut shown).expect("status");
+
+    assert_eq!(exit, Exit::Converged);
+    assert_eq!(
+        text(&shown),
+        "On branch master\nYour branch is ahead of 'origin/master' by 1 commit.\n  (use \
+         \"bx sync\" to publish them)\n\nTracked files to carry:\n  (use \"bx sync\" to \
+         commit and push them)\n        saved:    ~/.config/bx/files/rc\n\nnothing to apply, \
+         this machine matches the configuration\n"
+    );
+    assert_eq!(
+        std::fs::read(repo.join(".git/index")).expect("the index"),
+        index,
+        "asking git rewrote no index"
+    );
+    assert_eq!(
+        run(home.path(), &repo, &["status", "--porcelain"]),
+        "M files/rc",
+        "nothing staged"
+    );
+
+    // A git that cannot be started says why once, and nothing more is asked.
+    let inputs = Inputs::load(&env(home.path())).expect("inputs");
+    let missing = Git::new(&env(home.path())).with_program("/nonexistent/git");
+    let facts = status::Facts::gather(&inputs, &missing);
+    assert!(
+        matches!(&facts.branch, status::Branch::Unknown(why)
+            if why.starts_with("The config repo ~/.config/bx is not a git checkout bx can read: \
+                                git could not be started")),
+        "{facts:?}"
+    );
+    assert_eq!((facts.uncommitted, facts.unasked), (Vec::new(), None));
+    assert!(!facts.due, "no stamp, so nothing is due");
+
+    // An update stamp that has fallen due, now or before, is a check due;
+    // one still ahead is not.
+    let stamps = crate::update::Stamps::of(inputs.state());
+    inputs
+        .state()
+        .ensure_update()
+        .expect("the update directory");
+    let now = crate::update::now();
+    for (at, due) in [(now, true), (now + 3600, false)] {
+        std::fs::write(stamps.check_due(), format!("{at}\n")).expect("a stamp");
+        assert_eq!(status::Facts::gather(&inputs, &missing).due, due, "{at}");
+    }
 }
 
 #[test]
@@ -1053,7 +1136,7 @@ fn a_missing_repo_is_an_error_for_every_command() {
     let env = env(home.path());
 
     assert!(matches!(
-        status(&env, &mut Vec::new()),
+        status(&env, false, &mut Vec::new()),
         Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(

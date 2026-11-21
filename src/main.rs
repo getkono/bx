@@ -5,7 +5,7 @@
 
 use std::io::Write as _;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 use eyre::Result;
 
 // One version text for `-V` and `--version` alike: a user reporting a problem
@@ -46,6 +46,12 @@ enum Command {
         /// Hand back without asking for confirmation
         #[arg(long)]
         yes: bool,
+    },
+    /// Where this machine stands, as `git status` says it; changes nothing
+    Status {
+        /// One line per row that is not unchanged: its symbol and its path
+        #[arg(long, short)]
+        short: bool,
     },
     /// The diff `apply` would make
     Plan,
@@ -167,53 +173,59 @@ fn main() -> Result<()> {
         Err(error) => error.exit(),
     };
     let mut out = std::io::stdout().lock();
+    // No subcommand is a request for the help, answered as `--help` is: on
+    // standard output, with status 0, and before anything is read.
+    let Some(command) = command else {
+        write!(out, "{}", Cli::command().render_long_help())?;
+        out.flush()?;
+        std::process::exit(0);
+    };
     // Upgrading reads no configuration, so it does not need a usable home.
-    if let Some(Command::SelfUpgrade { check, force }) = command {
+    if let Command::SelfUpgrade { check, force } = command {
         let exit = bx::command::self_upgrade(check, force, &mut out)?;
         out.flush()?;
         std::process::exit(exit.code());
     }
     let env = bx::env::Env::from_process()?;
     let exit = match command {
-        // No subcommand is the status view.
-        None => bx::command::status(&env, &mut out)?,
-        Some(Command::Init { set, yes }) => bx::command::init(&env, &set, yes, &mut out)?,
-        Some(Command::Plan) => bx::command::plan(&env, &mut out)?,
-        Some(Command::Apply { yes }) => bx::command::apply(&env, yes, &mut out)?,
-        Some(Command::Sync { yes }) => bx::command::sync(&env, yes, &mut out)?,
-        Some(Command::Update {
+        Command::Status { short } => bx::command::status(&env, short, &mut out)?,
+        Command::Init { set, yes } => bx::command::init(&env, &set, yes, &mut out)?,
+        Command::Plan => bx::command::plan(&env, &mut out)?,
+        Command::Apply { yes } => bx::command::apply(&env, yes, &mut out)?,
+        Command::Sync { yes } => bx::command::sync(&env, yes, &mut out)?,
+        Command::Update {
             paths,
             yes,
             check,
             snooze,
             background,
-        }) => {
+        } => {
             let mode = bx::command::UpdateMode::from_flags(yes, check, snooze, background);
             bx::command::update(&env, &paths, mode, &mut out)?
         }
-        Some(Command::Upgrade { paths, yes, check }) => {
+        Command::Upgrade { paths, yes, check } => {
             bx::command::upgrade(&env, &paths, yes, check, &mut out)?
         }
-        Some(Command::Doctor) => bx::command::doctor(&env, &mut out)?,
-        Some(Command::Abandon) => bx::command::abandon(&env, &mut out)?,
-        Some(Command::Secret {
+        Command::Doctor => bx::command::doctor(&env, &mut out)?,
+        Command::Abandon => bx::command::abandon(&env, &mut out)?,
+        Command::Secret {
             action: SecretAction::List,
-        }) => bx::command::secret_list(&env, &mut out)?,
-        Some(Command::Add { path, yes }) => {
+        } => bx::command::secret_list(&env, &mut out)?,
+        Command::Add { path, yes } => {
             bx::command::add(&env, &std::env::current_dir()?, &path, yes, &mut out)?
         }
-        Some(Command::Rm { path, yes }) => {
+        Command::Rm { path, yes } => {
             bx::command::rm(&env, &std::env::current_dir()?, &path, yes, &mut out)?
         }
         // Every command is named: one without a body is refused, not panicked
         // on, and a new one without an arm does not compile.
-        Some(Command::ShellInit { .. }) => {
+        Command::ShellInit { .. } => {
             bx::command::not_built("bx shell-init", &mut std::io::stderr())?
         }
-        Some(Command::Complete { .. }) => {
+        Command::Complete { .. } => {
             bx::command::not_built("bx __complete", &mut std::io::stderr())?
         }
-        Some(Command::SelfUpgrade { .. }) => unreachable!("dispatched before the environment"),
+        Command::SelfUpgrade { .. } => unreachable!("dispatched before the environment"),
     };
     out.flush()?;
     std::process::exit(exit.code());

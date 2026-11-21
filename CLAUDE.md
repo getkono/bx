@@ -98,6 +98,8 @@ wrong even if it passes CI.
 - **tempfile + rustix** — atomic writes (temp in destination dir, fsync,
   rename), file modes, the advisory state-dir lock, and discarding what was
   typed ahead of a confirmation.
+- **signal-hook** — catching SIGINT while the pager runs, so an interrupt ends
+  the pager and not bx. Default features off.
 - **sha2** — content addressing for the restore store, and activation-cache
   fingerprints.
 - **getrandom** — the write-ahead journal's per-session nonce, from the

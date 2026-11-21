@@ -430,6 +430,7 @@ mod tests {
             created_dirs: Vec::new(),
             superseded: Vec::new(),
             superseded_absent: false,
+            kept: None,
         }
     }
 

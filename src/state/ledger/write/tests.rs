@@ -1549,6 +1549,7 @@ fn saving_the_ledger_twice_produces_identical_bytes() {
                     created_dirs: Vec::new(),
                     superseded: Vec::new(),
                     superseded_absent: false,
+                    kept: None,
                 },
             );
         }

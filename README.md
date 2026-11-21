@@ -213,7 +213,10 @@ it yours.
                 link bx made that you deleted while the configuration still
                 wants exactly what bx made: your deletion stands, as in git.
                 Shown like `git status`'s `deleted:`, never pending, and
-                `apply` asks at a terminal whether to restore it.
+                `apply` asks at a terminal whether to restore it. Also, and
+                shown too, a target whose question you answered by keeping
+                your edit, mode, target or deletion, until either side
+                changes.
 ```
 
 `plan` and `apply` compute this with the same code, so `apply` can never do work
@@ -375,16 +378,22 @@ says what the budget covers.
   markers, and about a symlink bx made that you pointed elsewhere, each in its
   own words; showing one of these shows its row's diff again. Taking bx's
   keeps your mode, your whole file, or your link's target, and `bx rm` puts
-  that back exactly. With `--yes`, or
-  with no terminal, nothing is asked and every edit is kept. Any other
+  that back exactly. Keeping yours is remembered: the row says you kept it,
+  nothing is pending, `bx sync` pushes, and nothing is asked again until the
+  file or what bx wants there changes. With `--yes`, or
+  with no terminal, nothing is asked and every edit is kept for that run
+  only: nothing was answered, so nothing is remembered, the row stays a
+  conflict, `bx sync` does not push, and the next run at a terminal asks.
+  Any other
   conflict you settle by hand, in the file or in your configuration, and the
   next `plan` reads what you decided.
 - A file or link bx made that you deleted is never silently re-created. While
   the configuration still wants what bx made there, the deletion stands; once
   it wants something else, it is a modify/delete conflict. Either way, at a
   terminal, `apply` and `sync` ask whether to keep it deleted (the default) or
-  restore bx's, and can show what restoring writes; `--yes` or no terminal
-  keeps it deleted. A file bx
+  restore bx's, and can show what restoring writes; keeping it deleted is
+  remembered the same way, and `--yes` or no terminal
+  keeps it deleted for that run, remembering nothing. A file bx
   generates for itself under `~/.local/share/bx` — a shell fragment, or a zsh
   activation's file and its `.zwc` — holds nothing of yours, and a deleted one
   is re-created.

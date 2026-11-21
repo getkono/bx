@@ -746,6 +746,7 @@ mod tests {
                 created_dirs,
                 superseded: Vec::new(),
                 superseded_absent: false,
+                kept: None,
             },
         );
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
@@ -893,6 +894,7 @@ mod tests {
                     created_dirs: dirs,
                     superseded: Vec::new(),
                     superseded_absent: false,
+                    kept: None,
                 },
             );
         }
@@ -951,6 +953,7 @@ mod tests {
                     created_dirs: Vec::new(),
                     superseded: Vec::new(),
                     superseded_absent: false,
+                    kept: None,
                 },
             );
         }
@@ -1099,6 +1102,7 @@ mod tests {
                     created_dirs: dirs,
                     superseded: Vec::new(),
                     superseded_absent: false,
+                    kept: None,
                 },
             );
         }
@@ -1189,6 +1193,7 @@ mod tests {
                 created_dirs: Vec::new(),
                 superseded: Vec::new(),
                 superseded_absent: false,
+                kept: None,
             },
         );
         // The survivor, carrying one real ancestor and one stray.
@@ -1204,6 +1209,7 @@ mod tests {
                 created_dirs: vec![target("~/.config/tool"), target("~/.cache")],
                 superseded: Vec::new(),
                 superseded_absent: false,
+                kept: None,
             },
         );
         store::save(&dir.ledger(), KIND, VERSION, &LedgerView { entries }).expect("seed");
@@ -1289,6 +1295,7 @@ mod tests {
                     created_dirs: dirs,
                     superseded: Vec::new(),
                     superseded_absent: false,
+                    kept: None,
                 },
             );
         }

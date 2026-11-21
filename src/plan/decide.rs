@@ -58,7 +58,7 @@ use crate::journal::{Content, Ownership, Request};
 use crate::paths::{self, Portable};
 use crate::report::Action;
 use crate::shell::activation::{self, Host as _};
-use crate::state::{LedgerEntry, LedgerView, Mechanism, removed_written};
+use crate::state::{Kept, LedgerEntry, LedgerView, Mechanism, removed_written};
 
 /// What a decision may read: nothing it could change.
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +121,11 @@ pub(super) struct Decided {
     /// [`Decided::held`], with the write `apply` makes right after the
     /// file's, and only once it does: see [`wordcode`].
     pub tied: Vec<Tied>,
+    /// Each row whose question an earlier run was answered *keep* about,
+    /// while both sides are still what they were then, by index into
+    /// [`Decided::changes`], ascending: see [`keep_rows`]. None of them is in
+    /// [`Decided::held`].
+    pub kept: Vec<usize>,
 }
 
 /// Decide every target of a configuration.
@@ -214,7 +219,19 @@ pub(super) fn decide_all(
     }
     // Every target has its row, so a row's index is its target's.
     let mut changes: Vec<Change> = rows.into_iter().flatten().collect();
-    let tied = wordcode::tie(resolutions, &mut changes, &mut ops, &mut held, ctx.home)?;
+    let mut tied = wordcode::tie(resolutions, &mut changes, &mut ops, &mut held, ctx.home)?;
+    // A question already answered *keep*, about exactly what is there now,
+    // is not put again: its row says it was kept.
+    let mut answered = Vec::new();
+    held.retain(|(row, op)| {
+        let entry = ctx.ledger.get(op.target());
+        let standing = entry.and_then(|entry| entry.kept.as_ref()) == Some(&op.kept());
+        if standing {
+            answered.push((*row, op.asked(entry)));
+        }
+        !standing
+    });
+    let kept = keep_rows(&mut changes, &mut tied, &answered);
     Ok(Decided {
         changes,
         ops,
@@ -223,7 +240,48 @@ pub(super) fn decide_all(
         declared,
         held,
         tied,
+        kept,
     })
+}
+
+/// Turn each row in `answered`, a question answered *keep*, into the row a
+/// kept answer is, and return every row that became one, ascending.
+///
+/// A kept row is unchanged and needs nothing: no write is pending there, and
+/// nothing waits on an answer. It says it was kept, in place of what `apply`
+/// would ask, and shows no diff. A zsh activation's wordcode whose write was
+/// tied to a kept file waits with it, as one whose file is not written does,
+/// and is kept too: zsh would read bx's compiled form in place of the edit.
+/// One that is a question of its own stays one, and stays tied, so *take
+/// bx's* for it is still never made without its file's.
+pub(super) fn keep_rows(
+    changes: &mut [Change],
+    tied: &mut Vec<Tied>,
+    answered: &[(usize, super::Asked)],
+) -> Vec<usize> {
+    let mut kept = Vec::new();
+    for &(row, asked) in answered {
+        let change = &mut changes[row];
+        change.action = Action::Unchanged;
+        change.diff = None;
+        change.note = Some(asked.kept(change.note.as_deref()));
+        kept.push(row);
+    }
+    tied.retain(|tied| {
+        if tied.asked() || !answered.iter().any(|(row, _)| *row == tied.source) {
+            return true;
+        }
+        let change = &mut changes[tied.row];
+        change.action = Action::Unchanged;
+        change.note = change
+            .note
+            .as_deref()
+            .map(|note| note.replace(wordcode::TIED, wordcode::WAITS));
+        kept.push(tied.row);
+        false
+    });
+    kept.sort_unstable();
+    kept
 }
 
 /// One write a decision produced.
@@ -371,6 +429,30 @@ impl Op {
                 }),
             },
             _ => None,
+        }
+    }
+
+    /// What both sides of this held write's question are: what plan found on
+    /// disk, and what the write would leave there. An answer *keep* is
+    /// remembered against it, and stands while it is still the same.
+    pub(super) fn kept(&self) -> Kept {
+        let wanted = match &self.made {
+            Made::Bytes(bytes) | Made::Region(bytes, _) => ContentHash::of(bytes),
+            Made::Link(text) => fs::link::digest(text),
+            // Never held: nothing is asked about a directory or a removal.
+            Made::Dir | Made::Absent(_) | Made::DirAbsent(_) | Made::LinkAbsent(_) => {
+                ContentHash::ZERO
+            }
+        };
+        Kept {
+            found: self
+                .planned
+                .digest()
+                .or_else(|| self.planned.link_digest())
+                .unwrap_or(ContentHash::ZERO),
+            found_mode: self.planned.mode,
+            wanted,
+            mode: self.mode,
         }
     }
 

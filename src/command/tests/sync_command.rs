@@ -194,8 +194,8 @@ fn a_sync_that_leaves_a_conflict_pushes_nothing() {
     assert!(text(&out).starts_with("  ! ~/.mine"), "{}", text(&out));
     assert!(
         text(&out).ends_with(
-            "Pushed nothing: 1 commit(s) wait for an apply that leaves nothing undone; \
-                     run `bx sync` again.\n"
+            "Pushed nothing: 1 commit(s) wait on ~/.mine (conflict); settle what this apply \
+             left undone, then run `bx sync` again.\n"
         ),
         "{}",
         text(&out)
@@ -206,6 +206,60 @@ fn a_sync_that_leaves_a_conflict_pushes_nothing() {
         rev(home.path(), &home.child("remote.git"), "master"),
         before
     );
+}
+
+#[test]
+fn a_sync_whose_edit_is_kept_pushes_and_asks_nothing_next_time() {
+    let home = guarded_home();
+    let repo = cloned(&home, "");
+    std::fs::write(repo.join("bx.toml"), inline("~/.a", "bx\\n")).expect("bx.toml");
+    commit_all(home.path(), &repo, "bx");
+    let env = env(home.path());
+    sync_with(&env, true, &mut Vec::new(), &git(home.path()), &mut never).expect("sync");
+    std::fs::write(home.child(".a"), "edited\n").expect("the edit");
+    std::fs::write(repo.join("bx.toml"), inline("~/.a", "new\\n")).expect("bx.toml");
+    commit_all(home.path(), &repo, "new");
+    let tty = Env {
+        stdin_tty: true,
+        ..env.clone()
+    };
+
+    // The defect: a kept edit left a conflict, and every push was refused.
+    let mut out = Vec::new();
+    let exit = sync_answering(
+        &tty,
+        false,
+        &mut out,
+        &git(home.path()),
+        (&mut never, Some(&mut |_, _| Ok(Answer::Keep))),
+    )
+    .expect("sync");
+
+    assert_eq!(exit, Exit::Converged, "{}", text(&out));
+    assert!(
+        text(&out).ends_with("Pushed 1 commit(s) to origin/master.\n"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        rev(home.path(), &home.child("remote.git"), "master"),
+        rev(home.path(), &repo, "HEAD")
+    );
+    assert_eq!(std::fs::read(home.child(".a")).expect("kept"), b"edited\n");
+
+    let mut again = Vec::new();
+    let exit = sync_answering(
+        &tty,
+        false,
+        &mut again,
+        &git(home.path()),
+        (
+            &mut never,
+            Some(&mut |_, _| panic!("a kept edit is not asked about again")),
+        ),
+    )
+    .expect("a second sync");
+    assert_eq!(exit, Exit::Converged, "{}", text(&again));
 }
 
 #[test]

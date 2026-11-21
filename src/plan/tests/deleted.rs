@@ -31,6 +31,7 @@ fn answer(inputs: &Inputs, taken: &[usize]) -> Report {
         Ok(Approval {
             approved: true,
             taken: taken.iter().copied().collect(),
+            kept: BTreeSet::new(),
         })
     })
     .expect("apply runs")
@@ -678,4 +679,64 @@ fn a_deleted_region_file_restored_takes_the_mode_its_target_declares() {
     let now = std::fs::read_to_string(home.child(".zshrc")).expect("restored");
     assert!(now.starts_with("# >>> bx >>>\n"), "{now}");
     assert_eq!(mode_of(&home.child(".zshrc")), 0o640, "the declared mode");
+}
+
+/// An `apply` answering *keep it deleted* for every question it puts.
+fn keep(inputs: &Inputs) -> Report {
+    answered(inputs, Mode::Apply, &mut |report| {
+        Ok(Approval {
+            approved: false,
+            taken: BTreeSet::new(),
+            kept: report
+                .questions
+                .iter()
+                .map(|question| question.row)
+                .collect(),
+        })
+    })
+    .expect("apply runs")
+}
+
+#[test]
+fn keeping_a_deletion_is_remembered_until_either_side_changes() {
+    let home = guarded_home();
+    let inputs = deleted(&home, "new\\n");
+    assert_eq!(plan(&inputs).actions(), vec![Action::Conflict]);
+
+    let kept = keep(&inputs);
+
+    assert_eq!(kept.actions(), vec![Action::Unchanged]);
+    let planned = plan(&inputs);
+    assert!(planned.questions.is_empty(), "not asked again");
+    assert_eq!(planned.kept, vec![0]);
+    assert_eq!(exit(&planned, Mode::Plan), Exit::Converged);
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.starts_with(decide::DELETED_CHANGED), "{note}");
+    assert!(note.ends_with(super::super::KEPT_DELETED), "{note}");
+    assert!(!home.child(".a").exists());
+
+    // Something is there again: that is a question of its own.
+    home.write(".a", "mine\n");
+    assert_eq!(plan(&inputs).questions.len(), 1);
+}
+
+#[test]
+fn keeping_a_retargeted_link_is_remembered() {
+    let home = guarded_home();
+    let made = inputs(&home, &symlink("~/.l", "bx"));
+    assert!(apply(&made).executed);
+    std::fs::remove_file(home.child(".l")).expect("unlink");
+    std::os::unix::fs::symlink("theirs", home.child(".l")).expect("retarget");
+    let inputs = inputs(&home, &symlink("~/.l", "new"));
+    assert_eq!(plan(&inputs).questions[0].asked, Asked::Retargeted);
+
+    keep(&inputs);
+
+    let planned = plan(&inputs);
+    assert!(planned.questions.is_empty());
+    let note = planned.changes[0].note.as_deref().expect("a note");
+    assert!(note.ends_with(super::super::KEPT_RETARGETED), "{note}");
+    // bx wants another target there now: asked again.
+    let elsewhere = super::inputs(&home, &symlink("~/.l", "newer"));
+    assert_eq!(plan(&elsewhere).questions.len(), 1);
 }

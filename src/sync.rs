@@ -478,6 +478,48 @@ pub fn may_push(report: &Report) -> bool {
             }))
 }
 
+/// How many rows [`undone`] names before it counts the rest.
+const NAMED: usize = 3;
+
+/// The rows `report` left that keep [`may_push`] from pushing, named for the
+/// line that says so, in row order: each conflict, said to be *unanswered*
+/// where it is a question a writing run asks at a terminal, and each blocked
+/// row; the first three by path and the rest by count. A row whose
+/// question stands answered *keep* is unchanged, and is not one of them.
+///
+/// `None` where no row is left so: what waits is then the apply itself —
+/// declined, only recovering, or interrupted — and running it again is
+/// what settles it.
+#[must_use]
+pub fn undone(report: &Report) -> Option<String> {
+    use crate::report::{self, Action};
+
+    let rows: Vec<String> = report
+        .changes
+        .iter()
+        .enumerate()
+        .filter(|(_, change)| change.action.needs_attention())
+        .map(|(at, change)| {
+            let why = if change.action == Action::Blocked {
+                "blocked"
+            } else if report.questions.iter().any(|question| question.row == at) {
+                "unanswered"
+            } else {
+                "conflict"
+            };
+            format!("{} ({why})", report::escape(&change.target))
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let named = rows[..rows.len().min(NAMED)].join(", ");
+    Some(match rows.len().saturating_sub(NAMED) {
+        0 => named,
+        more => format!("{named} and {more} more"),
+    })
+}
+
 /// Refuse a state directory that lies inside the config repo, lexically.
 fn refuse_state_in_repo(repo: &Path, state: &Path) -> Result<(), Error> {
     let (repo, state) = (paths::normalize(repo), paths::normalize(state));
@@ -1402,5 +1444,64 @@ mod tests {
             }),
             ..Report::default()
         }));
+    }
+
+    #[test]
+    fn undone_names_each_row_a_push_waits_on_and_counts_past_three() {
+        use crate::config::Origin;
+        use crate::report::Action;
+
+        let row = |target: &str, action| plan::Change {
+            target: target.to_string(),
+            origin: Origin {
+                file: PathBuf::from("/repo/bx.toml"),
+                line: 1,
+            },
+            action,
+            diff: None,
+            note: None,
+        };
+        let question = plan::Question {
+            row: 0,
+            three_way: None,
+            asked: plan::Asked::Edited,
+        };
+        assert_eq!(undone(&Report::default()), None);
+        // A kept row is unchanged, and a push does not wait on it.
+        assert_eq!(
+            undone(&Report {
+                changes: vec![row("~/.kept", Action::Unchanged)],
+                kept: vec![0],
+                ..Report::default()
+            }),
+            None
+        );
+        let report = Report {
+            changes: vec![
+                row("~/.a", Action::Conflict),
+                row("~/.b", Action::Create),
+                row("~/.c", Action::Conflict),
+                row("~/.d", Action::Blocked),
+            ],
+            questions: vec![question.clone()],
+            ..Report::default()
+        };
+        assert_eq!(
+            undone(&report).as_deref(),
+            Some("~/.a (unanswered), ~/.c (conflict), ~/.d (blocked)")
+        );
+        let mut more = report;
+        more.changes.push(row("~/.e\n", Action::Blocked));
+        more.changes.push(row("~/.f", Action::Conflict));
+        assert_eq!(
+            undone(&more).as_deref(),
+            Some("~/.a (unanswered), ~/.c (conflict), ~/.d (blocked) and 2 more")
+        );
+        let mut escaped = more;
+        escaped.changes.drain(..4);
+        assert_eq!(
+            undone(&escaped).as_deref(),
+            Some("~/.e\\n (blocked), ~/.f (conflict)")
+        );
     }
 }

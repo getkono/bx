@@ -134,9 +134,108 @@ pub struct Pager {
 }
 
 /// The options `less` is always given through `LESS`: `F` exits at once where
-/// everything fits, `R` shows colour, and `X` keeps the terminal's alternate
-/// screen out of it, so what was paged stays on the screen once it exits.
-pub const LESS_OPTIONS: &str = "FRX";
+/// everything fits, `R` shows colour, `X` keeps the terminal's alternate
+/// screen out of it, so what was paged stays on the screen once it exits, and
+/// `K` exits at once on Ctrl-C, which [`Pager::page`] reports as
+/// [`Paged::Interrupted`].
+pub const LESS_OPTIONS: &str = "FRXK";
+
+/// What became of a rendering handed to [`Pager::page`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paged {
+    /// The pager ran and exited, so the rendering was shown.
+    Shown,
+    /// The pager could not be started, and nothing was shown: the caller
+    /// writes the rendering itself.
+    NotRun,
+    /// Ctrl-C reached bx while the pager ran. A terminal sends it to the
+    /// pager and bx alike; bx outlives it so that it can say what it did not
+    /// do, and asks nothing that would have followed.
+    Interrupted,
+}
+
+/// A signal caught only while a pager runs: elsewhere it does what it would
+/// without the handler, which for `SIGINT` is to end bx.
+pub(crate) struct Interrupt {
+    /// How many pagers run, under the lock that keeps `outside` in step.
+    running: std::sync::Mutex<usize>,
+    /// Whether no pager runs, so the signal takes its default action.
+    outside: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the signal arrived since the first running pager started.
+    seen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Interrupt {
+    /// Catch `signal` from now on, through no pager yet. The default action
+    /// is registered first, so a signal arriving outside a pager takes it
+    /// before anything records the signal as seen.
+    fn catching(signal: i32) -> std::io::Result<Self> {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let outside = Arc::new(AtomicBool::new(true));
+        let seen = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register_conditional_default(signal, Arc::clone(&outside))?;
+        signal_hook::flag::register(signal, Arc::clone(&seen))?;
+        Ok(Self {
+            running: std::sync::Mutex::new(0),
+            outside,
+            seen,
+        })
+    }
+
+    /// Run `pager`, with the signal caught and not acted on throughout, and
+    /// whether it arrived meanwhile.
+    fn during<T>(&self, pager: impl FnOnce() -> T) -> (T, bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        /// Leaves the pager on drop, so a panic does not leave the signal
+        /// caught for good.
+        struct Running<'a>(&'a Interrupt);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                let mut running = self.0.lock();
+                *running = running.saturating_sub(1);
+                if *running == 0 {
+                    self.0.outside.store(true, SeqCst);
+                }
+            }
+        }
+
+        {
+            let mut running = self.lock();
+            if *running == 0 {
+                self.seen.store(false, SeqCst);
+            }
+            *running += 1;
+            self.outside.store(false, SeqCst);
+        }
+        let _running = Running(self);
+        let ran = pager();
+        (ran, self.seen.load(SeqCst))
+    }
+
+    /// The count of running pagers, which no panic leaves unusable.
+    fn lock(&self) -> std::sync::MutexGuard<'_, usize> {
+        self.running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// `SIGINT`, caught while a pager runs from the first paging on, or `None`
+/// where its handler could not be installed and the pager runs as it did
+/// without one.
+pub(crate) fn interrupt() -> Option<&'static Interrupt> {
+    static SIGINT: std::sync::OnceLock<Option<Interrupt>> = std::sync::OnceLock::new();
+    SIGINT
+        .get_or_init(|| {
+            Interrupt::catching(signal_hook::consts::SIGINT)
+                .inspect_err(|error| tracing::debug!(%error, "Ctrl-C is not caught while paging"))
+                .ok()
+        })
+        .as_ref()
+}
 
 /// What bx pages through when neither `$BX_PAGER` nor `$PAGER` names one.
 pub const DEFAULT_PAGER: &str = "less -FRX";
@@ -189,38 +288,57 @@ impl Pager {
     /// Show `text` through this pager, returning once it exits, so whatever
     /// is written next — `apply`'s question — follows it on the screen.
     ///
-    /// `Ok(false)` where the pager could not be started, and nothing was
-    /// shown: the caller writes `text` itself. That is the case too where
+    /// [`Paged::NotRun`] where the pager could not be started, and nothing
+    /// was shown: the caller writes `text` itself. That is the case too where
     /// `sh` started but exited 126 or 127, which is how it says the command
     /// was not found or could not be run — the default `less -FRX` where no
     /// `less` is installed. A pager quit before it read everything is not an
     /// error.
     ///
+    /// Ctrl-C while it runs ends the pager and not bx: [`Paged::Interrupted`],
+    /// so the caller cancels what would have followed.
+    ///
     /// # Errors
     ///
     /// The error writing `text` to it, or waiting for it.
-    pub fn page(&self, text: &str) -> std::io::Result<bool> {
+    pub fn page(&self, text: &str) -> std::io::Result<Paged> {
+        self.page_catching(text, interrupt())
+    }
+
+    /// [`Pager::page`], with `interrupt` caught while the pager runs.
+    fn page_catching(&self, text: &str, interrupt: Option<&Interrupt>) -> std::io::Result<Paged> {
         use std::io::Write as _;
 
-        let mut command = std::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(&self.command)
-            .stdin(std::process::Stdio::piped());
-        command.env("LESS", &self.less);
-        let Ok(mut child) = command.spawn() else {
-            return Ok(false);
+        let run = || {
+            let spawned = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&self.command)
+                .env("LESS", &self.less)
+                .stdin(std::process::Stdio::piped())
+                .spawn();
+            let Ok(mut child) = spawned else {
+                return Ok(None);
+            };
+            let written = child
+                .stdin
+                .take()
+                .map_or(Ok(()), |mut stdin| stdin.write_all(text.as_bytes()));
+            let waited = child.wait();
+            match written {
+                Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error),
+                _ => waited.map(Some),
+            }
         };
-        let written = child
-            .stdin
-            .take()
-            .map_or(Ok(()), |mut stdin| stdin.write_all(text.as_bytes()));
-        let waited = child.wait();
-        match written {
-            Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => return Err(error),
-            _ => {}
-        }
-        waited.map(|status| !matches!(status.code(), Some(NOT_RUN | NOT_FOUND)))
+        let (ran, interrupted) = match interrupt {
+            Some(interrupt) => interrupt.during(run),
+            None => (run(), false),
+        };
+        Ok(match ran? {
+            None => Paged::NotRun,
+            Some(status) if matches!(status.code(), Some(NOT_RUN | NOT_FOUND)) => Paged::NotRun,
+            Some(_) if interrupted => Paged::Interrupted,
+            Some(_) => Paged::Shown,
+        })
     }
 }
 
@@ -338,19 +456,19 @@ mod tests {
         // `BX_PAGER`, else a `PAGER` that is not empty, else `less -FRX`.
         assert_eq!(
             Pager::resolve(false, true, os("more"), os("most"), None),
-            pager("more", "FRX")
+            pager("more", "FRXK")
         );
         assert_eq!(
             Pager::resolve(false, true, None, os("most"), None),
-            pager("most", "FRX")
+            pager("most", "FRXK")
         );
         assert_eq!(
             Pager::resolve(false, true, None, os(""), None),
-            pager(DEFAULT_PAGER, "FRX")
+            pager(DEFAULT_PAGER, "FRXK")
         );
         assert_eq!(
             Pager::resolve(false, true, None, None, None),
-            pager(DEFAULT_PAGER, "FRX")
+            pager(DEFAULT_PAGER, "FRXK")
         );
     }
 
@@ -363,13 +481,13 @@ mod tests {
         };
         // oh-my-zsh's `LESS=-R` alone runs `less` on the alternate screen,
         // which wipes the plan before the question about it is put.
-        assert_eq!(less("-R"), "-R -FRX");
+        assert_eq!(less("-R"), "-R -FRXK");
         // Every option it gave is kept, ahead of the ones bx needs.
-        assert_eq!(less("-i -x4"), "-i -x4 -FRX");
-        assert_eq!(less("SR"), "SR -FRX");
+        assert_eq!(less("-i -x4"), "-i -x4 -FRXK");
+        assert_eq!(less("SR"), "SR -FRXK");
         // Set to nothing but blanks, it gives no option of its own.
-        assert_eq!(less(""), "FRX");
-        assert_eq!(less(" \t"), "FRX");
+        assert_eq!(less(""), "FRXK");
+        assert_eq!(less(" \t"), "FRXK");
     }
 
     #[test]
@@ -430,33 +548,113 @@ mod tests {
             Some("-R".as_ref()),
         )
         .expect("a pager")
-        .page("one\ntwo\n")
+        // Uncaught: the Ctrl-C another test sends bx is not this pager's.
+        .page_catching("one\ntwo\n", None)
         .expect("paged");
-        assert!(shown);
+        assert_eq!(shown, Paged::Shown);
         // Waited for: what it wrote is there once `page` returns.
         assert_eq!(std::fs::read_to_string(&seen).expect("seen"), "one\ntwo\n");
-        assert_eq!(std::fs::read_to_string(&less).expect("LESS"), "-R -FRX");
+        assert_eq!(std::fs::read_to_string(&less).expect("LESS"), "-R -FRXK");
 
         // A pager that quits without reading is no error.
-        let quit = pager("exit 0", "FRX").expect("a pager");
-        assert!(quit.page(&"x\n".repeat(1 << 20)).expect("quit early"));
+        let quit = pager("exit 0", LESS_OPTIONS).expect("a pager");
+        assert_eq!(
+            quit.page_catching(&"x\n".repeat(1 << 20), None)
+                .expect("quit early"),
+            Paged::Shown
+        );
     }
 
     #[test]
     fn a_pager_that_does_not_exist_or_cannot_run_has_shown_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("no-such-pager").display().to_string();
-        let missing = pager(&missing, "FRX").expect("a pager");
-        assert!(!missing.page("one\ntwo\n").expect("not shown"));
+        let missing = pager(&missing, LESS_OPTIONS).expect("a pager");
+        assert_eq!(
+            missing.page("one\ntwo\n").expect("not shown"),
+            Paged::NotRun
+        );
 
         let unrunnable = dir.path().join("unrunnable");
         std::fs::write(&unrunnable, "#!/bin/sh\n").expect("write");
-        let unrunnable = pager(&unrunnable.display().to_string(), "FRX").expect("a pager");
-        assert!(!unrunnable.page("one\n").expect("not shown"));
+        let unrunnable = pager(&unrunnable.display().to_string(), LESS_OPTIONS).expect("a pager");
+        assert_eq!(unrunnable.page("one\n").expect("not shown"), Paged::NotRun);
 
         // Any other status is a pager that ran, and its own business.
-        let failed = pager("exit 1", "FRX").expect("a pager");
-        assert!(failed.page("one\n").expect("ran"));
+        let failed = pager("exit 1", LESS_OPTIONS).expect("a pager");
+        assert_eq!(
+            failed.page_catching("one\n", None).expect("ran"),
+            Paged::Shown
+        );
+    }
+
+    #[test]
+    fn an_interrupt_while_the_pager_runs_ends_the_pager_and_not_bx() {
+        use signal_hook::consts::SIGURG;
+
+        // SIGURG stands in for SIGINT, which would end this test process
+        // where it arrived outside a pager; its default action is to be
+        // ignored, and nothing else here catches it.
+        let interrupt = Interrupt::catching(SIGURG).expect("caught");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ack = dir.path().join("ack");
+        // Written once bx's handler has run, after it marked the signal seen,
+        // so the pager below exits only once bx has caught it.
+        let acked = std::fs::File::create(&ack).expect("ack");
+        signal_hook::low_level::pipe::register(SIGURG, acked).expect("acked");
+
+        // A terminal's Ctrl-C reaches the pager and bx alike; `less -K`
+        // exits 2 on it.
+        let interrupted = pager(
+            &format!(
+                "kill -URG $PPID; until [ -s '{}' ]; do :; done; exit 2",
+                ack.display()
+            ),
+            LESS_OPTIONS,
+        )
+        .expect("a pager");
+        assert_eq!(
+            interrupted
+                .page_catching("one\n", Some(&interrupt))
+                .expect("interrupted"),
+            Paged::Interrupted
+        );
+        assert!(
+            interrupt.outside.load(std::sync::atomic::Ordering::SeqCst),
+            "once the pager is gone the signal takes its default action again"
+        );
+
+        // The next pager starts without it.
+        let quiet = pager("cat > /dev/null", LESS_OPTIONS).expect("a pager");
+        assert_eq!(
+            quiet
+                .page_catching("one\n", Some(&interrupt))
+                .expect("shown"),
+            Paged::Shown
+        );
+        // A pager that never started showed nothing, interrupted or not.
+        let missing = dir.path().join("no-such-pager").display().to_string();
+        let missing = pager(&missing, LESS_OPTIONS).expect("a pager");
+        let (paged, seen) = interrupt.during(|| {
+            signal_hook::low_level::raise(SIGURG).expect("raised");
+            missing.page_catching("one\n", Some(&interrupt))
+        });
+        assert!(seen);
+        assert_eq!(paged.expect("not shown"), Paged::NotRun);
+
+        // Two pagers at once: the signal is caught until the last exits,
+        // and seen by both.
+        let ((seen_inner, outside_between), seen_outer) = interrupt.during(|| {
+            let ((), seen_inner) = interrupt.during(|| {
+                signal_hook::low_level::raise(SIGURG).expect("raised");
+            });
+            (
+                seen_inner,
+                interrupt.outside.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        });
+        assert!(seen_inner && seen_outer);
+        assert!(!outside_between);
     }
 
     #[test]

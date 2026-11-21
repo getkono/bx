@@ -23,7 +23,7 @@ use crate::adopt::{self, Adoption, Removal};
 use crate::config::resolve::Resolution;
 use crate::config::target::Body;
 use crate::doctor::{self, Probes, systemd};
-use crate::env::Env;
+use crate::env::{Env, Paged};
 use crate::git::Git;
 use crate::init;
 use crate::paths;
@@ -138,8 +138,8 @@ pub fn plan(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 /// [`Error::NeedsConfirmation`] when there is something to write, no `yes`,
 /// and no terminal to ask on; [`Error::Prompt`] when the prompt fails; and
 /// otherwise as [`status`], plus whatever recovery and the session return. A
-/// prompt abandoned with Esc or Ctrl-C is not an error: it is said in a line
-/// and exits [`Exit::Canceled`].
+/// prompt abandoned with Esc or Ctrl-C, or a pager ended with Ctrl-C before
+/// it, is not an error: it is said in a line and exits [`Exit::Canceled`].
 pub fn apply(env: &Env, yes: bool, out: &mut dyn Write) -> Result<Exit, Error> {
     apply_answering(env, yes, out, &mut confirm, Some(&mut ask_edited))
 }
@@ -392,7 +392,8 @@ pub(crate) fn converge_answering(
     })?;
 
     if !shown {
-        emit(out, &report, View::Plan, env)?;
+        // The run is over, so nothing is left for a Ctrl-C to cancel.
+        viewed(emit(out, &report, View::Plan, env))?;
     } else if let Some(outcome) = &report.recovered {
         writeln!(out, "{}", recovered(&report, outcome)).map_err(Error::Output)?;
     } else if report.executed {
@@ -1304,7 +1305,7 @@ pub fn abandon(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 fn show(env: &Env, view: View, out: &mut dyn Write) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
     let report = plan::run(&inputs, Mode::Plan, &mut |_| Ok(false))?;
-    emit(out, &report, view, env)?;
+    viewed(emit(out, &report, view, env))?;
     Ok(plan::exit(&report, Mode::Plan))
 }
 
@@ -1320,15 +1321,32 @@ fn emit(out: &mut dyn Write, report: &Report, view: View, env: &Env) -> Result<(
 
 /// Write `text` to `out`, or through the pager when it is taller than the
 /// terminal.
+///
+/// # Errors
+///
+/// [`Error::Canceled`] where Ctrl-C ended the pager: bx outlived it, so the
+/// question that would follow is not put, and the command says so. Where
+/// nothing follows, [`viewed`] takes it as the view's end.
 fn page(out: &mut dyn Write, text: &str, env: &Env) -> Result<(), Error> {
     if let Some(pager) = env.pager_for(text) {
         // What is already written goes first, ahead of what the pager shows.
         out.flush().map_err(Error::Output)?;
-        if pager.page(text).map_err(Error::Output)? {
-            return Ok(());
+        match pager.page(text).map_err(Error::Output)? {
+            Paged::Shown => return Ok(()),
+            Paged::Interrupted => return Err(Error::Canceled),
+            Paged::NotRun => {}
         }
     }
     out.write_all(text.as_bytes()).map_err(Error::Output)
+}
+
+/// What a rendering with nothing after it came to: a Ctrl-C that ended its
+/// pager ended only the view, since no question was left to cancel.
+fn viewed(shown: Result<(), Error>) -> Result<(), Error> {
+    match shown {
+        Err(Error::Canceled) => Ok(()),
+        shown => shown,
+    }
 }
 
 #[cfg(test)]

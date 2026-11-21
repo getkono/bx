@@ -78,6 +78,10 @@ getrandom = { version = "0.4.3", default-features = false }
 # File modes, fsync, the advisory lock on the state directory, and discarding
 # what was typed ahead of a confirmation.
 rustix = { version = "1.1.4", features = ["fs", "process", "system", "termios"] }
+# Catching Ctrl-C while the pager runs, so it ends the pager and bx says
+# "Canceled." rather than dying with it: a handler without the `unsafe` this
+# crate forbids. Already built for inquire's crossterm; default features off.
+signal-hook = { version = "0.3.18", default-features = false }
 # UTC timestamps for `bx --version` and `bx doctor`; no tz database, so default
 # features off.
 jiff = { version = "0.2.42", default-features = false }

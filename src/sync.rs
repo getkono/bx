@@ -166,15 +166,20 @@ pub enum Error {
     /// A commit waiting to be pushed carries a file named as a state file is.
     #[error(
         "the commits bx sync would push to {upstream} carry {}, named as bx's state files are; \
-         they belong to this machine and are never published. Nothing was pulled, applied \
-         or pushed. Remove them from those commits and run bx sync again",
-        .paths.join(", ")
+         they belong to this machine and are never published. bx sync fetched {upstream} and \
+         {}: nothing was merged, applied or pushed. Remove them from those commits and run \
+         bx sync again",
+        .paths.join(", "),
+        diverged_changes(*.recovered)
     )]
     WouldPushState {
         /// Its upstream, as `REMOTE/BRANCH`.
         upstream: String,
         /// Each offending path, as git names it in the repo.
         paths: Vec<String>,
+        /// Tracked copies an interrupted sync left uncommitted, which [`pull`]
+        /// committed before it found what the push would carry.
+        recovered: usize,
     },
     /// Another `bx sync`, `bx update` or check holds `update/check.lock`.
     #[error(
@@ -200,8 +205,8 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
-/// What [`Error::Diverged`] and [`Error::UpstreamGone`] say `sync` changed
-/// before it refused: nothing,
+/// What [`Error::Diverged`], [`Error::UpstreamGone`] and
+/// [`Error::WouldPushState`] say `sync` changed before it refused: nothing,
 /// or only the commit of the `recovered` copies an interrupted sync carried.
 fn diverged_changes(recovered: usize) -> String {
     if recovered == 0 {
@@ -308,7 +313,7 @@ pub fn pull(env: &Env, git: &Git) -> Result<Pulled, Error> {
         });
     }
     if ahead > 0 {
-        refuse_outgoing_state(git, &repo, &state, &upstream)?;
+        refuse_outgoing_state(git, &repo, &state, &upstream, recovered)?;
     }
     if behind > 0 {
         git.query(&repo, &["merge", "--ff-only", "--quiet", "@{upstream}"])?;
@@ -576,12 +581,14 @@ pub(crate) fn counts(git: &Git, repo: &Path) -> Result<(u64, u64), Error> {
 /// that reaches it, and leaves out a blob the upstream already has, so a
 /// state file whose bytes happen to exist elsewhere (an empty `local.toml`)
 /// would pass unseen. A state file a later commit deleted again is still
-/// listed by the commit that added it.
+/// listed by the commit that added it. `recovered` is what the refusal says
+/// [`commit_carried`] committed before it.
 fn refuse_outgoing_state(
     git: &Git,
     repo: &Path,
     state: &StateDir,
     upstream: &Upstream,
+    recovered: usize,
 ) -> Result<(), Error> {
     // Untrimmed, so a first path that begins with whitespace keeps it: the
     // newline git prints before each commit's paths is all that is stripped.
@@ -612,6 +619,7 @@ fn refuse_outgoing_state(
         Err(Error::WouldPushState {
             upstream: upstream.short.clone(),
             paths,
+            recovered,
         })
     }
 }
@@ -1138,12 +1146,28 @@ mod tests {
 
             let error = pull(&env(home.path()), &git(home.path())).expect_err(named);
 
-            let Error::WouldPushState { paths, upstream } = &error else {
+            let Error::WouldPushState {
+                paths,
+                upstream,
+                recovered,
+            } = &error
+            else {
                 panic!("{commits:?}: {error:?}");
             };
             assert_eq!(paths, &vec![named.to_string()], "{commits:?}");
             assert_eq!(upstream, "origin/master", "{commits:?}");
+            assert_eq!(*recovered, 0, "{commits:?}");
             assert_eq!(rev(home.path(), &repo, "HEAD"), head, "{commits:?}");
+            // The fetch ran, so it is not said that nothing was pulled: what
+            // was not done is the merge, the apply and the push.
+            assert!(
+                error.to_string().contains(
+                    "bx sync fetched origin/master and changed nothing: nothing was merged, \
+                     applied or pushed."
+                ),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("pulled"), "{error}");
         }
     }
 

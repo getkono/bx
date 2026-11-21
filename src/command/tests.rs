@@ -43,8 +43,8 @@ fn prompts_child() {
         "{removing:?}"
     );
     assert!(
-        ask_passphrase("~/.ssh/id_ed25519").is_none(),
-        "a prompt with no terminal is no passphrase"
+        matches!(ask_passphrase("~/.ssh/id_ed25519"), Asked::Nothing),
+        "a prompt with no terminal is no passphrase, and not one left with Esc"
     );
     // `init`'s questions: a value, asked afresh or again after a
     // problem, and the files to adopt.
@@ -825,6 +825,42 @@ fn a_run_that_only_adopted_is_set_up_and_not_already_set_up() {
 }
 
 #[test]
+fn a_pick_that_adopted_nothing_is_already_set_up() {
+    use crate::init::tests::Script;
+
+    // The pick is a directory holding only a link, which `add` passes over:
+    // the row is said, and nothing was adopted, so nothing was set up.
+    let home = guarded_home();
+    seed(home.path(), "");
+    std::fs::create_dir_all(home.child(".config/app")).expect("the directory");
+    std::os::unix::fs::symlink("elsewhere", home.child(".config/app/link")).expect("the link");
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+    let mut script = Script {
+        pick: vec!["~/.config/app"],
+        ..Script::default()
+    };
+    let mut out = Vec::new();
+
+    let exit = init_with(&tty, &[], false, &mut out, &mut script, &mut never).expect("init");
+
+    assert_eq!(script.offered, [vec!["~/.config/app".to_string()]]);
+    assert_eq!(exit, Exit::Converged);
+    assert!(
+        text(&out).contains("  - ~/.config/app/link  skipped: "),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        text(&out).ends_with(&init_closing(Exit::Converged, false, None)),
+        "{}",
+        text(&out)
+    );
+}
+
+#[test]
 fn init_says_what_was_left_when_a_session_is_interrupted_after_the_pick() {
     use crate::init::tests::InterruptedWhileAsking;
 
@@ -1018,15 +1054,15 @@ fn a_missing_repo_is_an_error_for_every_command() {
 
     assert!(matches!(
         status(&env, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(
         plan(&env, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
     assert!(matches!(
         apply(&env, true, &mut Vec::new()),
-        Err(Error::RepoMissing(_))
+        Err(Error::RepoMissing(_, plan::Absence::Nothing))
     ));
 }
 
@@ -1043,7 +1079,7 @@ fn seal(home: &crate::testing::GuardedHome, name: &str, recipient: &str) {
         .expect("the ciphertext");
 }
 
-fn no_passphrase(_: &str) -> Option<Passphrase> {
+fn no_passphrase(_: &str) -> Asked {
     panic!("nothing should have asked for a passphrase")
 }
 
@@ -1132,7 +1168,7 @@ fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret()
     let mut out = Vec::new();
     let exit = secret_list_with(&tty, &mut out, &mut |shown| {
         asked.push(shown.to_string());
-        Some(Passphrase::from(LOCKED_PASSPHRASE))
+        Asked::Given(Passphrase::from(LOCKED_PASSPHRASE))
     })
     .expect("listed");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
@@ -1145,6 +1181,65 @@ fn d1_secret_list_asks_for_a_locked_identity_only_on_a_terminal_and_per_secret()
         ["~/.ssh/id_ed25519", "~/.ssh/id_ed25519"],
         "asked once per secret: nothing keeps a passphrase"
     );
+
+    // A prompt that failed asks again for the next secret.
+    let mut asked = 0;
+    let mut out = Vec::new();
+    secret_list_with(&tty, &mut out, &mut |_| {
+        asked += 1;
+        Asked::Nothing
+    })
+    .expect("listed");
+    assert_eq!(asked, 2, "{}", text(&out));
+}
+
+#[test]
+fn d1_secret_list_left_at_a_passphrase_prompt_asks_for_that_identity_no_more() {
+    use crate::secret::tests::{LOCKED_SSH_KEY, LOCKED_SSH_PUB};
+
+    let home = guarded_home();
+    home.write(".ssh/id_ed25519", LOCKED_SSH_KEY);
+    for name in ["one", "two", "three"] {
+        seal(&home, name, LOCKED_SSH_PUB);
+    }
+    seed(
+        home.path(),
+        &[
+            secret_target("one"),
+            secret_target("two"),
+            secret_target("three"),
+        ]
+        .concat(),
+    );
+    let tty = Env {
+        stdin_tty: true,
+        ..env(home.path())
+    };
+
+    let mut asked = 0;
+    let mut out = Vec::new();
+    let exit = secret_list_with(&tty, &mut out, &mut |_| {
+        asked += 1;
+        Asked::Left
+    })
+    .expect("listed");
+
+    assert_eq!(asked, 1, "Esc on the first prompt skips the other two");
+    assert_eq!(exit, Exit::Pending);
+    let locked = "not decryptable: the identity ~/.ssh/id_ed25519 is locked by a passphrase";
+    let lines: Vec<&str> = text(&out).lines().collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "every secret is still listed: {}",
+        text(&out)
+    );
+    for (line, name) in lines.iter().zip(["one", "two", "three"]) {
+        assert!(
+            line.starts_with(&format!("  ~/{name}  secrets/{name}.age  {locked}")),
+            "{line}"
+        );
+    }
 }
 
 #[test]
@@ -1281,13 +1376,68 @@ fn doctor_with_nothing_to_check_is_converged_and_needs_no_systemd() {
 }
 
 #[test]
-fn doctor_without_a_repo_or_an_output_is_an_error() {
+fn doctor_without_a_repo_is_a_finding_and_writes_nothing() {
     let home = guarded_home();
-    assert!(matches!(
-        doctor(&env(home.path()), &mut Vec::new()),
-        Err(Error::RepoMissing(_))
-    ));
+    let before = crate::plan::tests::snapshot(home.path(), &[]);
 
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx does not exist, so there is no configuration to check; `bx init` \
+         creates the config repo\n\
+         Doctor: 1 finding(s).\n"
+    );
+    assert_eq!(crate::plan::tests::snapshot(home.path(), &[]), before);
+    assert!(matches!(
+        doctor(&env(home.path()), &mut Refusing),
+        Err(Error::Output(_))
+    ));
+}
+
+#[test]
+fn doctor_with_a_non_directory_for_a_repo_says_so_and_writes_nothing() {
+    let home = guarded_home();
+    std::fs::create_dir_all(home.path().join(".config")).expect("the config home");
+    std::fs::write(home.path().join(".config/bx"), "x").expect("a file where the repo goes");
+    let before = crate::plan::tests::snapshot(home.path(), &[]);
+
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx is not a directory, so there is no configuration to check; move it \
+         aside, and `bx init` creates the config repo\n\
+         Doctor: 1 finding(s).\n"
+    );
+    assert_eq!(crate::plan::tests::snapshot(home.path(), &[]), before);
+}
+
+#[test]
+fn doctor_with_a_repo_beneath_a_non_directory_says_so() {
+    let home = guarded_home();
+    std::fs::write(home.path().join(".config"), "x").expect("a file where the config home goes");
+
+    let mut out = Vec::new();
+    let exit = doctor(&env(home.path()), &mut out).expect("a finding, not an error");
+
+    assert_eq!(exit, Exit::Pending);
+    assert_eq!(
+        text(&out),
+        "  ! ~/.config/bx lies beneath a path that is not a directory, so there is no \
+         configuration to check; `bx init` creates the config repo once that path is a \
+         directory\n\
+         Doctor: 1 finding(s).\n"
+    );
+}
+
+#[test]
+fn doctor_without_an_output_is_an_error() {
+    let home = guarded_home();
     seed(home.path(), "");
     assert!(matches!(
         doctor(&env(home.path()), &mut Refusing),

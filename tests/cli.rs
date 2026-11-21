@@ -744,9 +744,20 @@ fn add_then_rm_round_trips_the_file_and_the_layer_through_the_binary() {
         "# mine\n"
     );
 
-    let unnamed = bx(home.path(), &["add"]);
-    assert_eq!(unnamed.status.code(), Some(1));
-    assert!(stderr(&unnamed).contains("name the file or directory to add"));
+    // The path is required, as the README spells it: `bx add PATH`, and a
+    // command line without one is a usage error, not a run.
+    for command in ["add", "rm"] {
+        let unnamed = bx(home.path(), &[command]);
+        assert_eq!(unnamed.status.code(), Some(64), "{}", stderr(&unnamed));
+        assert!(stderr(&unnamed).contains("<PATH>"), "{}", stderr(&unnamed));
+
+        let help = bx(home.path(), &[command, "--help"]);
+        assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+        // Both take `--yes`, so each usage line reads `[OPTIONS] <PATH>`.
+        let usage = format!("Usage: bx {command} [OPTIONS] <PATH>\n");
+        assert!(stdout(&help).contains(&usage), "{}", stdout(&help));
+        assert!(!stdout(&help).contains("TARGET"), "{}", stdout(&help));
+    }
 }
 
 #[test]
@@ -1431,8 +1442,10 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     let (path, requests) = served(home.path(), "v999.0.0");
     publish(home.path(), "v999.0.0", false);
     let (exe, _) = installed_copy(home.path());
-    // Where the kernel says the copy is, which is the directory bx names.
+    // Where the kernel says the copy is, which is the directory bx names, as
+    // `~/install` wherever no link lies on the way to the home.
     let dir = std::fs::canonicalize(home.path().join("install")).expect("the install directory");
+    let shown = bx::paths::to_portable(&dir, home.path());
 
     let output = self_upgrade_copy(&exe, home.path(), &path);
 
@@ -1440,9 +1453,8 @@ fn self_upgrade_replaces_the_running_binary_with_the_latest_release() {
     assert_eq!(
         stdout(&output),
         format!(
-            "Installing bx v999.0.0 over v{} in {}...\nInstalled bx v999.0.0.\n",
+            "Installing bx v999.0.0 over v{} in {shown}...\nInstalled bx v999.0.0.\n",
             bx::VERSION,
-            dir.display()
         )
     );
     assert_eq!(

@@ -50,7 +50,7 @@ fn rm_of_a_directory_without_a_terminal_shows_its_rows_and_changes_nothing() {
     let error = rm_with(
         &env(home.path()),
         home.path(),
-        Some("~/.d"),
+        "~/.d",
         false,
         &mut out,
         &mut never_rm,
@@ -73,7 +73,7 @@ fn rm_declined_at_its_question_changes_nothing() {
     let exit = rm_with(
         &tty(home.path()),
         home.path(),
-        Some("~/.d"),
+        "~/.d",
         false,
         &mut out,
         &mut || Ok(false),
@@ -92,7 +92,7 @@ fn rm_abandoned_at_its_question_is_a_cancel_that_changes_nothing() {
     let exit = rm_with(
         &tty(home.path()),
         home.path(),
-        Some("~/.d"),
+        "~/.d",
         false,
         &mut out,
         &mut || Err(adopt::Error::Canceled),
@@ -114,7 +114,7 @@ fn rm_approved_at_its_question_does_what_it_showed() {
     let exit = rm_with(
         &tty(home.path()),
         home.path(),
-        Some("~/.d"),
+        "~/.d",
         false,
         &mut out,
         &mut || Ok(true),
@@ -133,7 +133,7 @@ fn rm_yes_asks_nothing_and_says_what_it_did() {
     let exit = rm_with(
         &tty(home.path()),
         home.path(),
-        Some("~/.d"),
+        "~/.d",
         true,
         &mut out,
         &mut never_rm,
@@ -153,7 +153,7 @@ fn rm_with_only_a_conflict_to_show_asks_nothing() {
     let exit = rm_with(
         &tty(home.path()),
         home.path(),
-        Some("~/.e"),
+        "~/.e",
         false,
         &mut out,
         &mut never_rm,
@@ -169,25 +169,11 @@ fn rm_after_add_then_an_edit_names_the_way_out_by_path_and_no_digest() {
     seed(home.path(), "");
     std::fs::write(home.child(".rc"), "original\n").expect("the file");
     let mut out = Vec::new();
-    add(
-        &env(home.path()),
-        home.path(),
-        Some("~/.rc"),
-        false,
-        &mut out,
-    )
-    .expect("add");
+    add(&env(home.path()), home.path(), "~/.rc", false, &mut out).expect("add");
     std::fs::write(home.child(".rc"), "edited\n").expect("the edit");
 
     let mut out = Vec::new();
-    let exit = rm(
-        &env(home.path()),
-        home.path(),
-        Some("~/.rc"),
-        false,
-        &mut out,
-    )
-    .expect("rm");
+    let exit = rm(&env(home.path()), home.path(), "~/.rc", false, &mut out).expect("rm");
     assert_eq!(exit, Exit::Pending);
     let shown = text(&out);
     assert_eq!(
@@ -271,7 +257,7 @@ fn a_layer_rm_cannot_edit_after_handing_back_still_reports_what_was_done() {
     let result = rm_with(
         &tty(home.path()),
         home.path(),
-        Some("~/.d/a"),
+        "~/.d/a",
         false,
         &mut out,
         &mut || {
@@ -298,14 +284,7 @@ fn a_layer_rm_cannot_edit_after_handing_back_still_reports_what_was_done() {
 
     // A second `rm` finishes it.
     let mut out = Vec::new();
-    let exit = rm(
-        &env(home.path()),
-        home.path(),
-        Some("~/.d/a"),
-        true,
-        &mut out,
-    )
-    .expect("rm");
+    let exit = rm(&env(home.path()), home.path(), "~/.d/a", true, &mut out).expect("rm");
     assert_eq!(exit, Exit::Converged, "{}", text(&out));
     assert_eq!(
         layer(home.path()),

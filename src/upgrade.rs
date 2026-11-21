@@ -294,7 +294,9 @@ pub struct Request {
 }
 
 /// `bx self-upgrade`, for the binary at version `current` installed in `dir`,
-/// fetching from `url` with programs found along `path_var`.
+/// fetching from `url` with programs found along `path_var`. `dir` is named
+/// `~/…` when it is under `home`; an upgrade needs no usable home, so there
+/// may be none to name it under.
 ///
 /// `--check` exits [`Exit::Pending`] when a newer release exists and
 /// [`Exit::Converged`] otherwise, as `bx plan` does. Without it, an older
@@ -310,6 +312,7 @@ pub fn run(
     request: Request,
     current: &str,
     dir: &Path,
+    home: Option<&Path>,
     url: &str,
     path_var: &OsStr,
     out: &mut dyn Write,
@@ -362,12 +365,13 @@ pub fn run(
         return Ok(Exit::Converged);
     }
 
+    let shown = home.map_or_else(
+        || dir.display().to_string(),
+        |home| crate::paths::to_portable(dir, home),
+    );
     say(
         out,
-        format!(
-            "Installing bx {latest} over {current} in {}...",
-            dir.display()
-        ),
+        format!("Installing bx {latest} over {current} in {shown}..."),
     )?;
     out.flush().map_err(Error::Output)?;
     installer.install(latest, dir, path_var)?;
@@ -548,11 +552,22 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
         }
 
         fn run(&self, request: Request, current: &str) -> (Result<Exit, Error>, String) {
+            self.run_in(request, current, None)
+        }
+
+        /// [`Served::run`], naming the install directory under `home`.
+        fn run_in(
+            &self,
+            request: Request,
+            current: &str,
+            home: Option<&Path>,
+        ) -> (Result<Exit, Error>, String) {
             let mut out = Vec::new();
             let result = run(
                 request,
                 current,
                 self.dir.path(),
+                home,
                 INSTALLER_URL,
                 &self.path_var(),
                 &mut out,
@@ -668,6 +683,22 @@ if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
             format!(
                 "Installing bx v0.2.0 over v0.1.1 in {}...\nInstalled bx v0.2.0.\n",
                 served.dir.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn an_install_directory_under_the_home_is_named_under_it() {
+        let served = Served::new(INSTALL_SH, "v0.2.0");
+        let dir = served.dir.path();
+        let (home, name) = (dir.parent().expect("a parent"), dir.file_name());
+        let (result, out) = served.run_in(UPGRADE, "0.1.1", Some(home));
+        assert_eq!(result.unwrap(), Exit::Converged);
+        assert_eq!(
+            out,
+            format!(
+                "Installing bx v0.2.0 over v0.1.1 in ~/{}...\nInstalled bx v0.2.0.\n",
+                name.expect("a name").to_string_lossy()
             )
         );
     }

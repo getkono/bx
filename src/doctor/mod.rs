@@ -165,6 +165,7 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         inputs.lock(),
         inputs.repo(),
         inputs.state(),
+        home,
     ));
     findings.extend(stray_local::check(inputs.repo(), inputs.state(), home));
     findings.extend(bash::check(inputs.targets(), probes.path, probes.bash));
@@ -179,7 +180,7 @@ pub fn run(inputs: &Inputs, probes: &Probes<'_>) -> Report {
         home,
         probes.git,
     ));
-    let notes = externals::notes(&resolved.externals, inputs.state());
+    let notes = externals::notes(&resolved.externals, inputs.state(), home);
     Report { findings, notes }
 }
 
@@ -634,8 +635,8 @@ login-shell = \"zsh\"
         assert_eq!(
             out,
             format!(
-                "  i bx update {} says `{summary}`\nDoctor: 0 finding(s), 1 note(s).\n",
-                last.display()
+                "  i bx update ~/.local/state/bx/update/last-check says `{summary}`\n\
+                 Doctor: 0 finding(s), 1 note(s).\n"
             )
         );
         assert_eq!(code, Exit::Converged);

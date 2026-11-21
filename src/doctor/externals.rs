@@ -36,6 +36,7 @@ use super::Finding;
 use crate::config::Origin;
 use crate::config::external::{External, first_followed};
 use crate::config::lock::{self, Lock, Lookup};
+use crate::paths;
 use crate::plan::external::unlocked_note;
 use crate::state::StateDir;
 use crate::update::{STOPPED, Stamps, kept};
@@ -46,7 +47,8 @@ use crate::update::{STOPPED, Stamps, kept};
 ///
 /// `externals` is this account's merged configuration and `committed` the
 /// committed layers' alone, as [`crate::update::proposed`] takes them: an
-/// entry either follows is one the next `bx update` keeps.
+/// entry either follows is one the next `bx update` keeps. A stamp is named
+/// under `home`.
 #[must_use]
 pub fn check(
     externals: &[External],
@@ -54,6 +56,7 @@ pub fn check(
     lock: &Lock,
     repo: &Path,
     state: &StateDir,
+    home: &Path,
 ) -> Vec<Finding> {
     let mut findings = Vec::new();
     for external in externals {
@@ -103,7 +106,7 @@ pub fn check(
                     note: format!(
                         "{} holds no time, so no shell asks about updates; `bx update` or \
                          `bx update --snooze` writes it again",
-                        stamp.display()
+                        paths::to_portable(&stamp, home)
                     ),
                 });
             }
@@ -118,7 +121,7 @@ pub fn check(
                     note: format!(
                         "{} says `{line}`; `bx update` tries again, and removes it once it \
                          finishes",
-                        last.display()
+                        paths::to_portable(&last, home)
                     ),
                 });
             }
@@ -129,12 +132,14 @@ pub fn check(
 
 /// A note for every line of `last-check` that [`check`] does not report, in
 /// its order, while an external follows a branch. Blank lines say nothing.
+/// `last-check` is named under `home`.
 #[must_use]
-pub fn notes(externals: &[External], state: &StateDir) -> Vec<Finding> {
+pub fn notes(externals: &[External], state: &StateDir, home: &Path) -> Vec<Finding> {
     if first_followed(externals).is_none() {
         return Vec::new();
     }
     let last = Stamps::of(state).last_check();
+    let shown = paths::to_portable(&last, home);
     let text = std::fs::read(&last).unwrap_or_default();
     String::from_utf8_lossy(&text)
         .lines()
@@ -142,7 +147,7 @@ pub fn notes(externals: &[External], state: &StateDir) -> Vec<Finding> {
         .map(|line| Finding {
             subject: "bx update".to_string(),
             origin: None,
-            note: format!("{} says `{line}`", last.display()),
+            note: format!("{shown} says `{line}`"),
         })
         .collect()
 }
@@ -195,14 +200,28 @@ mod tests {
             external(home.path(), "~/new", follow("main")),
             external(home.path(), "~/pinned", Pin::Rev(REV.to_string())),
         ];
-        let findings = check(&externals, Some(&externals), &lock, home.path(), &state);
+        let findings = check(
+            &externals,
+            Some(&externals),
+            &lock,
+            home.path(),
+            &state,
+            home.path(),
+        );
         let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
         assert_eq!(subjects, ["~/stale", "~/new", "~/gone"]);
         // Followed by the committed configuration, though not by this
         // account's, or with that unknown: kept, so no finding.
         let committed = [external(home.path(), "~/gone", follow("main"))];
         for committed in [Some(&committed[..]), None] {
-            let findings = check(&externals, committed, &lock, home.path(), &state);
+            let findings = check(
+                &externals,
+                committed,
+                &lock,
+                home.path(),
+                &state,
+                home.path(),
+            );
             assert!(
                 findings.iter().all(|f| f.subject != "~/gone"),
                 "{findings:?}"
@@ -260,7 +279,14 @@ mod tests {
         ];
         // Committed as this account declares them: `bx update` locks both.
         for committed in [Some(&externals[..]), None] {
-            let findings = check(&externals, committed, &lock, home.path(), &state);
+            let findings = check(
+                &externals,
+                committed,
+                &lock,
+                home.path(),
+                &state,
+                home.path(),
+            );
             assert!(findings[0].note.ends_with("`bx update` locks it again"));
             assert!(findings[1].note.ends_with("`bx update` locks one"));
         }
@@ -270,7 +296,14 @@ mod tests {
             external(home.path(), "~/stale", follow("old")),
             external(home.path(), "~/new", Pin::Rev(REV.to_string())),
         ];
-        let findings = check(&externals, Some(&committed), &lock, home.path(), &state);
+        let findings = check(
+            &externals,
+            Some(&committed),
+            &lock,
+            home.path(),
+            &state,
+            home.path(),
+        );
         let subjects: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
         assert_eq!(subjects, ["~/stale", "~/new"]);
         let elsewhere = "the committed configuration follows here, not this one; pin it with `rev`";
@@ -320,11 +353,20 @@ mod tests {
                 rev: REV.to_string(),
             },
         );
-        let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+        let findings = check(
+            &followed,
+            Some(&followed),
+            &lock,
+            home.path(),
+            &state,
+            home.path(),
+        );
         assert_eq!(findings.len(), 1, "{findings:?}");
         assert!(
-            findings[0].note.contains("ask-due holds no time"),
-            "{}",
+            findings[0]
+                .note
+                .starts_with("~/.local/state/bx/update/ask-due holds no time"),
+            "named under the home: {}",
             findings[0].note
         );
 
@@ -335,7 +377,8 @@ mod tests {
                 Some(&pinned),
                 &Lock::default(),
                 home.path(),
-                &state
+                &state,
+                home.path()
             )
             .is_empty()
         );
@@ -366,21 +409,27 @@ mod tests {
         let stopped = format!("{STOPPED}the config repo has diverged from its upstream");
         std::fs::write(stamps.last_check(), format!("{stopped}\n")).unwrap();
         let (followed, lock) = locked_follow(home.path());
-        let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+        let findings = check(
+            &followed,
+            Some(&followed),
+            &lock,
+            home.path(),
+            &state,
+            home.path(),
+        );
         assert_eq!(
             findings,
             [Finding {
                 subject: "bx update".to_string(),
                 origin: None,
                 note: format!(
-                    "{} says `{stopped}`; `bx update` tries again, and removes it once it \
-                     finishes",
-                    stamps.last_check().display()
+                    "~/.local/state/bx/update/last-check says `{stopped}`; `bx update` tries \
+                     again, and removes it once it finishes"
                 ),
             }]
         );
         assert!(
-            notes(&followed, &state).is_empty(),
+            notes(&followed, &state, home.path()).is_empty(),
             "a stopped line is no note"
         );
         let report = super::super::Report {
@@ -397,6 +446,7 @@ mod tests {
             &Lock::default(),
             home.path(),
             &state,
+            home.path(),
         );
         assert!(findings.is_empty(), "{findings:?}");
     }
@@ -408,10 +458,17 @@ mod tests {
         let stamps = Stamps::of(&state);
         let (followed, lock) = locked_follow(home.path());
         assert!(!stamps.last_check().exists());
-        let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+        let findings = check(
+            &followed,
+            Some(&followed),
+            &lock,
+            home.path(),
+            &state,
+            home.path(),
+        );
         assert!(findings.is_empty(), "{findings:?}");
         assert!(
-            notes(&followed, &state).is_empty(),
+            notes(&followed, &state, home.path()).is_empty(),
             "no last-check, no note"
         );
 
@@ -426,15 +483,22 @@ mod tests {
             " bx update stopped: indented\n",
         ] {
             std::fs::write(stamps.last_check(), said).unwrap();
-            let findings = check(&followed, Some(&followed), &lock, home.path(), &state);
+            let findings = check(
+                &followed,
+                Some(&followed),
+                &lock,
+                home.path(),
+                &state,
+                home.path(),
+            );
             assert!(findings.is_empty(), "{said:?}: {findings:?}");
             let line = said.trim_end_matches('\n');
             assert_eq!(
-                notes(&followed, &state),
+                notes(&followed, &state, home.path()),
                 [Finding {
                     subject: "bx update".to_string(),
                     origin: None,
-                    note: format!("{} says `{line}`", stamps.last_check().display()),
+                    note: format!("~/.local/state/bx/update/last-check says `{line}`"),
                 }],
                 "{said:?}"
             );
@@ -447,24 +511,23 @@ mod tests {
             format!("judged here\n\n{stopped}\n  \n~/a: up to date with main\n"),
         )
         .unwrap();
-        let said: Vec<String> = notes(&followed, &state)
+        let said: Vec<String> = notes(&followed, &state, home.path())
             .into_iter()
             .map(|note| note.note)
             .collect();
-        let last = stamps.last_check();
         assert_eq!(
             said,
             [
-                format!("{} says `judged here`", last.display()),
-                format!("{} says `~/a: up to date with main`", last.display()),
+                "~/.local/state/bx/update/last-check says `judged here`",
+                "~/.local/state/bx/update/last-check says `~/a: up to date with main`",
             ]
         );
         std::fs::write(stamps.last_check(), "").unwrap();
-        assert!(notes(&followed, &state).is_empty());
+        assert!(notes(&followed, &state, home.path()).is_empty());
 
         // Nothing follows a branch: nothing asks about updates, so nothing.
         std::fs::write(stamps.last_check(), "~/a: up to date with main\n").unwrap();
         let pinned = [external(home.path(), "~/a", Pin::Rev(REV.to_string()))];
-        assert!(notes(&pinned, &state).is_empty());
+        assert!(notes(&pinned, &state, home.path()).is_empty());
     }
 }

@@ -990,11 +990,14 @@ fn an_approval_that_fails_stops_the_run() {
     let inputs = inputs(&home, &inline("~/.a", "x\\n"));
 
     let error = run(&inputs, Mode::Apply, &mut |_| {
-        Err(Error::RepoMissing(PathBuf::from("/refused")))
+        Err(Error::RepoMissing(
+            "/refused".to_string(),
+            super::Absence::Nothing,
+        ))
     })
     .expect_err("the approval's error");
 
-    assert!(matches!(error, Error::RepoMissing(_)), "{error:?}");
+    assert!(matches!(error, Error::RepoMissing(..)), "{error:?}");
     assert!(!home.child(".a").exists());
 }
 

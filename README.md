@@ -145,7 +145,8 @@ module, edited by hand, and a secret is encrypted or re-encrypted to them with
 `local.toml`, `~/.ssh/id_ed25519` when it names none: an age identity file, as
 `age-keygen` or `age -p` writes it, or any ssh private key age reads. A
 passphrase-protected one is never asked for by `plan` or `apply`; only
-`bx secret list` asks, and only at a terminal.
+`bx secret list` asks, and only at a terminal, once per secret; Esc at the
+prompt lists the rest as locked without asking again.
 
 ### Reading a plan
 
@@ -258,7 +259,8 @@ or a login banner without anyone parsing its output:
 | `130` | you left a question with Esc or Ctrl-C; what was on offer was not done |
 
 The other commands use the same codes. `bx add` exits `2` when it refused a
-path or a merge it wrote conflicts, `bx rm` when a conflict left something as it was, and
+path or a merge it wrote conflicts, `bx rm` when a conflict left something as
+it was, `bx doctor` when it has a finding, no config repo at all among them, and
 `bx self-upgrade --check` when a newer release exists. `bx sync` exits `2`
 when it was declined and did not carry the `<` rows it announced, and
 `bx update` and `bx upgrade` when declined, even when all they offered was a

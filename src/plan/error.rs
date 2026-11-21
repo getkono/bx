@@ -1,17 +1,19 @@
 //! Everything that can stop a run, and how the errors of the modules a run
 //! calls are folded into it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::config::{self, Origin};
-use crate::{journal, recover, state};
+use crate::{journal, paths, recover, state};
 
 /// Everything that can stop a run.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// There is no config repo.
-    #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
-    RepoMissing(PathBuf),
+    /// There is no config repo at the path it holds, spelled `~/…` when it is
+    /// under the home, as every other message spells a path, missing in the
+    /// way the [`Absence`] says.
+    #[error("no bx config repo at {}{}", .0, .1.advice())]
+    RepoMissing(String, Absence),
     /// The configuration could not be loaded, merged or resolved.
     #[error(transparent)]
     Config(config::Error),
@@ -72,10 +74,82 @@ pub enum Error {
     Output(#[source] std::io::Error),
 }
 
+/// How a config repo that loading found missing is missing.
+///
+/// Loading finds it missing when nothing is at the path, when something that
+/// is not a directory is, and when the path lies beneath a non-directory.
+/// Only the first is one `bx init` mends as it stands, so each message says
+/// which it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absence {
+    /// Nothing is at the path.
+    Nothing,
+    /// Something that is not a directory is at the path.
+    NotADirectory,
+    /// The path lies beneath something that is not a directory.
+    BeneathNonDirectory,
+}
+
+impl Absence {
+    /// How `repo`, which loading found missing, is missing: one more look at
+    /// the path, following a link as loading does.
+    #[must_use]
+    pub fn of(repo: &Path) -> Self {
+        match std::fs::metadata(repo) {
+            Ok(_) => Self::NotADirectory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                Self::BeneathNonDirectory
+            }
+            Err(_) => Self::Nothing,
+        }
+    }
+
+    /// What follows the path in a missing repo's message. The advice names
+    /// only what bx itself does, and no command that would move or delete the
+    /// user's file.
+    #[must_use]
+    pub fn advice(self) -> &'static str {
+        match self {
+            Self::Nothing => "; run `bx init` to create one",
+            Self::NotADirectory => {
+                ": something that is not a directory is there; move it aside, and `bx init` \
+                 creates one"
+            }
+            Self::BeneathNonDirectory => {
+                ": it lies beneath a path that is not a directory; `bx init` creates one once \
+                 that path is a directory"
+            }
+        }
+    }
+}
+
+impl Error {
+    /// [`Error::RepoMissing`] for `repo`, spelled under `home`.
+    #[must_use]
+    pub fn repo_missing(repo: &Path, home: &Path) -> Self {
+        Self::RepoMissing(paths::to_portable(repo, home), Absence::of(repo))
+    }
+
+    /// `error`, the configuration's, with a missing config repo spelled under
+    /// `home`: what loading the layers returns goes through here, as only
+    /// it can find the repo missing.
+    #[must_use]
+    pub fn from_config(error: config::Error, home: &Path) -> Self {
+        match error {
+            config::Error::RepoMissing(repo) => Self::repo_missing(&repo, home),
+            other => Self::Config(other),
+        }
+    }
+}
+
 impl From<config::Error> for Error {
     fn from(error: config::Error) -> Self {
         match error {
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo),
+            // Without the home there is no `~/…` spelling to give it;
+            // [`Error::from_config`] is what loading the layers uses.
+            config::Error::RepoMissing(repo) => {
+                Self::RepoMissing(repo.display().to_string(), Absence::of(&repo))
+            }
             other => Self::Config(other),
         }
     }

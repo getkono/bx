@@ -48,6 +48,9 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
         upgrade::Request { check, force },
         crate::VERSION,
         &upgrade::install_dir()?,
+        // No usable home is no reason to refuse an upgrade: the directory is
+        // then named as it is.
+        paths::home().ok().as_deref(),
         upgrade::INSTALLER_URL,
         &std::env::var_os("PATH").unwrap_or_default(),
         out,
@@ -60,9 +63,10 @@ pub fn self_upgrade(check: bool, force: bool, out: &mut dyn Write) -> Result<Exi
 ///
 /// # Errors
 ///
-/// Whatever loading the configuration returns, and [`Error::Output`] when
-/// `out` cannot be written. A check that cannot ask what it needs — systemd's
-/// user session unreachable — is a finding, not an error.
+/// Whatever loading the configuration returns, but for a missing config
+/// repo, and [`Error::Output`] when `out` cannot be written. No config repo,
+/// like a check that cannot ask what it needs — systemd's user session
+/// unreachable — is a finding, not an error.
 pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     doctor_with(
         env,
@@ -71,6 +75,26 @@ pub fn doctor(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
         &systemd::Systemctl::default(),
         &Git::new(env),
     )
+}
+
+/// What doctor says of a config repo that loading found missing in the way
+/// `absence` says: only [`plan::Absence::Nothing`] is one `bx init` mends as
+/// it stands, so each is said as it is.
+fn no_repo_note(absence: plan::Absence) -> &'static str {
+    match absence {
+        plan::Absence::NotADirectory => {
+            "is not a directory, so there is no configuration to check; move it aside, and \
+             `bx init` creates the config repo"
+        }
+        plan::Absence::BeneathNonDirectory => {
+            "lies beneath a path that is not a directory, so there is no configuration to \
+             check; `bx init` creates the config repo once that path is a directory"
+        }
+        plan::Absence::Nothing => {
+            "does not exist, so there is no configuration to check; `bx init` creates the \
+             config repo"
+        }
+    }
 }
 
 /// [`doctor`], looking for declared tools along `path`, asking systemd
@@ -82,7 +106,26 @@ fn doctor_with(
     systemd: &dyn systemd::Query,
     git: &Git,
 ) -> Result<Exit, Error> {
-    let inputs = Inputs::load(env)?;
+    let inputs = match Inputs::load(env) {
+        Ok(inputs) => inputs,
+        // No config repo is the first thing a human should look at, not a
+        // failure to look: said as a finding, and nothing else is checked,
+        // as every other check reads the configuration.
+        Err(Error::RepoMissing(repo, absence)) => {
+            let report = doctor::Report {
+                findings: vec![doctor::Finding {
+                    subject: repo,
+                    origin: None,
+                    note: no_repo_note(absence).to_string(),
+                }],
+                notes: Vec::new(),
+            };
+            out.write_all(doctor::render(&report, &env.home).as_bytes())
+                .map_err(Error::Output)?;
+            return Ok(doctor::exit(&report));
+        }
+        Err(other) => return Err(other),
+    };
     let unit_dir = paths::systemd_user_dir_in(&env.home, env.xdg_config_home.as_deref());
     let report = doctor::run(
         &inputs,
@@ -1006,7 +1049,11 @@ fn init_with(
     let mut adopted = 0_usize;
     if interactive {
         let deferred = init::adopt_offered(env, ask, &mut |row| {
-            adopted += 1;
+            // Only a row that changed what bx manages is something this run
+            // did: one passed over, refused or already managed is not.
+            if matches!(row, Adoption::Adopt { .. } | Adoption::Own { .. }) {
+                adopted += 1;
+            }
             say(out, &adoption_row(row, &env.home))
         });
         match deferred {
@@ -1136,8 +1183,9 @@ fn recovered(report: &Report, outcome: &crate::recover::Outcome) -> String {
 /// The one command that may ask for an identity's passphrase, and only when
 /// standard input is a terminal; without one a locked identity is reported as
 /// locked. Each secret is checked on its own, so a locked identity is asked
-/// for once per secret: nothing keeps a passphrase between them. Nothing is
-/// written.
+/// for once per secret: nothing keeps a passphrase between them. A prompt
+/// left with Esc or Ctrl-C asks nothing more: the rest of the secrets locked
+/// by that identity are listed as locked. Nothing is written.
 ///
 /// Exits [`Exit::Converged`] when every secret can be decrypted, and
 /// [`Exit::Pending`] when one cannot.
@@ -1150,21 +1198,37 @@ pub fn secret_list(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
     secret_list_with(env, out, &mut ask_passphrase)
 }
 
-/// Ask on the terminal for an identity's passphrase, masked. A prompt that
-/// fails or is cancelled is no passphrase, and the identity stays locked.
-fn ask_passphrase(shown: &str) -> Option<Passphrase> {
-    inquire::Password::new(&format!("Passphrase for {shown}:"))
+/// What a passphrase prompt answered.
+enum Asked {
+    /// The passphrase typed.
+    Given(Passphrase),
+    /// None: the prompt failed. The identity stays locked, and the next
+    /// secret asks again.
+    Nothing,
+    /// The prompt was left with Esc or Ctrl-C: ask about this identity no
+    /// more.
+    Left,
+}
+
+/// Ask on the terminal for an identity's passphrase, masked.
+fn ask_passphrase(shown: &str) -> Asked {
+    use inquire::InquireError::{OperationCanceled, OperationInterrupted};
+
+    match inquire::Password::new(&format!("Passphrase for {shown}:"))
         .without_confirmation()
         .prompt()
-        .ok()
-        .map(Passphrase::from)
+    {
+        Ok(passphrase) => Asked::Given(Passphrase::from(passphrase)),
+        Err(OperationCanceled | OperationInterrupted) => Asked::Left,
+        Err(_) => Asked::Nothing,
+    }
 }
 
 /// [`secret_list`], with the passphrase asked through `ask`.
 fn secret_list_with(
     env: &Env,
     out: &mut dyn Write,
-    ask: &mut dyn FnMut(&str) -> Option<Passphrase>,
+    ask: &mut dyn FnMut(&str) -> Asked,
 ) -> Result<Exit, Error> {
     let inputs = Inputs::load(env)?;
     let secrets = &inputs.resolved().secrets;
@@ -1173,6 +1237,9 @@ fn secret_list_with(
 
     let mut text = String::new();
     let mut all = true;
+    // Nothing asks without a terminal. One identity decrypts every secret,
+    // so a prompt left once is left for all that follow.
+    let mut ask_no_more = !env.stdin_tty;
     for (declared, resolution) in inputs.declared_targets() {
         let Body::Secret(written) = &declared.body else {
             continue;
@@ -1190,8 +1257,17 @@ fn secret_list_with(
                 let status = plan::read_repo_file(target, inputs.repo(), rel)
                     .map_err(|error| format!("unreadable: {error}"))
                     .and_then(|bytes| {
-                        let unlock = if env.stdin_tty {
-                            Unlock::Ask(&mut *ask)
+                        let asks = !ask_no_more;
+                        let mut asking = |shown: &str| match ask(shown) {
+                            Asked::Given(passphrase) => Some(passphrase),
+                            Asked::Nothing => None,
+                            Asked::Left => {
+                                ask_no_more = true;
+                                None
+                            }
+                        };
+                        let unlock = if asks {
+                            Unlock::Ask(&mut asking)
                         } else {
                             Unlock::Never
                         };
@@ -1247,12 +1323,11 @@ pub fn not_built(command: &str, err: &mut dyn Write) -> Result<Exit, Error> {
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, and whatever locating, loading,
-/// asking or adopting returns.
+/// Whatever locating, loading, asking or adopting returns.
 pub fn add(
     env: &Env,
     cwd: &Path,
-    path: Option<&str>,
+    path: &str,
     yes: bool,
     out: &mut dyn Write,
 ) -> Result<Exit, adopt::Error> {
@@ -1279,12 +1354,11 @@ fn confirm_save() -> Result<bool, adopt::Error> {
 pub(crate) fn add_with(
     env: &Env,
     cwd: &Path,
-    path: Option<&str>,
+    path: &str,
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
 ) -> Result<Exit, adopt::Error> {
-    let path = path.ok_or(adopt::Error::NoPath("add"))?;
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
     let home = ctx.home().to_path_buf();
@@ -1426,14 +1500,14 @@ fn adoption_row(row: &Adoption, home: &Path) -> String {
 ///
 /// # Errors
 ///
-/// [`adopt::Error::NoPath`] without a path, [`adopt::Error::NeedsConfirmation`]
-/// with something to change, no `yes` and no terminal, and whatever locating,
-/// loading, asking or restoring returns. [`adopt::Error::Undeclare`] comes
+/// [`adopt::Error::NeedsConfirmation`] with something to change, no `yes`
+/// and no terminal, and whatever locating, loading, asking or restoring
+/// returns. [`adopt::Error::Undeclare`] comes
 /// after the rows it holds are written.
 pub fn rm(
     env: &Env,
     cwd: &Path,
-    path: Option<&str>,
+    path: &str,
     yes: bool,
     out: &mut dyn Write,
 ) -> Result<Exit, adopt::Error> {
@@ -1461,12 +1535,11 @@ fn confirm_rm() -> Result<bool, adopt::Error> {
 fn rm_with(
     env: &Env,
     cwd: &Path,
-    path: Option<&str>,
+    path: &str,
     yes: bool,
     out: &mut dyn Write,
     ask: &mut dyn FnMut() -> Result<bool, adopt::Error>,
 ) -> Result<Exit, adopt::Error> {
-    let path = path.ok_or(adopt::Error::NoPath("rm"))?;
     let target = adopt::locate(path, cwd, &env.home)?;
     let ctx = adopt::Context::load(env)?;
     let home = ctx.home().to_path_buf();

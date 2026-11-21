@@ -33,14 +33,16 @@ enum Command {
     /// Begin managing a config file, or a directory of them, or save an
     /// edit of one bx manages into the repo
     Add {
-        target: Option<String>,
+        /// The file or directory, e.g. ~/.gitconfig
+        path: String,
         /// Save an edit into the repo without asking for confirmation
         #[arg(long)]
         yes: bool,
     },
     /// Stop managing it, and restore the original
     Rm {
-        target: Option<String>,
+        /// The file or directory bx manages
+        path: String,
         /// Hand back without asking for confirmation
         #[arg(long)]
         yes: bool,
@@ -197,20 +199,12 @@ fn main() -> Result<()> {
         Some(Command::Secret {
             action: SecretAction::List,
         }) => bx::command::secret_list(&env, &mut out)?,
-        Some(Command::Add { target, yes }) => bx::command::add(
-            &env,
-            &std::env::current_dir()?,
-            target.as_deref(),
-            yes,
-            &mut out,
-        )?,
-        Some(Command::Rm { target, yes }) => bx::command::rm(
-            &env,
-            &std::env::current_dir()?,
-            target.as_deref(),
-            yes,
-            &mut out,
-        )?,
+        Some(Command::Add { path, yes }) => {
+            bx::command::add(&env, &std::env::current_dir()?, &path, yes, &mut out)?
+        }
+        Some(Command::Rm { path, yes }) => {
+            bx::command::rm(&env, &std::env::current_dir()?, &path, yes, &mut out)?
+        }
         // Every command is named: one without a body is refused, not panicked
         // on, and a new one without an arm does not compile.
         Some(Command::ShellInit { .. }) => {

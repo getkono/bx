@@ -216,8 +216,8 @@ fn a_save_nobody_confirmed_writes_nothing_and_says_how_to_confirm() {
     std::fs::write(rc(&home), b"mine\n").expect("edit");
 
     let mut out = Vec::new();
-    let exit = crate::command::add(&env(home.path()), home.path(), Some(".rc"), false, &mut out)
-        .expect("add");
+    let exit =
+        crate::command::add(&env(home.path()), home.path(), ".rc", false, &mut out).expect("add");
     let text = String::from_utf8(out).expect("UTF-8");
     assert_eq!(exit, Exit::Pending, "{text}");
     assert!(text.contains("+mine"), "the diff is shown first: {text}");
@@ -225,8 +225,8 @@ fn a_save_nobody_confirmed_writes_nothing_and_says_how_to_confirm() {
     assert_eq!(repo_body(&home), b"one\n");
 
     let mut out = Vec::new();
-    let exit = crate::command::add(&env(home.path()), home.path(), Some(".rc"), true, &mut out)
-        .expect("add");
+    let exit =
+        crate::command::add(&env(home.path()), home.path(), ".rc", true, &mut out).expect("add");
     let text = String::from_utf8(out).expect("UTF-8");
     assert_eq!(exit, Exit::Converged, "{text}");
     assert!(
@@ -247,7 +247,7 @@ fn at_a_terminal_the_save_is_asked_about_and_a_no_writes_nothing() {
     for (answer, body) in [(false, &b"one\n"[..]), (true, b"mine\n")] {
         let mut out = Vec::new();
         let mut asked = 0;
-        crate::command::add_with(&tty, home.path(), Some(".rc"), false, &mut out, &mut || {
+        crate::command::add_with(&tty, home.path(), ".rc", false, &mut out, &mut || {
             asked += 1;
             Ok(answer)
         })
@@ -258,11 +258,10 @@ fn at_a_terminal_the_save_is_asked_about_and_a_no_writes_nothing() {
 
     std::fs::write(rc(&home), b"again\n").expect("edit");
     let mut out = Vec::new();
-    let exit =
-        crate::command::add_with(&tty, home.path(), Some(".rc"), false, &mut out, &mut || {
-            Err(Error::Canceled)
-        })
-        .expect("add");
+    let exit = crate::command::add_with(&tty, home.path(), ".rc", false, &mut out, &mut || {
+        Err(Error::Canceled)
+    })
+    .expect("add");
     assert_eq!(exit, Exit::Canceled);
     assert_eq!(repo_body(&home), b"mine\n");
 }
@@ -301,8 +300,8 @@ fn a_conflicted_merge_marks_the_machine_file_only_and_stays_an_edit() {
     std::fs::write(home.child(".config/bx/files/rc"), b"one\ntheirs\nthree\n").expect("there");
 
     let mut out = Vec::new();
-    let exit = crate::command::add(&env(home.path()), home.path(), Some(".rc"), true, &mut out)
-        .expect("add");
+    let exit =
+        crate::command::add(&env(home.path()), home.path(), ".rc", true, &mut out).expect("add");
     let text = String::from_utf8(out).expect("UTF-8");
     assert_eq!(exit, Exit::Pending, "{text}");
     assert!(
@@ -340,7 +339,7 @@ fn rm_after_a_conflicted_merge_leaves_the_marked_file_as_a_conflict() {
     std::fs::write(rc(&home), b"one\nmine\nthree\n").expect("edit here");
     std::fs::write(home.child(".config/bx/files/rc"), b"one\ntheirs\nthree\n").expect("there");
     let mut out = Vec::new();
-    crate::command::add(&env(home.path()), home.path(), Some(".rc"), true, &mut out).expect("add");
+    crate::command::add(&env(home.path()), home.path(), ".rc", true, &mut out).expect("add");
     let state = StateDir::resolve(home.path());
     assert!(
         !state.journal().exists(),

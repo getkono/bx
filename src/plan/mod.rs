@@ -44,7 +44,7 @@ pub(crate) use decide::read_repo_file;
 pub use diff::DiffKind;
 pub(crate) use diff::unified;
 pub use diff::{Diff, Palette, View, render, render_row};
-pub use error::Error;
+pub use error::{Absence, Error};
 pub use inputs::Inputs;
 
 use crate::adopt::save::Save;

@@ -85,6 +85,38 @@ fn a_background_check_looks_at_auto_externals_only_and_never_twice_at_once() {
     );
 }
 
+#[test]
+fn a_snooze_names_the_interval_that_applies_and_promises_no_question_nothing_asks() {
+    // Every followed external checks on its own, each day: no shell asks,
+    // so the snooze promises no question in the global interval.
+    let home = guarded_home();
+    upstream(&home, &["skills/a/SKILL.md"]);
+    cloned(
+        &home,
+        &layer().replace(
+            "branch = \"master\"\n",
+            "branch = \"master\"\ncheck = \"auto\"\ninterval = \"1d\"\n",
+        ),
+    );
+    let mut out = Vec::new();
+    update::snooze(&env(home.path()), &mut out).expect("snooze");
+    assert_eq!(
+        text(&out),
+        "bx will check for updates on its own again in 1d; run `bx update` any time before.\n"
+    );
+
+    // Nothing follows a branch: nothing asks or checks at all.
+    let home = guarded_home();
+    seed(home.path(), "");
+    let mut out = Vec::new();
+    update::snooze(&env(home.path()), &mut out).expect("snooze");
+    assert_eq!(
+        text(&out),
+        "No external follows a branch, so nothing asks about updates; run `bx update` any \
+         time.\n"
+    );
+}
+
 /// Whether a shell's prompt would offer what `stamps` hold now.
 fn offers(stamps: &Stamps) -> bool {
     Stamps::offers(

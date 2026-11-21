@@ -85,6 +85,7 @@ use crate::env_guard::{self, Reason, RootSet};
 use crate::fs::{self, Kind, Mode};
 use crate::journal;
 use crate::paths::{self, Portable};
+use crate::plan::Absence;
 use crate::recover;
 use crate::restore::{self, Restored};
 use crate::shell::activation::{self, Host as _};
@@ -101,12 +102,6 @@ const FILES_DIR: &str = "files";
 /// Everything that stops `add` or `rm`.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// No path was named.
-    #[error(
-        "name the file or directory to {0}, e.g. `bx {0} ~/.gitconfig`; `bx init` is what \
-         offers the config already on this machine"
-    )]
-    NoPath(&'static str),
     /// The path could not be made portable.
     #[error(transparent)]
     Path(#[from] paths::Error),
@@ -119,9 +114,10 @@ pub enum Error {
     /// There is nothing at the path.
     #[error("there is nothing at {0} to add")]
     Missing(String),
-    /// There is no config repo.
-    #[error("no bx config repo at {}; run `bx init` to create one", .0.display())]
-    RepoMissing(PathBuf),
+    /// There is no config repo at the path it holds, spelled `~/…` when it is
+    /// under the home, missing in the way the [`Absence`] says.
+    #[error("no bx config repo at {}{}", .0, .1.advice())]
+    RepoMissing(String, Absence),
     /// The configuration could not be loaded, merged or resolved.
     #[error(transparent)]
     Config(config::Error),
@@ -206,7 +202,11 @@ pub enum Error {
 impl From<config::Error> for Error {
     fn from(error: config::Error) -> Self {
         match error {
-            config::Error::RepoMissing(repo) => Self::RepoMissing(repo),
+            // Without the home there is no `~/…` spelling to give it;
+            // [`Context::load`] spells it under the home itself.
+            config::Error::RepoMissing(repo) => {
+                Self::RepoMissing(repo.display().to_string(), Absence::of(&repo))
+            }
             other => Self::Config(other),
         }
     }
@@ -332,7 +332,14 @@ impl Context {
             machine: host.machine(),
             present: &present,
         };
-        let layers = layers::load_gated(&repo, state.root(), &home, &facts)?.layers;
+        let layers = layers::load_gated(&repo, state.root(), &home, &facts)
+            .map_err(|error| match error {
+                config::Error::RepoMissing(repo) => {
+                    Error::RepoMissing(paths::to_portable(&repo, &home), Absence::of(&repo))
+                }
+                other => other.into(),
+            })?
+            .layers;
         let merged = merge::merge(&layers, &home)?;
         let resolved = resolve::resolve(&merged, &home, crate::shell::placement::place)?;
         let roots = RootSet::from_values(&resolved.values)

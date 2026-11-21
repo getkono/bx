@@ -49,6 +49,8 @@
 //! committed here too: the save records each repo file it wrote, and what it
 //! left there, in `saved.mpk` in the state directory (`remember_saved`),
 //! and [`commit_carried`] commits each one still holding exactly that.
+//! [`uncommitted`] asks the same question read-only, for `bx status`: which
+//! of those files no commit has taken yet.
 //!
 //! # State never leaves the machine
 //!
@@ -455,41 +457,12 @@ pub(crate) fn remember_saved(
 /// git refuses a step, as a failing hook makes it.
 pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error> {
     let state = StateDir::resolve_in(&env.home, env.xdg_state_home.as_deref());
-    let ledger = LedgerView::read(&state, &env.home)
-        .map_err(plan::Error::from)?
-        .value;
-    let root = paths::normalize(repo);
-    let mut written = BTreeSet::new();
-    let mut removed = BTreeSet::new();
-    for (path, entry) in ledger
-        .iter()
-        .filter(|(_, entry)| entry.mechanism == Mechanism::Own)
-    {
-        let dest = paths::normalize(&path.render(&env.home));
-        let Some(rel) = dest.strip_prefix(&root).ok().and_then(Path::to_str) else {
-            continue;
-        };
-        if rel.is_empty() {
-            continue;
-        }
-        if entry.written == removed_written() {
-            let gone = std::fs::symlink_metadata(&dest)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-            if gone {
-                removed.insert(rel.to_string());
-            }
-        } else if std::fs::read(&dest).is_ok_and(|bytes| ContentHash::of(&bytes) == entry.written) {
-            written.insert(rel.to_string());
-        }
-    }
-    let record = saved(&state);
-    let mut saves = BTreeSet::new();
-    for (rel, digest) in &record {
-        if std::fs::read(repo.join(rel)).is_ok_and(|bytes| ContentHash::of(&bytes) == *digest) {
-            written.insert(rel.clone());
-            saves.insert(rel.clone());
-        }
-    }
+    let Carried {
+        written,
+        removed,
+        saves,
+        record,
+    } = carried(&state, &env.home, repo)?;
     let committed = commit_paths(git, repo, &written, &removed, &saves)?;
     // Every save looked at is forgotten: committed, already in `HEAD`, or
     // edited since, which makes it the user's. Under the lock `bx add`
@@ -508,6 +481,150 @@ pub fn commit_carried(env: &Env, git: &Git, repo: &Path) -> Result<usize, Error>
         }
     }
     Ok(committed)
+}
+
+/// The repo files bx wrote that [`commit_carried`] would commit, each by
+/// its path relative to the repo, whether or not git already holds them.
+#[derive(Debug, Default)]
+struct Carried {
+    /// Each copy `sync` wrote and each file `bx add` saved, still holding
+    /// exactly the bytes bx left.
+    written: BTreeSet<String>,
+    /// Each copy `sync` removed, with nothing at its path since.
+    removed: BTreeSet<String>,
+    /// The paths in `written` that are saves.
+    saves: BTreeSet<String>,
+    /// The record of saves as it was read.
+    record: Saved,
+}
+
+/// What [`commit_carried`] would commit in `repo`, from the ledger and the
+/// record of saves in `state`, its paths spelled against `home`: a copy is
+/// one the ledger records as a whole file bx owns inside the repo, and a
+/// save one `remember_saved` recorded, each only while the file holds
+/// exactly what bx left. Reads, and writes nothing.
+fn carried(state: &StateDir, home: &Path, repo: &Path) -> Result<Carried, Error> {
+    let ledger = LedgerView::read(state, home)
+        .map_err(plan::Error::from)?
+        .value;
+    let root = paths::normalize(repo);
+    let mut carried = Carried::default();
+    for (path, entry) in ledger
+        .iter()
+        .filter(|(_, entry)| entry.mechanism == Mechanism::Own)
+    {
+        let dest = paths::normalize(&path.render(home));
+        let Some(rel) = dest.strip_prefix(&root).ok().and_then(Path::to_str) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        if entry.written == removed_written() {
+            let gone = std::fs::symlink_metadata(&dest)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            if gone {
+                carried.removed.insert(rel.to_string());
+            }
+        } else if std::fs::read(&dest).is_ok_and(|bytes| ContentHash::of(&bytes) == entry.written) {
+            carried.written.insert(rel.to_string());
+        }
+    }
+    carried.record = saved(state);
+    for (rel, digest) in &carried.record {
+        if std::fs::read(repo.join(rel)).is_ok_and(|bytes| ContentHash::of(&bytes) == *digest) {
+            carried.written.insert(rel.clone());
+            carried.saves.insert(rel.clone());
+        }
+    }
+    Ok(carried)
+}
+
+/// What one repo file bx wrote and git has not committed holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carry {
+    /// A tracked target's copy `sync` carried into the repo.
+    Copy,
+    /// The removal of a tracked target's copy `sync` carried.
+    Removal,
+    /// An edit `bx add`, or `apply`'s question, saved into the repo.
+    Save,
+}
+
+/// One repo file bx wrote that the next `bx sync` commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Uncommitted {
+    /// The file, absolute: the repo joined with its path there.
+    pub path: PathBuf,
+    /// What it holds.
+    pub carry: Carry,
+}
+
+/// Every repo file [`commit_carried`] would commit in `repo` that git has
+/// not committed yet, in byte order of its path in the repo: a copy an
+/// interrupted `sync` carried, or an edit `bx add` saved, that no `sync`
+/// has committed since.
+///
+/// Read-only, as `bx status` needs it: the index is not staged as
+/// [`commit_carried`] stages it, but asked with `git status`, run with
+/// `GIT_OPTIONAL_LOCKS=0` so it does not refresh the index either; and the
+/// record of saves is read, never forgotten. A repo that is not a git
+/// repository holds nothing uncommitted, and nothing is asked.
+///
+/// # Errors
+///
+/// [`Error::Plan`] when the ledger cannot be read, and [`Error::Git`] when
+/// git cannot say.
+pub fn uncommitted(
+    state: &StateDir,
+    home: &Path,
+    git: &Git,
+    repo: &Path,
+) -> Result<Vec<Uncommitted>, Error> {
+    let carried = carried(state, home, repo)?;
+    if (carried.written.is_empty() && carried.removed.is_empty())
+        || std::fs::symlink_metadata(repo.join(".git")).is_err()
+    {
+        return Ok(Vec::new());
+    }
+    let mut args = vec![
+        "status",
+        "--porcelain",
+        "-z",
+        "--no-renames",
+        "--untracked-files=all",
+        "--",
+    ];
+    args.extend(carried.written.iter().map(String::as_str));
+    args.extend(carried.removed.iter().map(String::as_str));
+    let git = git.clone().with_env("GIT_OPTIONAL_LOCKS", "0");
+    // `XY PATH`, each entry ended by a NUL, and with `--no-renames` never a
+    // second path. Untrimmed, so a path that begins with whitespace keeps it.
+    let changed: BTreeSet<String> = git
+        .query_whole(repo, &args)?
+        .split('\0')
+        .filter_map(|entry| entry.get(3..))
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect();
+    Ok(changed
+        .into_iter()
+        .filter_map(|rel| {
+            let carry = if carried.saves.contains(&rel) {
+                Carry::Save
+            } else if carried.written.contains(&rel) {
+                Carry::Copy
+            } else if carried.removed.contains(&rel) {
+                Carry::Removal
+            } else {
+                return None;
+            };
+            Some(Uncommitted {
+                path: repo.join(&rel),
+                carry,
+            })
+        })
+        .collect())
 }
 
 /// Commit `written` and the removals in `removed`, the paths in `saves`
@@ -1498,6 +1615,94 @@ mod tests {
         let again = commit_carried(&env(home.path()), &git(home.path()), &repo).expect("again");
         assert_eq!(again, 0);
         assert_eq!(rev(home.path(), &repo, "HEAD"), head);
+    }
+
+    /// What [`uncommitted`] finds in `repo`, by repo-relative path.
+    fn uncommitted_in(home: &crate::testing::GuardedHome, repo: &Path) -> Vec<(String, Carry)> {
+        uncommitted(
+            &StateDir::resolve(home.path()),
+            home.path(),
+            &git(home.path()),
+            repo,
+        )
+        .expect("asked")
+        .into_iter()
+        .map(|found| {
+            let rel = found.path.strip_prefix(repo).expect("in the repo");
+            (rel.display().to_string(), found.carry)
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_carried_copy_is_uncommitted_until_committed_and_asking_stages_nothing() {
+        let home = guarded_home();
+        let repo = cloned(
+            &home,
+            "[[target]]\npath = \"~/.lock\"\nfile = \"lock\"\ndirection = \"track\"\n",
+        );
+        std::fs::write(repo.join("lock"), "a\n").expect("the repo copy");
+        commit_all(home.path(), &repo, "track");
+        home.write(".lock", "a\n");
+        let sync = |what: &str| {
+            let inputs = crate::plan::Inputs::load(&env(home.path())).expect("inputs");
+            crate::plan::run(&inputs, crate::plan::Mode::Sync, &mut |_| Ok(true)).expect(what);
+        };
+        sync("the agreeing run");
+        assert_eq!(uncommitted_in(&home, &repo), [], "agreed and committed");
+        home.write(".lock", "b\n");
+        sync("the carrying run");
+
+        assert_eq!(
+            uncommitted_in(&home, &repo),
+            [("lock".to_string(), Carry::Copy)]
+        );
+        assert_eq!(
+            run(home.path(), &repo, &["status", "--porcelain"]),
+            "M lock",
+            "nothing staged by asking"
+        );
+        commit_carried(&env(home.path()), &git(home.path()), &repo).expect("committed");
+        assert_eq!(uncommitted_in(&home, &repo), [], "committed");
+    }
+
+    #[test]
+    fn a_carried_deletion_is_an_uncommitted_removal() {
+        let home = guarded_home();
+        let repo = carried_deletion(&home);
+        assert_eq!(
+            uncommitted_in(&home, &repo),
+            [("lock".to_string(), Carry::Removal)]
+        );
+    }
+
+    #[test]
+    fn a_saved_edit_is_uncommitted_and_asking_forgets_no_save() {
+        let home = guarded_home();
+        let repo = saved_by_add(&home);
+        assert_eq!(
+            uncommitted_in(&home, &repo),
+            [("files/rc".to_string(), Carry::Save)]
+        );
+        let state = StateDir::resolve(home.path());
+        assert_eq!(saved(&state).len(), 1, "still recorded");
+    }
+
+    #[test]
+    fn a_repo_that_is_not_a_git_repository_holds_nothing_uncommitted() {
+        let home = guarded_home();
+        let repo = saved_by_add(&home);
+        std::fs::remove_dir_all(repo.join(".git")).expect("no longer git");
+        // A git that would fail every question: none is asked.
+        let refusing = git(home.path()).with_program("/nonexistent/git");
+        let found = uncommitted(
+            &StateDir::resolve(home.path()),
+            home.path(),
+            &refusing,
+            &repo,
+        )
+        .expect("nothing asked");
+        assert_eq!(found, []);
     }
 
     /// A repo declaring `~/.rc` from `files/rc`, committed and pushed, applied

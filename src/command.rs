@@ -231,14 +231,15 @@ fn asked(
 /// files are asked about, `yes`, no terminal, the view — is decided in
 /// [`converge_answering`] and tested through its `settle` seam.
 fn ask_edited(question: &str, choices: &Choices) -> Result<Answer, Error> {
-    discard_typeahead(std::io::stdin());
     let labels: Vec<&str> = choices.iter().map(|(label, _)| *label).collect();
     // The pick is read by its position in `choices`, which is the order its
     // labels were offered in, so no label is compared to find its answer.
-    let picked = inquire::Select::new(question, labels)
-        .with_starting_cursor(0)
-        .raw_prompt()
-        .map_err(confirmation_failed)?;
+    let picked = asked_afresh(|| {
+        inquire::Select::new(question, labels)
+            .with_starting_cursor(0)
+            .raw_prompt()
+    })
+    .map_err(confirmation_failed)?;
     Ok(choices
         .get(picked.index)
         .map_or(Answer::Keep, |(_, answer)| *answer))
@@ -256,11 +257,25 @@ fn ask_edited(question: &str, choices: &Choices) -> Result<Answer, Error> {
 /// `y` that answered the shell's `bx: update now?` would otherwise be read
 /// here as the default, and a `y` typed ahead as approval.
 fn confirm() -> Result<bool, Error> {
-    discard_typeahead(std::io::stdin());
-    inquire::Confirm::new("Apply these changes?")
-        .with_default(false)
-        .prompt()
-        .map_err(confirmation_failed)
+    asked_afresh(|| {
+        inquire::Confirm::new("Apply these changes?")
+            .with_default(false)
+            .prompt()
+    })
+    .map_err(confirmation_failed)
+}
+
+/// Put a question on the terminal with `ask`, once what was typed ahead on
+/// standard input is discarded: nothing typed before a question is shown
+/// answers it. Every `inquire` prompt bx puts is put through this.
+pub(crate) fn asked_afresh<T>(ask: impl FnOnce() -> T) -> T {
+    asked_afresh_on(std::io::stdin(), ask)
+}
+
+/// [`asked_afresh`], with the typeahead discarded on `terminal`.
+fn asked_afresh_on<T>(terminal: impl std::os::fd::AsFd, ask: impl FnOnce() -> T) -> T {
+    discard_typeahead(terminal);
+    ask()
 }
 
 /// Discard what was typed on `terminal` and not yet read. A refusal is only
@@ -1085,12 +1100,16 @@ pub fn secret_list(env: &Env, out: &mut dyn Write) -> Result<Exit, Error> {
 
 /// Ask on the terminal for an identity's passphrase, masked. A prompt that
 /// fails or is cancelled is no passphrase, and the identity stays locked.
+/// What was typed ahead is discarded first, so a command typed while the
+/// last one ran is never taken as the passphrase.
 fn ask_passphrase(shown: &str) -> Option<Passphrase> {
-    inquire::Password::new(&format!("Passphrase for {shown}:"))
-        .without_confirmation()
-        .prompt()
-        .ok()
-        .map(Passphrase::from)
+    asked_afresh(|| {
+        inquire::Password::new(&format!("Passphrase for {shown}:"))
+            .without_confirmation()
+            .prompt()
+    })
+    .ok()
+    .map(Passphrase::from)
 }
 
 /// [`secret_list`], with the passphrase asked through `ask`.

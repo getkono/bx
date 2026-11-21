@@ -350,8 +350,10 @@ impl Pager {
 /// it, so without one [`LESS_OPTIONS`] would become part of that string and
 /// never apply. The `$` follows the last word directly, since a blank before
 /// it would join that string too (`-kfile $` names the file "file "), unless
-/// the last word is a long option: `less` reads `--use-color$` as an option
-/// named `use-color$` and stops on an error, so a blank separates it there.
+/// the last word is a long option with no `=`: `less` reads `--use-color$` as
+/// an option named `use-color$` and stops on an error, so a blank separates it
+/// there. A long option given its value with `=` is a string like `-kfile`
+/// (`--log-file=out $` names the file "out "), so the `$` follows it directly.
 /// After a short option with no value, such as `-R`, the `$` is ignored.
 fn keep_on_screen(inherited: Option<&OsStr>) -> OsString {
     match inherited.filter(|less| !less.as_encoded_bytes().iter().all(u8::is_ascii_whitespace)) {
@@ -361,7 +363,7 @@ fn keep_on_screen(inherited: Option<&OsStr>) -> OsString {
                 .as_encoded_bytes()
                 .split(u8::is_ascii_whitespace)
                 .rfind(|word| !word.is_empty())
-                .is_some_and(|word| word.starts_with(b"--"));
+                .is_some_and(|word| word.starts_with(b"--") && !word.contains(&b'='));
             let mut kept = less.to_owned();
             kept.push(if long { " $ -" } else { "$ -" });
             kept.push(LESS_OPTIONS);
@@ -509,6 +511,9 @@ mod tests {
         assert_eq!(less("-R --use-color"), "-R --use-color $ -FRXK");
         assert_eq!(less("--incsearch"), "--incsearch $ -FRXK");
         assert_eq!(less("--use-color \t"), "--use-color \t $ -FRXK");
+        // A long option given a value with `=` is a string: a blank before
+        // the `$` would join it, and `--log-file=x $` names the file "x ".
+        assert_eq!(less("--log-file=x"), "--log-file=x$ -FRXK");
         // Only the last word decides.
         assert_eq!(less("--use-color -R"), "--use-color -R$ -FRXK");
         // Set to nothing but blanks, it gives no option of its own.

@@ -9,6 +9,30 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/getkono/bx/compare/v0.1.4...v0.1.5) - 2026-11-21
+
+### Added
+
+- *(cli)* `bx status` like `git status`; bare `bx` prints help
+- *(add)* save a local edit of a managed file into the config repo, merging when both sides changed
+- *(apply)* remember a kept answer until either side changes
+
+### Fixed
+
+- *(shell)* a yes to "check now?" runs a check, and typeahead never answers a prompt
+- *(add)* keep a conflicted merge's journal intent in step with its ledger base
+- polish messages and help text (tilde paths, doctor findings, snooze, secret Esc, init count, add/rm PATH)
+- *(rm)* preview and confirm before handing back, and say how to get out
+- *(cli)* exit codes are unambiguous and documented truthfully
+- *(plan)* ask about a pending link's held children and a deleted region file instead of dropping or re-creating them
+- *(pager)* keep the plan on screen under an inherited LESS, and let Ctrl-C in the pager cancel
+- *(apply)* a take never writes what plan did not announce
+- *(apply)* word each question for its change, and offer a view only where one exists
+
+### Other
+
+- list signal-hook in CLAUDE.md's Packages
+
 ## [0.1.4](https://github.com/getkono/bx/compare/v0.1.3...v0.1.4) - 2026-11-17
 
 ### Added

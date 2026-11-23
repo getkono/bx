@@ -178,6 +178,19 @@ impl Diff {
         Some(Self { kind })
     }
 
+    /// This diff with `part` shown after it, as a second diff of the same
+    /// target: what a shared target's overlays add, beside what the row
+    /// changes. Where either is not a line-by-line diff, this one alone.
+    #[must_use]
+    pub(super) fn with_part(self, part: Option<Self>) -> Self {
+        match (self.kind, part.map(|part| part.kind)) {
+            (DiffKind::Text(whole), Some(DiffKind::Text(part))) => Self {
+                kind: DiffKind::Texts(vec![whole, part]),
+            },
+            (kind, _) => Self { kind },
+        }
+    }
+
     /// A tracked target both sides changed since `base`, the bytes they last
     /// agreed on: what this machine did to it and what the repo did to it, as
     /// two diffs. Where either cannot be shown line by line, the one line

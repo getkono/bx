@@ -527,6 +527,7 @@ mod tests {
             declared: &Declared::new(),
             bases: &Bases::new(),
             host: &activation::System::from_env(),
+            overlays: &[],
         };
         let mut target = a_target(home.path(), "/");
         target.body = Body::Dir;

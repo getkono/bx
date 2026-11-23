@@ -249,8 +249,10 @@ fn merge_table(
         if item.is_none() {
             continue;
         }
+        // `get_mut` never yields `Item::None`: a standard table hides one,
+        // and an inline table holds only values.
         match base.get_mut(key) {
-            Some(existing) if !existing.is_none() => {
+            Some(existing) => {
                 path.with_key(key, |path| merge_item(existing, item, path, overlay))?;
             }
             _ => {

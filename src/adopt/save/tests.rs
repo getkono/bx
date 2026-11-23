@@ -549,13 +549,18 @@ const HOOK_JSON: &str =
 /// A home whose repo declares `~/.settings.json` from `files/settings.json`
 /// with this machine's overlay from `files/hook.json`, applied once.
 fn overlaid() -> GuardedHome {
+    overlaid_over(SHARED_JSON)
+}
+
+/// [`overlaid`] with `shared` as the shared body.
+fn overlaid_over(shared: &str) -> GuardedHome {
     let home = guarded_home();
     seed(
         home.path(),
         "[[target]]\npath = \"~/.settings.json\"\nfile = \"files/settings.json\"\n\
          [[overlay]]\nname = \"hook\"\npath = \"~/.settings.json\"\nfile = \"files/hook.json\"\n",
     );
-    home.write(".config/bx/files/settings.json", SHARED_JSON);
+    home.write(".config/bx/files/settings.json", shared);
     home.write(".config/bx/files/hook.json", HOOK_JSON);
     let mut out = Vec::new();
     crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
@@ -655,6 +660,57 @@ fn a_mode_change_alone_to_an_overlaid_file_leaves_the_repo_s_newer_body() {
     let rows = add_settings(&home);
     assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
     assert_eq!(shared_body(&home), repo_edit, "the repo's edit stands");
+}
+
+#[test]
+fn a_layout_only_rewrite_leaves_a_hand_laid_out_shared_body_as_it_is() {
+    // Laid out unlike the tool's compact print, so saving the same data in
+    // the tool's layout would show as a change of bytes.
+    let hand = "{ \"permissions\": { \"allow\": [ \"Bash(ls)\" ] }, \"hooks\": { } }\n";
+    let home = overlaid_over(hand);
+    // Only the layout changes: the same data, printed compactly.
+    let value = json_at(&home, ".settings.json");
+    std::fs::write(
+        home.child(".settings.json"),
+        serde_json::to_vec(&value).expect("print"),
+    )
+    .expect("the tool's write");
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    assert_eq!(shared_body(&home), hand, "the same data saves nothing");
+}
+
+#[test]
+fn an_inline_body_s_rewrite_is_saved_without_this_machine_s_overlay() {
+    let home = guarded_home();
+    seed(
+        home.path(),
+        "[[target]]\npath = \"~/.tool.toml\"\ncontent = '''\n[editor]\ntheme = \"dark\"\n'''\n\
+         [[overlay]]\nname = \"font\"\npath = \"~/.tool.toml\"\ncontent = \"[editor]\\nfont = \\\"mono\\\"\\n\"\n",
+    );
+    let mut out = Vec::new();
+    crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
+    let applied = std::fs::read_to_string(home.child(".tool.toml")).expect("read");
+    assert!(applied.contains("font = \"mono\""), "{applied}");
+    std::fs::write(
+        home.child(".tool.toml"),
+        format!("model = \"opus\"\n{applied}"),
+    )
+    .expect("the tool's write");
+
+    let ctx = Context::load(&env(home.path())).expect("the context");
+    let target = Portable::parse_in("~/.tool.toml", home.path()).expect("a target");
+    let rows = adopt::add(&ctx, &target).expect("add");
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    let doc: toml_edit::DocumentMut = layer(&home).parse().expect("TOML");
+    assert_eq!(
+        doc["target"][0]["content"].as_str(),
+        Some("model = \"opus\"\n[editor]\ntheme = \"dark\"\n"),
+        "the tool's edit is saved, the overlay's font is not"
+    );
+    let (exit, shown) = plan(&home);
+    assert_eq!(exit, Exit::Converged, "{shown}");
 }
 
 #[test]

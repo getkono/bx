@@ -487,6 +487,7 @@ fn decide_and_write(
         declared: &decide::Declared::new(),
         bases: &bases,
         host: &inputs.host,
+        overlays: &inputs.resolved.overlays,
     };
     // A fragment bx wrote for a place no variable lands in any more is planned
     // empty, so switching a variable off takes it out of every shell.
@@ -847,6 +848,7 @@ fn offered_save(
         git: &inputs.git,
         values: &inputs.resolved.values,
         targets: &inputs.resolved.targets,
+        overlays: &inputs.resolved.overlays,
     };
     match save::decide(&sides, target, entry, op.planned(), wanted) {
         Decision::Save(save) if save.how != How::Conflicted => Some(save),
@@ -1070,6 +1072,7 @@ fn link_pending(
         declared: &decide::Declared::new(),
         bases,
         host: &inputs.host,
+        overlays: &inputs.resolved.overlays,
     };
     let mut decided = decide::decide_all(&targets, &ctx)?;
     // A child retargeted or deleted since bx made it is a question, but this

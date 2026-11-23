@@ -149,6 +149,19 @@ fn a_mode_changed_on_this_machine_is_saved_as_the_declared_mode() {
 }
 
 #[test]
+fn a_mode_change_alone_is_saved_without_undoing_the_repo_s_newer_body() {
+    let home = applied(FILE_BODY, b"one\n");
+    std::fs::write(home.child(".config/bx/files/rc"), b"two\n").expect("the repo's edit");
+    chmod(&rc(&home), 0o600);
+
+    let rows = add(&home);
+    assert_eq!(how(&rows), Some(How::Save), "a save, not a merge: {rows:?}");
+    assert_eq!(layer(&home), format!("{FILE_BODY}mode = \"0600\"\n"));
+    assert_eq!(repo_body(&home), b"two\n", "the repo's edit stands");
+    assert_eq!(std::fs::read(rc(&home)).expect("read"), b"one\n");
+}
+
+#[test]
 fn a_body_file_another_target_also_delivers_is_refused_naming_it() {
     let shared = format!("{FILE_BODY}[[target]]\npath = \"~/.other\"\nfile = \"files/rc\"\n");
     let home = applied(&shared, b"both\n");
@@ -525,4 +538,277 @@ fn shapes_bx_does_not_save_into_are_refused_by_the_decision_itself() {
             "{what}"
         );
     }
+}
+
+/// The shared settings every machine applies, laid out as a JSON printer
+/// lays it out, and what this machine adds to it.
+const SHARED_JSON: &str = "{\n  \"permissions\": {\n    \"allow\": [\n      \"Bash(ls)\"\n    ]\n  },\n  \"hooks\": {}\n}\n";
+const HOOK_JSON: &str =
+    r#"{"hooks": {"SubagentStop": [{"type": "command", "command": "~/bin/stop"}]}}"#;
+
+/// A home whose repo declares `~/.settings.json` from `files/settings.json`
+/// with this machine's overlay from `files/hook.json`, applied once.
+fn overlaid() -> GuardedHome {
+    overlaid_over(SHARED_JSON)
+}
+
+/// [`overlaid`] with `shared` as the shared body.
+fn overlaid_over(shared: &str) -> GuardedHome {
+    let home = guarded_home();
+    seed(
+        home.path(),
+        "[[target]]\npath = \"~/.settings.json\"\nfile = \"files/settings.json\"\n\
+         [[overlay]]\nname = \"hook\"\npath = \"~/.settings.json\"\nfile = \"files/hook.json\"\n",
+    );
+    home.write(".config/bx/files/settings.json", shared);
+    home.write(".config/bx/files/hook.json", HOOK_JSON);
+    let mut out = Vec::new();
+    crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
+    home
+}
+
+fn json_at(home: &GuardedHome, rel: &str) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(home.child(rel)).expect("read")).expect("JSON")
+}
+
+/// The file on this machine rewritten as a tool rewrites it: parsed, changed
+/// by `edit`, and printed again.
+fn rewrite(home: &GuardedHome, edit: impl FnOnce(&mut serde_json::Value)) {
+    let mut value = json_at(home, ".settings.json");
+    edit(&mut value);
+    let mut bytes = serde_json::to_vec_pretty(&value).expect("print");
+    bytes.push(b'\n');
+    std::fs::write(home.child(".settings.json"), bytes).expect("the tool's write");
+}
+
+fn add_settings(home: &GuardedHome) -> Vec<Adoption> {
+    let ctx = Context::load(&env(home.path())).expect("the context");
+    let target = Portable::parse_in("~/.settings.json", home.path()).expect("a target");
+    adopt::add(&ctx, &target).expect("add")
+}
+
+fn shared_body(home: &GuardedHome) -> String {
+    std::fs::read_to_string(home.child(".config/bx/files/settings.json")).expect("read")
+}
+
+#[test]
+fn a_tool_s_rewrite_is_saved_without_this_machine_s_overlay() {
+    let home = overlaid();
+    assert!(
+        json_at(&home, ".settings.json")["hooks"]["SubagentStop"].is_array(),
+        "the overlay is applied"
+    );
+    // The tool adds a shared setting, and keeps everything else, the hook
+    // included, where it was.
+    rewrite(&home, |value| {
+        value["model"] = serde_json::Value::from("opus");
+    });
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    let saved = json_at(&home, ".config/bx/files/settings.json");
+    assert_eq!(saved["model"], "opus", "the tool's edit reaches the repo");
+    assert_eq!(
+        saved["hooks"],
+        serde_json::json!({}),
+        "the overlay does not"
+    );
+    assert_eq!(
+        std::fs::read_to_string(home.child(".config/bx/files/hook.json")).expect("read"),
+        HOOK_JSON,
+        "nothing shared moves into the overlay"
+    );
+    let (exit, shown) = plan(&home);
+    assert_eq!(exit, Exit::Converged, "{shown}");
+}
+
+#[test]
+fn a_rewrite_that_changes_nothing_shared_saves_nothing_into_the_repo() {
+    let home = overlaid();
+    // Only the layout changes: the same data, printed compactly.
+    let value = json_at(&home, ".settings.json");
+    std::fs::write(
+        home.child(".settings.json"),
+        serde_json::to_vec(&value).expect("print"),
+    )
+    .expect("the tool's write");
+
+    add_settings(&home);
+    assert_eq!(
+        shared_body(&home),
+        SHARED_JSON,
+        "the shared body is as it was"
+    );
+    // The file is bx's at the tool's layout now, and bx writes its own: the
+    // next plan lays it out again, as a change to bytes bx wrote, and the
+    // one after is empty.
+    let (exit, shown) = plan(&home);
+    assert_eq!(exit, Exit::Pending, "{shown}");
+    let mut out = Vec::new();
+    crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
+    let (exit, shown) = plan(&home);
+    assert_eq!(exit, Exit::Converged, "{shown}");
+}
+
+#[test]
+fn a_mode_change_alone_to_an_overlaid_file_leaves_the_repo_s_newer_body() {
+    let home = overlaid();
+    let repo_edit = SHARED_JSON.replace("\"hooks\": {}", "\"hooks\": {},\n  \"model\": \"opus\"");
+    home.write(".config/bx/files/settings.json", &repo_edit);
+    chmod(&home.child(".settings.json"), 0o600);
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    assert_eq!(shared_body(&home), repo_edit, "the repo's edit stands");
+}
+
+#[test]
+fn a_layout_only_rewrite_leaves_a_hand_laid_out_shared_body_as_it_is() {
+    // Laid out unlike the tool's compact print, so saving the same data in
+    // the tool's layout would show as a change of bytes.
+    let hand = "{ \"permissions\": { \"allow\": [ \"Bash(ls)\" ] }, \"hooks\": { } }\n";
+    let home = overlaid_over(hand);
+    // Only the layout changes: the same data, printed compactly.
+    let value = json_at(&home, ".settings.json");
+    std::fs::write(
+        home.child(".settings.json"),
+        serde_json::to_vec(&value).expect("print"),
+    )
+    .expect("the tool's write");
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    assert_eq!(shared_body(&home), hand, "the same data saves nothing");
+}
+
+#[test]
+fn an_inline_body_s_rewrite_is_saved_without_this_machine_s_overlay() {
+    let home = guarded_home();
+    seed(
+        home.path(),
+        "[[target]]\npath = \"~/.tool.toml\"\ncontent = '''\n[editor]\ntheme = \"dark\"\n'''\n\
+         [[overlay]]\nname = \"font\"\npath = \"~/.tool.toml\"\ncontent = \"[editor]\\nfont = \\\"mono\\\"\\n\"\n",
+    );
+    let mut out = Vec::new();
+    crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
+    let applied = std::fs::read_to_string(home.child(".tool.toml")).expect("read");
+    assert!(applied.contains("font = \"mono\""), "{applied}");
+    std::fs::write(
+        home.child(".tool.toml"),
+        format!("model = \"opus\"\n{applied}"),
+    )
+    .expect("the tool's write");
+
+    let ctx = Context::load(&env(home.path())).expect("the context");
+    let target = Portable::parse_in("~/.tool.toml", home.path()).expect("a target");
+    let rows = adopt::add(&ctx, &target).expect("add");
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    let doc: toml_edit::DocumentMut = layer(&home).parse().expect("TOML");
+    assert_eq!(
+        doc["target"][0]["content"].as_str(),
+        Some("model = \"opus\"\n[editor]\ntheme = \"dark\"\n"),
+        "the tool's edit is saved, the overlay's font is not"
+    );
+    let (exit, shown) = plan(&home);
+    assert_eq!(exit, Exit::Converged, "{shown}");
+}
+
+#[test]
+fn add_refuses_a_file_whose_overlays_cannot_be_merged() {
+    let home = overlaid();
+    home.write(".config/bx/files/hook.json", r#"{"hooks": 1}"#);
+    let note = refusal(&add_settings(&home)).to_string();
+    assert!(note.contains("`hooks`"), "{note}");
+}
+
+#[test]
+fn a_toml_rewrite_is_saved_without_the_overlay_and_keeps_the_tool_s_layout() {
+    let home = guarded_home();
+    seed(
+        home.path(),
+        "[[target]]\npath = \"~/.tool.toml\"\nfile = \"files/tool.toml\"\n\
+         [[overlay]]\nname = \"font\"\npath = \"~/.tool.toml\"\ncontent = \"[editor]\\nfont = \\\"mono\\\"\\n\"\n",
+    );
+    home.write(
+        ".config/bx/files/tool.toml",
+        "# shared\n[editor]\ntheme = \"dark\"\n",
+    );
+    let mut out = Vec::new();
+    crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
+    let applied = std::fs::read_to_string(home.child(".tool.toml")).expect("read");
+    assert!(applied.contains("font = \"mono\""), "{applied}");
+
+    // The tool adds a shared key at the top and keeps the rest.
+    std::fs::write(
+        home.child(".tool.toml"),
+        format!("model = \"opus\"\n{applied}"),
+    )
+    .expect("the tool's write");
+    let ctx = Context::load(&env(home.path())).expect("the context");
+    let target = Portable::parse_in("~/.tool.toml", home.path()).expect("a target");
+    let rows = adopt::add(&ctx, &target).expect("add");
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    assert_eq!(
+        std::fs::read_to_string(home.child(".config/bx/files/tool.toml")).expect("read"),
+        "model = \"opus\"\n# shared\n[editor]\ntheme = \"dark\"\n"
+    );
+    let (exit, shown) = plan(&home);
+    assert_eq!(exit, Exit::Converged, "{shown}");
+}
+
+#[test]
+fn a_hand_laid_out_shared_body_still_merges_cleanly_with_a_tool_s_rewrite() {
+    let home = overlaid();
+    let compact = "{\"permissions\": {\"allow\": [\"Bash(ls)\", \"Bash(cat)\"]}, \"hooks\": {}}";
+    rewrite(&home, |value| {
+        value["model"] = serde_json::Value::from("opus");
+    });
+    home.write(".config/bx/files/settings.json", compact);
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Merged), "{rows:?}");
+    let saved = json_at(&home, ".config/bx/files/settings.json");
+    assert_eq!(saved["model"], "opus");
+    assert_eq!(saved["permissions"]["allow"][1], "Bash(cat)");
+    assert_eq!(saved["hooks"], serde_json::json!({}));
+}
+
+#[test]
+fn a_tool_changing_what_the_overlay_added_is_refused_rather_than_saved() {
+    let home = overlaid();
+    rewrite(&home, |value| {
+        value["hooks"]["SubagentStop"][0]["command"] = serde_json::Value::from("~/bin/other");
+    });
+    let rows = add_settings(&home);
+    let note = refusal(&rows);
+    assert!(note.contains("overlay"), "{note}");
+    assert_eq!(shared_body(&home), SHARED_JSON, "nothing saved");
+}
+
+#[test]
+fn both_sides_changed_merge_the_shared_parts_and_keep_the_overlay_out_of_the_repo() {
+    let home = overlaid();
+    rewrite(&home, |value| {
+        value["model"] = serde_json::Value::from("opus");
+    });
+    let repo_edit = SHARED_JSON.replace("\"Bash(ls)\"", "\"Bash(ls)\",\n      \"Bash(cat)\"");
+    home.write(".config/bx/files/settings.json", &repo_edit);
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Merged), "{rows:?}");
+    let saved = json_at(&home, ".config/bx/files/settings.json");
+    assert_eq!(saved["model"], "opus");
+    assert_eq!(saved["permissions"]["allow"][1], "Bash(cat)");
+    assert_eq!(
+        saved["hooks"],
+        serde_json::json!({}),
+        "the overlay stays out"
+    );
+    let machine = json_at(&home, ".settings.json");
+    assert_eq!(machine["model"], "opus");
+    assert_eq!(machine["permissions"]["allow"][1], "Bash(cat)");
+    assert!(
+        machine["hooks"]["SubagentStop"].is_array(),
+        "and stays here"
+    );
 }

@@ -152,6 +152,7 @@ use super::external::External;
 use super::function::FunctionDecl;
 use super::history::History;
 use super::keybindings::Keybindings;
+use super::overlay::{self, OverlayDecl};
 use super::path::PathEntry;
 use super::plugin::{self, PluginDecl};
 use super::secrets::Secrets;
@@ -203,6 +204,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
     let mut activations: Merged<ActivationDecl> = Merged::default();
     let mut tools: Merged<ToolDecl> = Merged::default();
     let mut externals: Merged<External> = Merged::default();
+    let mut overlays: Merged<OverlayDecl> = Merged::default();
     let mut secrets = Secrets::default();
     let mut history = History::default();
     let mut shell_options = ShellOptions::default();
@@ -248,6 +250,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         activations.absorb(layer.config.activations.iter().cloned());
         tools.absorb(layer.config.tools.iter().cloned());
         externals.absorb(layer.config.externals.iter().cloned());
+        overlays.absorb(layer.config.overlays.iter().cloned());
 
         // A key the layer declared only behind a gate that does not hold on
         // this machine: a later toggle naming it flips nothing.
@@ -263,6 +266,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Activation => activations.gated_out(key),
                 Section::Tool => tools.gated_out(key),
                 Section::External => externals.gated_out(key),
+                Section::Overlay => overlays.gated_out(key),
                 // Keyed by the file it names, once the values are resolved.
                 Section::Target => {}
             }
@@ -281,6 +285,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
                 Section::Activation => activations.toggle(toggle)?,
                 Section::Tool => tools.toggle(toggle)?,
                 Section::External => externals.toggle(toggle)?,
+                Section::Overlay => overlays.toggle(toggle)?,
                 Section::Target => {}
             }
         }
@@ -320,6 +325,7 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
 
     let mut targets = targets.into_enabled();
     carry_gates(&mut targets, layers);
+    let overlays = attach_overlays(overlays.into_enabled(), &targets, layers, &resolved)?;
 
     Ok(Config {
         targets,
@@ -348,6 +354,9 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         activations: activations.into_enabled(),
         // Nor to a declared tool.
         tools: tools.into_enabled(),
+        // Nor to an overlay; each one kept here adds to a target this
+        // machine declares.
+        overlays,
         secrets,
         history,
         shell_options,
@@ -368,6 +377,79 @@ pub fn merge(layers: &[Layer], home: &Path) -> Result<Config, Error> {
         path_gates: Vec::new(),
         gated: Vec::new(),
     })
+}
+
+/// Keep the overlays that add to a target declared on this machine.
+///
+/// An overlay names its target by path, compared as targets are keyed — after
+/// substitution — so `~/.config/one/settings.json` in `local.toml` reaches a
+/// target written `~/.config/{{acct}}/settings.json` with `acct` answered
+/// `one`. One whose target some layer declares but this machine does not —
+/// switched off, or behind a `when` that does not hold here — adds nothing.
+///
+/// # Errors
+///
+/// [`Error::BadValue`] at the overlay, when no layer declares a target for its
+/// file at all, which is a typo rather than a declaration, or when its target
+/// is one an overlay cannot be merged into ([`overlay::ineligible`]).
+fn attach_overlays(
+    overlays: Vec<OverlayDecl>,
+    targets: &[Target],
+    layers: &[Layer],
+    values: &ResolvedValues,
+) -> Result<Vec<OverlayDecl>, Error> {
+    let mut kept = Vec::with_capacity(overlays.len());
+    for decl in overlays {
+        if let Some(target) = targets
+            .iter()
+            .find(|target| same_file(target.path.as_str(), &decl.path, values))
+        {
+            if let Some(why) = overlay::ineligible(target) {
+                return Err(Error::BadValue {
+                    origin: decl.origin.clone(),
+                    message: format!(
+                        "overlay `{}` adds to the target at {}, which cannot take an overlay: \
+                         {why}",
+                        decl.name, target.origin
+                    ),
+                });
+            }
+            kept.push(decl);
+            continue;
+        }
+        let declared_somewhere = layers.iter().any(|layer| {
+            layer
+                .config
+                .targets
+                .iter()
+                .map(|target| target.path.as_str())
+                .chain(
+                    layer
+                        .config
+                        .gated
+                        .iter()
+                        .filter(|(section, _)| *section == Section::Target)
+                        .map(|(_, key)| key.as_str()),
+                )
+                .any(|path| same_file(path, &decl.path, values))
+        });
+        if !declared_somewhere {
+            return Err(Error::BadValue {
+                origin: decl.origin.clone(),
+                message: format!(
+                    "overlay `{}` adds to `{}`, but no layer declares a [[target]] for \
+                     that file",
+                    decl.name, decl.path
+                ),
+            });
+        }
+    }
+    Ok(kept)
+}
+
+/// Whether two target paths, as written, name one file for this account.
+pub(crate) fn same_file(one: &str, other: &str, values: &ResolvedValues) -> bool {
+    TargetKey::of(one, values) == TargetKey::of(other, values)
 }
 
 /// Give each of `targets` the conditions it was declared under: its own

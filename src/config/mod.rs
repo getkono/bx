@@ -32,6 +32,7 @@ pub mod layers;
 pub mod lock;
 pub mod merge;
 pub mod origin;
+pub mod overlay;
 pub mod path;
 pub mod plugin;
 pub mod resolution;
@@ -120,6 +121,9 @@ pub struct Config {
     /// declared tool inventory `bx doctor` reports on and never installs. See
     /// [`tool`].
     pub tools: Vec<tool::ToolDecl>,
+    /// `[[overlay]]`'s entries, keyed by `name`, in the order written: what
+    /// a machine adds to a shared structured target. See [`overlay`].
+    pub overlays: Vec<overlay::OverlayDecl>,
     /// `[secrets]`: a table, not a keyed list, so it merges key by key, the
     /// last layer that sets a key winning. See [`secrets`] for which layer may
     /// set which key.
@@ -156,7 +160,7 @@ pub struct Config {
     /// it is gated on. Only a module may carry one; see [`layers::gate`].
     pub when: Option<when::Condition>,
     /// The `when` of each `[[target]]`, `[[plugin]]`, `[[activation]]`,
-    /// `[[external]]` and `[[tool]]` that carries one, found again by the
+    /// `[[external]]`, `[[tool]]` and `[[overlay]]` that carries one, found again by the
     /// entry's origin, which is its own header's line. See [`layers::gate`].
     pub gates: Vec<when::Condition>,
     /// The `when` of each `[path]` entry that carries one, beside the entry's
@@ -625,6 +629,19 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
                     }
                 }
             }
+            "overlay" => {
+                for table in entries(root, name, item, file, text)? {
+                    match toggle::toggle_of(table, toggle::Section::Overlay, file, text)? {
+                        Some(toggle) => config.toggles.push(toggle),
+                        None => {
+                            config
+                                .overlays
+                                .push(overlay::parse_overlay(table, file, text)?);
+                            gate_of(table, overlay::SECTION, file, text, &mut config)?;
+                        }
+                    }
+                }
+            }
             when::KEY => {
                 let origin = section_origin(root, name, file, text);
                 let when = when::decided(item.as_value(), item.type_name())
@@ -740,6 +757,15 @@ pub fn parse_str(text: &str, file: &Path, home: &Path) -> Result<Config, Error> 
             .iter()
             .map(|t| (t.name.as_str(), &t.origin))
             .chain(toggles_in(&config, toggle::Section::Tool))
+            .collect(),
+    )?;
+    check_unique(
+        "overlay",
+        config
+            .overlays
+            .iter()
+            .map(|o| (o.name.as_str(), &o.origin))
+            .chain(toggles_in(&config, toggle::Section::Overlay))
             .collect(),
     )?;
     refuse_gated_values(&config)?;

@@ -12,6 +12,7 @@ use crate::config::alias::AliasDecl;
 use crate::config::env::EnvDecl;
 use crate::config::external::External;
 use crate::config::function::FunctionDecl;
+use crate::config::overlay::OverlayDecl;
 use crate::config::path::PathEntry;
 use crate::config::plugin::PluginDecl;
 use crate::config::source::SourceDecl;
@@ -89,6 +90,18 @@ impl Keyed for AliasDecl {
 }
 
 impl Keyed for FunctionDecl {
+    fn key(&self) -> &str {
+        &self.name
+    }
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+    fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+}
+
+impl Keyed for OverlayDecl {
     fn key(&self) -> &str {
         &self.name
     }

@@ -478,7 +478,7 @@ Everything specific to you or to one machine — answers, the write record, cach
 and the key that decrypts your secrets — stays outside the repo, on the machine.
 
 **Some machines only.** A `[[target]]`, `[path]` entry, `[[plugin]]`,
-`[[activation]]`, `[[external]]` or `[[tool]]` may say `when` it applies, and
+`[[activation]]`, `[[external]]`, `[[tool]]` or `[[overlay]]` may say `when` it applies, and
 a file in `modules/` may say it once, at the top, for everything in it:
 
 ```toml
@@ -514,6 +514,38 @@ the programs your graphical session starts, needs no `when`: bx writes it to
 `~/Library/LaunchAgents/dev.bx.environment.plist`, that runs
 `launchctl setenv` at login. `apply` loads nothing, so it takes effect at the
 next login; `bx doctor` says until then that launchd has not loaded it.
+
+**One machine adds to a shared file.** A JSON or TOML file every machine
+shares can take additions on some machines only, without a second copy of the
+file. An `[[overlay]]` names the target and a fragment in the same syntax:
+
+```toml
+# modules/buildhost.toml
+when = "host:build1"
+
+[[overlay]]
+name = "subagent-stop-hook"
+path = "~/.claude/settings.json"            # a [[target]] declared elsewhere
+file = "files/claude/subagent-stop.json"    # or content = "…"
+```
+
+Where it applies, `plan` merges the fragment into the shared body and shows
+what it adds as its own part of the change; everywhere else the file is the
+shared body, byte for byte, and an edit to the shared body reaches both.
+Objects and tables merge key by key, an array gets the overlay's elements
+appended unless it already holds them, and a key both set differently blocks
+the target with a message naming it rather than picking one. Every account on
+`build1` gets it from the committed module; one opts out with `name` and
+`enabled = false` in its own `local.toml`. Take the overlay away and the next
+`apply` gives the shared body back.
+
+When a tool rewrites the file — Claude Code rewrites `settings.json` — `bx
+add` saves only the shared part of the edit into the repo: what the overlays
+added is taken out first, and an addition the tool changed is refused rather
+than saved, so nothing one machine adds reaches the others. bx never writes an
+overlay's own file. An overlay may name a whole file bx owns with a `file` or
+`content` body, applied and not tracked; the full statement is in
+[`src/config/overlay.rs`](src/config/overlay.rs).
 
 ## Externals
 

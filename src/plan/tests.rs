@@ -1126,6 +1126,8 @@ mod deleted;
 mod displaced;
 /// A file bx owns whole that was edited since bx wrote it.
 mod edited;
+/// A shared structured target with this machine's overlays merged in.
+mod overlay;
 mod secrets;
 mod state_paths;
 mod tools;

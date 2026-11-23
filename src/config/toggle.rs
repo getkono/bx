@@ -40,6 +40,8 @@ pub enum Section {
     External,
     /// `[[tool]]`, keyed by `name`.
     Tool,
+    /// `[[overlay]]`, keyed by `name`.
+    Overlay,
 }
 
 impl Section {
@@ -57,6 +59,7 @@ impl Section {
             Self::Activation => super::activation::SECTION,
             Self::Tool => super::tool::SECTION,
             Self::External => super::external::SECTION,
+            Self::Overlay => super::overlay::SECTION,
         }
     }
 
@@ -72,7 +75,8 @@ impl Section {
             | Self::Plugin
             | Self::Source
             | Self::Activation
-            | Self::Tool => "name",
+            | Self::Tool
+            | Self::Overlay => "name",
         }
     }
 
@@ -93,6 +97,7 @@ impl Section {
             Self::Activation => "a `command`",
             Self::Tool => "an `install`",
             Self::External => "a `url` and a `rev` or a `branch`",
+            Self::Overlay => "a `path` and a `file` or `content`",
         }
     }
 }
@@ -172,6 +177,7 @@ impl Section {
             Self::Activation => "activation",
             Self::Tool => "tool",
             Self::External => "external",
+            Self::Overlay => "overlay",
         }
     }
 }

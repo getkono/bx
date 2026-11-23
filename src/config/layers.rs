@@ -508,6 +508,9 @@ fn gate_layer(config: &mut Config, decide: &dyn Decide) {
     config
         .tools
         .retain(|t| keep(Section::Tool, &t.name, &t.origin));
+    config
+        .overlays
+        .retain(|o| keep(Section::Overlay, &o.name, &o.origin));
     config.gated.extend(gated);
 }
 
@@ -583,6 +586,10 @@ fn declared_keys(config: &Config) -> Vec<(Section, String)> {
     add(
         Section::Tool,
         &mut config.tools.iter().map(|t| t.name.as_str()),
+    );
+    add(
+        Section::Overlay,
+        &mut config.overlays.iter().map(|o| o.name.as_str()),
     );
     keys
 }

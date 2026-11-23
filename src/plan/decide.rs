@@ -25,6 +25,7 @@
 mod dir;
 mod guard;
 mod link;
+mod overlay;
 mod parent;
 mod track;
 mod undeclared;
@@ -38,6 +39,7 @@ use self::guard::guard_generated;
 #[cfg(test)]
 pub(super) use self::guard::{guard_environment_d, guard_fragment};
 use self::link::decide_link;
+use self::overlay::{Layered, layered};
 use self::parent::{Write, created_dirs, locked_parent, parent_note};
 use self::track::{Gone, one_side_deleted};
 pub(super) use self::undeclared::{Look, Undo, decide_undeclared};
@@ -47,6 +49,7 @@ pub(super) use self::wordcode::{REWRITTEN, WAITS};
 use super::track::{Agreed, Base, Bases, When};
 use super::{Change, Diff, Error, region};
 use crate::config::env;
+use crate::config::overlay::Overlay;
 use crate::config::resolve::Resolution;
 use crate::config::secrets::Secrets;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
@@ -81,6 +84,9 @@ pub(super) struct Ctx<'a> {
     /// The machine a generated file's `has:TOOL` condition looks the tool up
     /// on: the `PATH` [`super::Inputs::load`] read once.
     pub host: &'a activation::System,
+    /// What this machine adds to its shared structured targets, each overlay
+    /// naming its target by the path that target resolved to.
+    pub overlays: &'a [Overlay],
 }
 
 /// The directories whose targets apply leaves at a declared mode — created,
@@ -609,8 +615,8 @@ pub(super) fn decide(
         note: join([note, held.clone()]),
     };
 
-    let bytes = match wanted(target, ctx)? {
-        Wanted::Bytes(bytes) => bytes,
+    let (bytes, layered) = match wanted(target, ctx)? {
+        Wanted::Bytes(bytes, layered) => (bytes, layered),
         Wanted::Dir => return decide_dir(target, ctx, row),
         Wanted::Link(text) => return decide_link(target, text, ctx, row),
         Wanted::Blocked(note) => return Ok((row(Action::Blocked, None, Some(note)), None)),
@@ -769,6 +775,31 @@ pub(super) fn decide(
             )
         })
         .flatten();
+    // What this machine's overlays add is its own part of the change: the
+    // shared body every other machine gets, and this machine's file.
+    let (diff, note) = match &layered {
+        // Said only where the row shows a change: an unchanged file says
+        // nothing about how it was made.
+        Some(layered) if diff.is_some() => (
+            diff.map(|diff| {
+                diff.with_part(Diff::labelled(
+                    target.path.as_str(),
+                    ("shared body", "with this machine's overlays"),
+                    Some(&layered.shared),
+                    &bytes,
+                    None,
+                ))
+            }),
+            join([
+                note,
+                Some(format!(
+                    "this machine adds overlay {} to the shared body",
+                    layered.applied.join(", ")
+                )),
+            ]),
+        ),
+        _ => (diff, note),
+    };
     // A create makes every missing parent on the way to its target, and the
     // row names each, so plan announces every directory apply creates.
     // So does the restore a deleted target's question offers.
@@ -952,8 +983,9 @@ fn region_ownership(
 /// The bytes a target wants, or why it cannot have any yet.
 #[derive(Debug, PartialEq, Eq)]
 enum Wanted {
-    /// The whole content.
-    Bytes(Vec<u8>),
+    /// The whole content, and the shared body it was merged from when this
+    /// machine's overlays add to it.
+    Bytes(Vec<u8>, Option<Layered>),
     /// A directory, which has none.
     Dir,
     /// A symlink holding this text, already rendered against the home.
@@ -1022,7 +1054,13 @@ fn wanted(target: &Target, ctx: &Ctx<'_>) -> Result<Wanted, Error> {
             )));
         }
     };
-    Ok(Wanted::Bytes(bytes))
+    match target.body {
+        Body::Inline(_) | Body::File(_) => match layered(target, bytes, ctx.overlays, ctx.repo)? {
+            Ok((bytes, layered)) => Ok(Wanted::Bytes(bytes, layered)),
+            Err(note) => Ok(Wanted::Blocked(note)),
+        },
+        _ => Ok(Wanted::Bytes(bytes, None)),
+    }
 }
 
 /// Read a file the config repo holds: a `file` body, or a secret's ciphertext.
@@ -1650,6 +1688,7 @@ mod tests {
             declared: &Declared::new(),
             bases: &Bases::new(),
             host: &activation::System::from_env(),
+            overlays: &[],
         };
         let shaped = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -1724,6 +1763,7 @@ mod tests {
             declared: &Declared::new(),
             bases: &Bases::new(),
             host: &activation::System::from_env(),
+            overlays: &[],
         };
         let tracked = |change: fn(&mut Target)| {
             let mut target = a_target(home.path(), "~/.a");
@@ -1768,6 +1808,7 @@ mod tests {
             declared: &Declared::new(),
             bases: &Bases::new(),
             host: &activation::System::from_env(),
+            overlays: &[],
         };
 
         let (change, op) =
@@ -1824,6 +1865,7 @@ mod tests {
                 declared: &Declared::new(),
                 bases: &Bases::new(),
                 host: &activation::System::from_env(),
+                overlays: &[],
             };
 
             let (change, op) =

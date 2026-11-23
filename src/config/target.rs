@@ -32,6 +32,12 @@
 //! when       = "os:macos"                       # optional; a condition bx decides
 //! ```
 //!
+//! # An overlay adds to a target on some machines
+//!
+//! A whole JSON or TOML file bx owns can take what some machines add to it,
+//! declared beside it as an `[[overlay]]` rather than as a second target for
+//! the same file. See [`super::overlay`].
+//!
 //! # `when` keeps a target to some machines
 //!
 //! `when` is one condition bx decides, or an array that is all of several:

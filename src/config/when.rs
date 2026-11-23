@@ -54,7 +54,7 @@
 //! # Gating a whole declaration, or a whole module
 //!
 //! A `[[target]]`, a `[path]` entry, a `[[plugin]]`, an `[[activation]]`, an
-//! `[[external]]` and a `[[tool]]` take `when` too, and so does a file in
+//! `[[external]]`, a `[[tool]]` and an `[[overlay]]` take `when` too, and so does a file in
 //! `modules/`, as a top-level key that gates everything in it — say
 //! `modules/macos.toml` opening with `when = "os:macos"`. These are not
 //! lines in a generated file but whole declarations, kept or left out as

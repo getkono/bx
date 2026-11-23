@@ -64,6 +64,7 @@ use std::path::Path;
 
 use super::external::External;
 use super::merge::Conflict;
+use super::overlay::Overlay;
 use super::target::{Body, Target};
 use super::values::{ResolvedValues, Unresolved, ValueAssignment};
 use super::{Config, Error};
@@ -102,6 +103,11 @@ pub struct Resolved {
     pub update: super::update::Update,
     /// The merged `[doctor]` table: nothing in it is substituted.
     pub doctor: super::doctor::Doctor,
+    /// Every overlay that adds to a ready target, in the resolved
+    /// configuration's order, each with the path its target resolved to. An
+    /// overlay on a held-back target is left out with it: nothing is written
+    /// there to add to.
+    pub overlays: Vec<Overlay>,
 }
 
 /// Resolve a merged configuration.
@@ -162,6 +168,7 @@ pub fn resolve(
 
     refuse_shared_files(&targets, home, crate::fs::case_insensitive)?;
     refuse_overlapping_externals(&merged.externals, &targets)?;
+    let overlays = resolve_overlays(merged, &targets, &values);
 
     Ok(Resolved {
         values,
@@ -171,7 +178,39 @@ pub fn resolve(
         tools: merged.tools.clone(),
         update: merged.update.clone(),
         doctor: merged.doctor.clone(),
+        overlays,
     })
+}
+
+/// Each of the merged overlays whose target is ready, with the path that
+/// target resolved to.
+///
+/// The merge kept only overlays whose target this machine declares, and the
+/// targets resolve in the merged order, so the target an overlay adds to is
+/// found by the same comparison the merge made, at the same index.
+fn resolve_overlays(
+    merged: &Config,
+    targets: &[Resolution<Target>],
+    values: &ResolvedValues,
+) -> Vec<Overlay> {
+    merged
+        .overlays
+        .iter()
+        .filter_map(|decl| {
+            let index = merged.targets.iter().position(|target| {
+                super::merge::same_file(target.path.as_str(), &decl.path, values)
+            })?;
+            match targets.get(index)? {
+                Resolution::Ready(target) => Some(Overlay {
+                    name: decl.name.clone(),
+                    path: target.path.clone(),
+                    fragment: decl.fragment.clone(),
+                    origin: decl.origin.clone(),
+                }),
+                Resolution::Blocked(_) => None,
+            }
+        })
+        .collect()
 }
 
 /// Refuse two ready targets that write one file.

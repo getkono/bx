@@ -247,7 +247,8 @@ impl Merged<Target, TargetKey> {
                 | Section::Source
                 | Section::Activation
                 | Section::Tool
-                | Section::External => {}
+                | Section::External
+                | Section::Overlay => {}
             }
         }
 

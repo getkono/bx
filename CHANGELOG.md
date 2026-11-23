@@ -9,6 +9,16 @@ Conventional Commit messages.
 
 ## [Unreleased]
 
+## [0.1.6](https://github.com/getkono/bx/compare/v0.1.5...v0.1.6) - 2026-11-23
+
+### Added
+
+- machine-scoped overlays for shared JSON and TOML targets ([#467](https://github.com/getkono/bx/pull/467))
+
+### Other
+
+- trim CLAUDE.md to the rules the repo cannot tell you
+
 ## [0.1.5](https://github.com/getkono/bx/compare/v0.1.4...v0.1.5) - 2026-11-21
 
 ### Added

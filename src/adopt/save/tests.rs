@@ -149,6 +149,19 @@ fn a_mode_changed_on_this_machine_is_saved_as_the_declared_mode() {
 }
 
 #[test]
+fn a_mode_change_alone_is_saved_without_undoing_the_repo_s_newer_body() {
+    let home = applied(FILE_BODY, b"one\n");
+    std::fs::write(home.child(".config/bx/files/rc"), b"two\n").expect("the repo's edit");
+    chmod(&rc(&home), 0o600);
+
+    let rows = add(&home);
+    assert_eq!(how(&rows), Some(How::Save), "a save, not a merge: {rows:?}");
+    assert_eq!(layer(&home), format!("{FILE_BODY}mode = \"0600\"\n"));
+    assert_eq!(repo_body(&home), b"two\n", "the repo's edit stands");
+    assert_eq!(std::fs::read(rc(&home)).expect("read"), b"one\n");
+}
+
+#[test]
 fn a_body_file_another_target_also_delivers_is_refused_naming_it() {
     let shared = format!("{FILE_BODY}[[target]]\npath = \"~/.other\"\nfile = \"files/rc\"\n");
     let home = applied(&shared, b"both\n");
@@ -630,6 +643,18 @@ fn a_rewrite_that_changes_nothing_shared_saves_nothing_into_the_repo() {
     crate::command::apply(&env(home.path()), true, &mut out).expect("apply");
     let (exit, shown) = plan(&home);
     assert_eq!(exit, Exit::Converged, "{shown}");
+}
+
+#[test]
+fn a_mode_change_alone_to_an_overlaid_file_leaves_the_repo_s_newer_body() {
+    let home = overlaid();
+    let repo_edit = SHARED_JSON.replace("\"hooks\": {}", "\"hooks\": {},\n  \"model\": \"opus\"");
+    home.write(".config/bx/files/settings.json", &repo_edit);
+    chmod(&home.child(".settings.json"), 0o600);
+
+    let rows = add_settings(&home);
+    assert_eq!(how(&rows), Some(How::Save), "{rows:?}");
+    assert_eq!(shared_body(&home), repo_edit, "the repo's edit stands");
 }
 
 #[test]

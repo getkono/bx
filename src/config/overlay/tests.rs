@@ -119,6 +119,18 @@ fn an_overlay_needs_exactly_one_fragment_and_a_structured_path() {
 }
 
 #[test]
+fn an_overlay_name_is_non_empty_and_on_one_line() {
+    // Each refusal on its own: an empty name has no control character, and a
+    // name with one is not empty.
+    for name in [r#""""#, r#""two\nlines""#, r#""tab\there""#] {
+        let note = refused(&format!(
+            "[[overlay]]\nname = {name}\npath = \"~/a.json\"\ncontent = \"{{}}\"\n"
+        ));
+        assert!(note.contains("is not an overlay name"), "{name}: {note}");
+    }
+}
+
+#[test]
 fn a_host_gated_module_adds_its_overlay_on_that_host_only() {
     let layers = || {
         vec![

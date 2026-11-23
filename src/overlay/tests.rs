@@ -255,6 +255,14 @@ fn key_paths_write_an_array_index_in_brackets() {
     path.with_key("a\"\\\n", |p| assert_eq!(p.to_string(), r#""a\"\\\u{a}""#));
 }
 
+#[test]
+fn key_paths_write_underscores_and_hyphens_bare() {
+    let mut path = KeyPath::default();
+    for key in ["snake_case", "kebab-case", "_", "-"] {
+        path.with_key(key, |p| assert_eq!(p.to_string(), key));
+    }
+}
+
 /// A Claude Code settings file a team shares.
 const CLAUDE_SHARED: &str = r#"{
   "permissions": {

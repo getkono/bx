@@ -848,6 +848,7 @@ fn offered_save(
         git: &inputs.git,
         values: &inputs.resolved.values,
         targets: &inputs.resolved.targets,
+        overlays: &inputs.resolved.overlays,
     };
     match save::decide(&sides, target, entry, op.planned(), wanted) {
         Decision::Save(save) if save.how != How::Conflicted => Some(save),

@@ -59,12 +59,14 @@ use std::path::{Path, PathBuf};
 use toml_edit::{Document, Item};
 
 use super::{declared_path, open_layer};
+use crate::config::overlay::{Overlay, naming};
 use crate::config::resolve::Resolution;
 use crate::config::target::{Attach, Body, Direction, Format, Target};
 use crate::config::values::ResolvedValues;
 use crate::fs::{self, Kind, Mode, Observed};
 use crate::git::{self, Git};
 use crate::journal::{Content, Ownership, Request, Session, SessionKind};
+use crate::overlay::{self, Syntax};
 use crate::paths::{self, Portable};
 use crate::state::{
     self, ContentHash, ExclusiveLock, LedgerEntry, Mechanism, NewEntry, PriorBytes, StateDir,
@@ -95,6 +97,9 @@ pub(crate) struct Sides<'a> {
     pub values: &'a ResolvedValues,
     /// Every resolved target, to find another that shares a body file.
     pub targets: &'a [Resolution<Target>],
+    /// What this machine adds to its shared targets, which a save keeps out
+    /// of the repo.
+    pub overlays: &'a [Overlay],
 }
 
 /// How a save settles the two sides.
@@ -334,21 +339,52 @@ fn decided(
     }
     // The mode the user set wins where they set one: they confirm it.
     let mode = if mode_moved { disk_mode } else { declared_mode };
-    // A save leaves the machine file as it is, so what bx records it wrote
-    // is what is there; only a merge writes it.
-    let (how, bytes) = if !disk_moved || disk == wanted || !repo_moved {
-        (How::Save, disk.to_vec())
-    } else {
-        merged(sides, entry, disk, wanted)?
+    let saves_bytes = !disk_moved || disk == wanted || !repo_moved;
+    // What the repo body is to hold, where the edit changes it, and what the
+    // machine file holds afterwards.
+    let (how, bytes, content) = match Layers::of(sides, target)? {
+        // This machine's overlays are in the file, and never go into the
+        // repo: only the shared part of the edit is saved, and a merge is of
+        // the shared parts alone, with the overlays merged into the result.
+        Some(layers) if saves_bytes => {
+            let shared = layers.strip(disk)?;
+            let content = (disk_moved && !layers.same(&shared)?).then_some(shared);
+            (How::Save, disk.to_vec(), content)
+        }
+        Some(layers) => {
+            let base = kept_base(sides, entry)?;
+            let (how, merged) = merge_file(
+                sides.git,
+                sides.state,
+                &layers.strip(disk)?,
+                &layers.strip(&base)?,
+                &layers.canonical()?,
+            )?;
+            if how == How::Conflicted {
+                (how, merged, None)
+            } else {
+                (how, layers.merge(&merged)?, Some(merged))
+            }
+        }
+        // A save leaves the machine file as it is, so what bx records it
+        // wrote is what is there; only a merge writes it. Bytes that are
+        // still what bx last wrote are not an edit to save, even where the
+        // repo has moved on from them.
+        None => {
+            let (how, bytes) = if saves_bytes {
+                (How::Save, disk.to_vec())
+            } else {
+                merged(sides, entry, disk, wanted)?
+            };
+            let content = (disk_moved && bytes != wanted).then(|| bytes.clone());
+            (how, bytes, content)
+        }
     };
     let mut repo = Vec::new();
     let mut diffs = Vec::new();
     if how != How::Conflicted {
-        // Bytes that are still what bx last wrote are not an edit to save,
-        // even where the repo has moved on from them.
-        let content = (disk_moved && bytes != wanted).then_some(bytes.as_slice());
         let new_mode = (mode != declared_mode).then_some(mode);
-        let (file, layer) = repo_writes(sides, target, content, new_mode)?;
+        let (file, layer) = repo_writes(sides, target, content.as_deref(), new_mode)?;
         for write in file.into_iter().chain(layer) {
             uncommitted(sides, &write)?;
             diffs.push(write.diff(sides.home));
@@ -414,15 +450,122 @@ fn merged(
     disk: &[u8],
     wanted: &[u8],
 ) -> Result<(How, Vec<u8>), String> {
-    let Some(base) = state::restore::kept(sides.state, entry.written, BASE_LIMIT) else {
-        return Err(
-            "was edited here and changed in the repo, and bx kept no copy of what it last \
-             wrote to merge the two from (it keeps none of a secret or of a file over 64 KiB); \
-             `bx plan` shows both sides"
-                .to_string(),
-        );
-    };
+    let base = kept_base(sides, entry)?;
     merge_file(sides.git, sides.state, disk, &base, wanted)
+}
+
+/// The copy `apply` kept of what it last wrote, which a merge starts from.
+fn kept_base(sides: &Sides<'_>, entry: &LedgerEntry) -> Result<Vec<u8>, String> {
+    state::restore::kept(sides.state, entry.written, BASE_LIMIT).ok_or_else(|| {
+        "was edited here and changed in the repo, and bx kept no copy of what it last \
+         wrote to merge the two from (it keeps none of a secret or of a file over 64 KiB); \
+         `bx plan` shows both sides"
+            .to_string()
+    })
+}
+
+/// A shared target's body and this machine's overlays on it: what a save
+/// takes out of the file before anything reaches the repo.
+struct Layers {
+    /// The target's syntax.
+    syntax: Syntax,
+    /// The shared body, as the repo declares it.
+    shared: Vec<u8>,
+    /// Each overlay's name and fragment, in configuration order.
+    fragments: Vec<(String, Vec<u8>)>,
+}
+
+impl Layers {
+    /// The layers of `target`, or `None` when no overlay of this machine's
+    /// adds to it.
+    fn of(sides: &Sides<'_>, target: &Target) -> Result<Option<Self>, String> {
+        let named: Vec<&Overlay> = naming(sides.overlays, &target.path).collect();
+        if named.is_empty() {
+            return Ok(None);
+        }
+        let syntax = Syntax::of(Path::new(target.path.as_str())).ok_or_else(|| {
+            "is not a JSON or TOML file, which an overlay is merged into".to_string()
+        })?;
+        let unreadable = |(path, error): (PathBuf, std::io::Error)| {
+            format!("could not read {}: {error}", path.display())
+        };
+        let shared = match &target.body {
+            Body::Inline(content) => content.clone().into_bytes(),
+            Body::File(rel) => {
+                let path = sides.repo.join(rel);
+                std::fs::read(&path).map_err(|error| unreadable((path, error)))?
+            }
+            // `shape` refused every other body before this is asked.
+            _ => return Ok(None),
+        };
+        let fragments = named
+            .iter()
+            .map(|overlay| {
+                overlay
+                    .read(sides.repo)
+                    .map(|bytes| (overlay.name.clone(), bytes))
+                    .map_err(unreadable)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Some(Self {
+            syntax,
+            shared,
+            fragments,
+        }))
+    }
+
+    /// The fragments, as [`crate::overlay`] takes them.
+    fn parts(&self) -> Vec<overlay::Fragment<'_>> {
+        self.fragments
+            .iter()
+            .map(|(name, bytes)| overlay::Fragment { name, bytes })
+            .collect()
+    }
+
+    /// `shared` with this machine's overlays merged in.
+    fn merge(&self, shared: &[u8]) -> Result<Vec<u8>, String> {
+        overlay::merge(self.syntax, shared, &self.parts())
+            .map_err(|why| format!("could not have this machine's overlays merged back in: {why}"))
+    }
+
+    /// `file` with what this machine's overlays add to the shared body
+    /// taken out.
+    fn strip(&self, file: &[u8]) -> Result<Vec<u8>, String> {
+        overlay::strip(self.syntax, file, &self.shared, &self.parts()).map_err(|why| {
+            format!("holds this machine's overlays, which bx cannot take out of it: {why}")
+        })
+    }
+
+    /// The shared body laid out as a strip lays out what it returns, so a
+    /// three-way merge of the two sees only what changed.
+    fn canonical(&self) -> Result<Vec<u8>, String> {
+        overlay::canonical(self.syntax, &self.shared)
+            .map_err(|why| format!("could not be merged with the shared body: {why}"))
+    }
+
+    /// Whether `shared` holds the data the shared body does.
+    fn same(&self, shared: &[u8]) -> Result<bool, String> {
+        overlay::same(self.syntax, shared, &self.shared)
+            .map_err(|why| format!("could not be compared with the shared body: {why}"))
+    }
+}
+
+/// What bx writes for `target` on this machine when the repo declares
+/// `shared`: the shared body with this machine's overlays merged in, or the
+/// shared body itself where none adds to it.
+///
+/// # Errors
+///
+/// Why the overlays cannot be merged, as a refusal reads.
+pub(crate) fn with_overlays(
+    sides: &Sides<'_>,
+    target: &Target,
+    shared: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    match Layers::of(sides, target)? {
+        Some(layers) => layers.merge(&shared),
+        None => Ok(shared),
+    }
 }
 
 /// `git merge-file` of `ours` and `theirs` from `base`, in a scratch

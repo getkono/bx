@@ -389,6 +389,7 @@ impl Context {
             git: &self.git,
             values: &self.resolved.values,
             targets: &self.resolved.targets,
+            overlays: &self.resolved.overlays,
         }
     }
 
@@ -998,6 +999,12 @@ fn decide_file(
                         "is already declared at {origin} with a body bx add does not adopt into"
                     )));
                 }
+            };
+            // What bx writes here, which is what the file is compared with:
+            // the shared body with this machine's overlays merged in.
+            let wanted = match save::with_overlays(&ctx.sides(), declared, wanted) {
+                Ok(wanted) => wanted,
+                Err(note) => return Ok(refused(note)),
             };
             if (&wanted, Mode::resolve(declared.mode, Kind::File)) != (&bytes, mode) {
                 // A file bx wrote and the user edited since is saved into

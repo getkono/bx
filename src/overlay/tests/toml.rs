@@ -291,3 +291,41 @@ fn same_ignores_the_form_a_table_or_array_is_written_in() {
     assert!(!toml_same("a = 1\n", "a = 2\n"));
     assert!(!toml_same("a = [1, 2]\n", "a = [2, 1]\n"));
 }
+
+#[test]
+fn a_table_from_an_overlay_prints_under_the_table_it_joins() {
+    // In the overlay each joins `a` after `z`; in the result each follows
+    // `a`, where it now belongs, and before `b`.
+    let shared = "[a]\nx = 1\n\n[b]\ny = 2\n";
+    let tables = "[z]\nk = 1\n\n[a.sub]\nm = 2\n\n[a.sub.deep]\nn = 3\n";
+    assert_eq!(
+        toml_merge(shared, &[frag("o", tables)]),
+        "[a]\nx = 1\n\n[a.sub]\nm = 2\n\n[a.sub.deep]\nn = 3\n\n[b]\ny = 2\n[z]\nk = 1\n"
+    );
+    let array = "[z]\nk = 1\n\n[[a.list]]\nm = 2\n";
+    assert_eq!(
+        toml_merge(shared, &[frag("o", array)]),
+        "[a]\nx = 1\n\n[[a.list]]\nm = 2\n\n[b]\ny = 2\n[z]\nk = 1\n"
+    );
+}
+
+#[test]
+fn a_new_key_keeps_the_form_the_overlay_wrote_it_in() {
+    let out = toml_merge(
+        "[a]\nx = 1\n",
+        &[frag("o", "[a]\n\"quoted key\"   =   1\n'lit'=2\n")],
+    );
+    assert_eq!(out, "[a]\nx = 1\n\"quoted key\"   =   1\n'lit'=2\n");
+}
+
+#[test]
+fn an_element_joining_a_lone_one_on_its_own_line_goes_on_its_own_line() {
+    let out = toml_merge("list = [\n  \"a\",\n]\n", &[frag("o", "list = [\"b\"]\n")]);
+    assert_eq!(out, "list = [\n  \"a\",\n  \"b\",\n]\n");
+}
+
+#[test]
+fn an_appended_element_keeps_the_space_written_before_each_comma() {
+    let out = toml_merge("list = [\"a\" , \"b\"]\n", &[frag("o", "list = [\"c\"]\n")]);
+    assert_eq!(out, "list = [\"a\" , \"b\" , \"c\"]\n");
+}

@@ -68,6 +68,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Hand-authored config (bx.toml, modules/*.toml, local.toml) and surgical,
 # comment-preserving edits to other tools' TOML — cargo, mise, uv.
 toml_edit = { version = "0.25.14", features = ["serde"] }
+# JSON settings files other tools own (`~/.claude/settings.json`), merged with
+# a machine's overlays and stripped of them again. `preserve_order` keeps the
+# file's key order; `arbitrary_precision` keeps each number's text as written.
+serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
 # Content addressing for the restore store, and activation-cache fingerprints.
 sha2 = "0.11.0"
 # Atomic writes: temp file in the destination directory, fsync, rename.

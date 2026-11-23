@@ -97,6 +97,11 @@
 //! run. Its checks, in the order it reports them, are listed in
 //! [`doctor`]'s own documentation.
 //!
+//! [`overlay`] merges a machine's overlays into a shared JSON or TOML body,
+//! and strips exactly what they contributed back out of the file a tool
+//! rewrote, so machine-only content never reaches the shared body and shared
+//! content never leaves it.
+//!
 //! # How one repo serves many accounts
 //!
 //! A developer with several Linux accounts has several *differences*, not
@@ -136,6 +141,7 @@ pub mod hash;
 pub mod init;
 pub mod journal;
 pub mod lexical;
+pub mod overlay;
 pub mod paths;
 pub mod pin;
 pub mod plan;

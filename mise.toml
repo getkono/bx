@@ -1,6 +1,6 @@
 # mise — dev tools + task runner. https://mise.jdx.dev
 #
-# The Rust toolchain itself is pinned by rust-toolchain.toml (rustup); mise
+# The Rust toolchain itself is named by rust-toolchain.toml (rustup); mise
 # manages only the auxiliary dev tools and the project task list.
 
 [tools]

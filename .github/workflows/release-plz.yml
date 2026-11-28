@@ -109,11 +109,10 @@ jobs:
         uses: actions/checkout@v4
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-      # rust-toolchain.toml pins the channel, so the action's `targets` input
-      # would add the target's std to the unused `stable` toolchain. Add it
-      # here, inside the checkout, so it lands in the pinned toolchain the build
-      # uses.
-      - name: Add the target to the pinned toolchain
+      # rust-toolchain.toml names the channel and overrides the action's
+      # toolchain. Add the target here, inside the checkout, so it lands in the
+      # toolchain that file selects, which is the one the build uses.
+      - name: Add the target to the toolchain rust-toolchain.toml selects
         run: rustup target add ${{ matrix.target }}
       # Key the cache by target: each pair of targets runs on the same runner
       # and rust-cache's default key omits the target, so without this the

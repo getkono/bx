@@ -20,8 +20,8 @@ jobs:
         with:
           fetch-depth: 0 # convco needs full history to walk the commit range
       # convco is a `cargo:` tool, so mise builds it from source and the build
-      # needs a toolchain that is pinned here rather than whatever the runner
-      # image happens to carry.
+      # needs the toolchain rust-toolchain.toml names rather than whatever the
+      # runner image happens to carry.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # mise provisions convco (see mise.toml); the install is cached across

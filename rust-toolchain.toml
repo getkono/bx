@@ -4,10 +4,12 @@
 # `cargo` invocation on a clean runner download it (see issue #55). A developer
 # who wants it runs `rustup component add rust-analyzer`.
 #
-# The channel is pinned to an exact release, not `stable`: a floating channel
-# let a new clippy lint turn master red with no change in this repository (see
-# issue #127). This file overrides the toolchain the CI workflows install, so
-# bumping it is a deliberate one-line change that brings its own lint fixes.
+# The channel floats on the latest stable release, locally and in CI (this file
+# overrides the toolchain the CI workflows install), so there is nothing to
+# bump by hand and new syntax, lints and compiler speed arrive when Rust ships
+# them. Rust releases are backwards compatible; what a new one can break is
+# usually a new clippy lint under `-D warnings`, as in issue #127, and that is
+# fixed in this repository when it lands rather than avoided by pinning.
 [toolchain]
-channel = "1.99.0"
+channel = "stable"
 components = ["rustfmt", "clippy", "llvm-tools-preview"]
